@@ -1,0 +1,9 @@
+# Bundle layer contributed by @domitor-syh/dsh-rollback.
+# Applied by `dsh plugin add` into any profile that lists this bundle.
+#
+# TRAE-style rollback: per-turn file checkpoints + in-place conversation
+# truncation, exposed as a model `rollback` tool, a `/rollback` command, and a
+# Web rollback button with affected-file diff preview.
+- insert:
+    - id: rollback
+      name: '@domitor-syh/dsh-rollback'
