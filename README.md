@@ -43,6 +43,24 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
    - `/rollback <n>` — 回退到第 n 轮发起之前
 3. **模型工具**：AI 可自主调用 `rollback`（传 `turn` + 可选 `preview: true`）。
 
+## 界面预览
+
+1. **回退按钮**：每条消息右下角、与「复制」同尺寸的 ↩ 按钮。
+
+   ![回退按钮](./docs/images/rollback-button.png)
+
+2. **回退弹窗与文件修改提示**：点击 ↩ 后弹出确认框，逐条列出受影响文件及其动作——修改过的写回原内容、新建的删除（无法恢复的单独标「跳过」）。
+
+   ![回退弹窗与文件修改提示](./docs/images/rollback-dialog.png)
+
+3. **回退分隔线与消息返回输入框**：确认后，被回退的消息从对话流中隐藏并渲染一条 ↩ 分隔线；被回退那一轮的用户文本 / 图片自动回到输入框，方便接着改。
+
+   ![回退分隔线与消息返回输入框](./docs/images/rollback-divider-and-composer.png)
+
+4. **回退首条消息的界面**：回退到第一条消息之前时，对话区显示「已回退到对话发起前」欢迎页。
+
+   ![回退首条消息的界面](./docs/images/rollback-hero.png)
+
 ## 架构
 
 | 文件 | 职责 |
