@@ -1,3 +1,5 @@
+> 🌐 语言 / Language: **中文** · [English](./README.en.md)
+
 # dsh-rollback · TRAE 式「回退」插件
 
 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）Web 端提供一个 TRAE 式「回退到本轮对话发起前」的插件：按轮次建立检查点，一键把【工作区文件】和【模型上下文】同时回退到某一轮发起之前，保持同一会话 id。
