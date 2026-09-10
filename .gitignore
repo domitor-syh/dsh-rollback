@@ -4,3 +4,13 @@ lib/
 coverage/
 *.tgz
 scripts/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# env & logs
+.env
+.env.*
+*.log
