@@ -51,6 +51,7 @@ export function apply(ctx: Context): void {
     description:
       'Roll back the conversation and workspace files to before a given 1-based turn number, ' +
       'removing that turn and all later turns from the model context and restoring any files they changed. ' +
+      'This is IRREVERSIBLE: only call when the user has clearly asked to roll back. ' +
       'Pass preview: true to only list affected files without changing anything.',
     parameters: {
       turn: {
