@@ -185,3 +185,45 @@ describe('planRollback', () => {
     expect(plan.truncation).toBeNull()
   })
 })
+
+describe('additional edge cases', () => {
+  it('SlidingWindow.clear empties the window', () => {
+    const w = new SlidingWindow<number>(3)
+    w.push(1); w.push(2)
+    w.clear()
+    expect(w.snapshot()).toEqual([])
+    expect(w.size()).toBe(0)
+  })
+
+  it('SessionFold.clear resets snapshots and the surface tail', () => {
+    const f = new SessionFold(10)
+    f.fold({ kind: 'turn-start', turn: 1, seq: 0 })
+    f.fold({ kind: 'surface', seq: 1 })
+    f.fold({ kind: 'turn-end', turn: 1, seq: 1 })
+    f.clear()
+    expect(f.snapshots()).toEqual([])
+    expect(f.surfaceTail()).toBeNull()
+  })
+
+  it('planRollback with an empty window yields no files and null truncation', () => {
+    const plan = planRollback([], 3, 10)
+    expect(plan.restored).toEqual([])
+    expect(plan.skipped).toEqual([])
+    expect(plan.truncation).toBeNull()
+  })
+
+  it('planRollback restores in ascending-turn order even when checkpoints are unsorted', () => {
+    const mk = (turn: number, startSeq: number, m: FsMutation) => {
+      let c = surfacePos(emptyCheckpoint(turn), startSeq)
+      c = surfacePos(c, startSeq + 1)
+      c = recordChange(c, m)
+      return c
+    }
+    const turn3 = mk(3, 5, { path: '/new', operation: 'create', before: null, after: 'body' })
+    const turn1 = mk(1, 1, { path: '/a', operation: 'update', before: 'A0', after: 'A1' })
+    const plan = planRollback([turn3, turn1], 1, 9)
+    expect(plan.restored.map(f => f.path)).toEqual(['/a', '/new'])
+    expect(plan.restored[0]!.action).toBe('restore')
+    expect(plan.restored[1]!.action).toBe('delete')
+  })
+})
