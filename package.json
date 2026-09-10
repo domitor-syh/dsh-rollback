@@ -34,6 +34,9 @@
     "typecheck": "tsc --noEmit"
   },
   "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/domitor-syh/dsh-rollback.git"
