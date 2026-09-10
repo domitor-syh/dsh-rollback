@@ -25,8 +25,8 @@ import { BrandWordmark, FishLogo } from '@deepseek-ai/dsh-client-ui-primitives'
 /** Required services: slot registry, the shipped `remote.commands` Remote, and the conversation node registry. */
 export const inject = ['slots', 'remote', 'remote.commands', 'conversationEvents']
 
-/** Console diagnostics while the injection path is being validated. */
-const DEBUG = true
+/** Console diagnostics; set to true to debug the injected UI/hidden-state logic. */
+const DEBUG = false
 /** Bundle revision, logged at apply so a stale cached bundle is identifiable. */
 const BUNDLE_REV = 4
 function log(...parts: unknown[]): void {
