@@ -1,0 +1,10 @@
+# Normalize text line endings to LF across the repo.
+* text=auto eol=lf
+
+# Keep binaries byte-identical.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.tgz binary
