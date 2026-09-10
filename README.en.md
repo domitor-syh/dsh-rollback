@@ -86,6 +86,15 @@ Key implementation points:
 - **Rollback is irreversible**: executing truncates, consistent with TRAE semantics, with no redo chain; the affected-files preview in the dialog compensates for this risk.
 - **Command side effects are out of scope**: `npm install`, database writes, network requests, and other external side effects cannot be rolled back (the inherent boundary of every checkpoint approach).
 
+## Development
+
+```sh
+pnpm install    # install deps (prepare also builds once)
+pnpm build      # emit lib/index.js, lib/invariant.js, lib/client.js from src/
+pnpm test       # run the dependency-free core unit tests
+pnpm typecheck  # type-check core and tests
+```
+
 ## License
 
 [MIT](./LICENSE)

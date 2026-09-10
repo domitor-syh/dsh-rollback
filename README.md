@@ -86,6 +86,15 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 - **回退不可撤销**：执行即截断，与 TRAE 语义一致，不做 redo 链；对话框的受影响文件预览是该风险的补偿交互。
 - **命令副作用不在回退范围**：`npm install`、写数据库、发请求等外部副作用无法回退（所有 checkpoint 方案的天然边界）。
 
+## 开发
+
+```sh
+pnpm install    # 安装依赖（prepare 会先构建一次）
+pnpm build      # 从 src/ 产出 lib/index.js、lib/invariant.js、lib/client.js
+pnpm test       # 运行核心逻辑（src/core/）单测
+pnpm typecheck  # 类型检查无 DSH 依赖的 core 与 tests
+```
+
 ## 许可证
 
 [MIT](./LICENSE)
