@@ -18,7 +18,7 @@
 
 import * as React from 'react'
 import { createPortal } from 'react-dom'
-import { FishLogo } from '@deepseek-ai/dsh-client-ui-primitives'
+import { FishLogo, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 
 /** Required services: slots, the `commands` Remote, the conversation node registry, and locale. */
 export const inject = ['slots', 'remote', 'remote.commands', 'conversationEvents', 'locale']
@@ -166,7 +166,7 @@ function extCommand(ctx: any, sessionId: string, line: string): Promise<{ text?:
 }
 
 const CSS =
-  '.rbk-act{position:relative;display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:6px;border:none;border-radius:28px;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;}' +
+  '.rbk-act{position:relative;display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:5px;border:none;border-radius:28px;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;}' +
   '.rbk-act:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary);}' +
   '.rbk-act:disabled{cursor:default;opacity:.4;}' +
   '.rbk-overlay{position:fixed;inset:0;z-index:1300;display:flex;align-items:center;justify-content:center;background:rgb(0 0 0/.4);backdrop-filter:blur(2px);}' +
@@ -202,7 +202,7 @@ const CSS =
 
 /** The curved reply/return arrow (↩), as a React element this time. */
 function ReplyIcon(): React.ReactElement {
-  return React.createElement('svg', { width: 16, height: 16, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': true },
+  return React.createElement('svg', { width: 18, height: 18, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': true },
     React.createElement('path', { d: 'M6.6 3.4 3 7l3.6 3.6', stroke: 'currentColor', strokeWidth: 1.4, strokeLinecap: 'round', strokeLinejoin: 'round' }),
     React.createElement('path', { d: 'M3 7h6.4c2.3 0 4 1.7 4 3.9V13', stroke: 'currentColor', strokeWidth: 1.4, strokeLinecap: 'round' }),
   )
@@ -390,14 +390,14 @@ function RollbackAction({ messageId, useSession, t }: any): React.ReactElement |
   const running = snapshot?.running === true
   const turn = React.useMemo(() => turnForMessageId(snapshot, messageId), [snapshot, messageId])
   const disabled = running || turn === undefined
-  return React.createElement('button', {
+  const button = React.createElement('button', {
     type: 'button',
     className: 'rbk-act',
     'aria-label': t('action.label'),
-    title: t('action.label'),
     disabled,
     onClick: () => { if (turn !== undefined && openRollbackDialog !== null) openRollbackDialog(turn) },
   }, React.createElement(ReplyIcon))
+  return React.createElement(Tooltip, { label: t('action.label'), side: 'bottom' }, button)
 }
 
 interface DriverProps {
