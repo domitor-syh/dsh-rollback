@@ -133,11 +133,15 @@ const hiddenRpcIds: Set<string> = (() => {
   catch { return new Set<string>() }
 })()
 
+/** Command seats present at the last button dispatch (see `markPendingCommandDispatch`). */
+let pendingCommandSeen: Set<string> | null = null
+
 /** Track one command execution dispatched by this client (best-effort persistence). */
 function trackRpcId(commandId: unknown): void {
   if (typeof commandId !== 'string' || commandId === '' || hiddenRpcIds.has(commandId)) return
   hiddenRpcIds.add(commandId)
   try { localStorage.setItem(RPC_HIDE_KEY, JSON.stringify([...hiddenRpcIds])) } catch { /* session-only */ }
+  pendingCommandSeen = null
   syncHiddenRpcRows()
   requestAnimationFrame(() => { syncHiddenRpcRows() })
 }
@@ -149,6 +153,40 @@ function syncHiddenRpcRows(): void {
     const key = el.getAttribute('data-chat-flow-key') ?? ''
     if (!key.startsWith(COMMAND_KEY_PREFIX)) continue
     if (hiddenRpcIds.has(key.slice(COMMAND_KEY_PREFIX.length))) el.style.display = 'none'
+  }
+}
+
+/**
+ * In-flight receipt capture: the button's preview/execute RPCs mint durable
+ * command nodes. Those used to mount visibly and then be hidden after the RPC
+ * resolved — a grow-then-shrink that made the transcript "shake" on every
+ * click. Snapshot the command seats present at dispatch, then hide any that
+ * appear afterwards (synchronously in the MutationObserver, before paint).
+ */
+function markPendingCommandDispatch(): void {
+  const seen = new Set<string>()
+  for (const el of document.querySelectorAll<HTMLElement>('[data-chat-flow-kind="command"][data-chat-flow-key]')) {
+    const key = el.getAttribute('data-chat-flow-key') ?? ''
+    if (key.startsWith(COMMAND_KEY_PREFIX)) seen.add(key.slice(COMMAND_KEY_PREFIX.length))
+  }
+  pendingCommandSeen = seen
+}
+
+/** Hide command receipts that appeared since {@link markPendingCommandDispatch}. */
+function syncPendingRpcRow(): void {
+  if (pendingCommandSeen === null) return
+  let caught = false
+  for (const el of document.querySelectorAll<HTMLElement>('[data-chat-flow-kind="command"][data-chat-flow-key]')) {
+    const key = el.getAttribute('data-chat-flow-key') ?? ''
+    if (!key.startsWith(COMMAND_KEY_PREFIX)) continue
+    const id = key.slice(COMMAND_KEY_PREFIX.length)
+    if (pendingCommandSeen.has(id)) continue
+    if (!hiddenRpcIds.has(id)) { hiddenRpcIds.add(id); caught = true }
+    el.style.display = 'none'
+  }
+  if (caught) {
+    pendingCommandSeen = null
+    try { localStorage.setItem(RPC_HIDE_KEY, JSON.stringify([...hiddenRpcIds])) } catch { /* session-only */ }
   }
 }
 
@@ -433,6 +471,7 @@ function RollbackDriver({ preview, execute, useSession, inputActions, restoreIma
     setDialogTurn(turn)
     setFiles(null)
     setError(null)
+    markPendingCommandDispatch()
     preview(turn).then(setFiles, (e: unknown) => setError(msg(e)))
   }, [preview])
 
@@ -450,7 +489,7 @@ function RollbackDriver({ preview, execute, useSession, inputActions, restoreIma
       raf = requestAnimationFrame(() => { raf = 0; ensure() })
     }
     ensure()
-    const obs = new MutationObserver(() => ensureRef.current())
+    const obs = new MutationObserver(() => { syncPendingRpcRow(); ensureRef.current() })
     obs.observe(document.body, { childList: true, subtree: true })
     return () => {
       obs.disconnect()
@@ -470,6 +509,7 @@ function RollbackDriver({ preview, execute, useSession, inputActions, restoreIma
     const turn = dialogTurn
     setBusy(true)
     setError(null)
+    markPendingCommandDispatch()
     execute(turn).then(
       () => {
         setBusy(false)
