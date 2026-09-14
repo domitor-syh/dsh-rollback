@@ -421,9 +421,20 @@ export class RollbackService {
       // client's marker/hide reads it; core and the model only see the empty
       // content), because an out-of-repo plugin event type is not loadable.
       const envelope = truncationEnvelope(session)
+      // The replacement node is an EMPTY assistant/message (derives to null), so
+      // the model sees nothing from the shadowed range. But DSH's session
+      // invariant and the compaction token meter both require every
+      // assistant/message to sit inside an open step — a "naked" append breaks
+      // compaction. Wrap it in a synthetic turn+step so the log stays
+      // well-formed; the fold skips this empty turn, so it never appears as a
+      // rollback-able turn.
+      const markerTurn = envelope.turn + 1
+      const markerStep = 1
+      session.append('turn/start', { turn: markerTurn })
+      session.append('step/start', { turn: markerTurn, step: markerStep })
       const markerEvent = session.append('assistant/message', {
-        turn: envelope.turn,
-        step: envelope.step,
+        turn: markerTurn,
+        step: markerStep,
         message: {
           id: `rollback-truncation-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           role: 'assistant',
@@ -448,6 +459,8 @@ export class RollbackService {
         },
         sourceEventSeqs: [...shadowed],
       })
+      session.append('step/end', { turn: markerTurn, step: markerStep })
+      session.append('turn/end', { turn: markerTurn, reason: { kind: 'completed' } })
       fold.setTail(markerEvent.seq)
     }
 
