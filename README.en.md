@@ -20,7 +20,7 @@ A TRAE-style "roll back to before this turn" plugin for the [DeepSeek Harness](h
 | File rollback | Modified files are written back to their pre-turn content; files created this turn are deleted; unrestorable files are reported as skipped |
 | In-place truncation | Truncates the model context via a `user/message` surface `replace` (the same mechanism compaction uses), keeping the same session id |
 | Three entry points | The `rollback` model tool, the `/rollback` human command, and a Web rollback button on each finalized reply |
-| Affected-file list | The Web button opens a dialog listing the files affected by this and later turns and their actions (restore/delete/skip); clicking a file opens it in the editor |
+| Affected-file list | The Web button opens a dialog listing the files affected by this and later turns and their actions (restore/delete/skip) |
 
 ## Getting started
 
