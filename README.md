@@ -19,7 +19,7 @@
 | 10 轮滑动窗口 | 借鉴 TRAE「仅最近 10 轮」，超出窗口的检查点被丢弃 |
 | 文件回退 | 修改过的文件写回本轮前内容；本轮新建的文件被删除；无法恢复的文件单独报告跳过 |
 | 原位截断 | 用 `user/message` 表层 `replace`（compaction 同款机制）截断模型上下文，保持同一 session id |
-| 三种触发入口 | 模型工具 `rollback`、人工命令 `/rollback`、Web 端每轮「回退」按钮 |
+| 三种触发入口 | 模型工具 `rollback`、人工命令 `/rollback`、Web 端每条已完成回复的「回退」按钮 |
 | 受影响文件列表 | Web 按钮弹出对话框，列出本轮及之后受影响文件及动作（恢复/删除/跳过），点击文件可在编辑器打开 |
 
 ## 快速上手
@@ -38,7 +38,7 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 
 ### 使用
 
-1. **Web 按钮**：每条消息气泡右下角「复制」按钮旁出现 ↩「回退」按钮（转弯回复箭头图标，与复制按钮同尺寸）→ 弹出受影响文件列表 → 确认回退。
+1. **Web 按钮**：每条已完成 AI 回复下方、与「赞/踩」并排的动作条里出现 ↩「回退」按钮 → 弹出受影响文件列表 → 确认回退。
 2. **人工命令**：输入框键入
    - `/rollback list` — 列出可回退到的轮次
    - `/rollback preview <n>` — 预览回退到第 n 轮前会影响的文件（不执行）
@@ -47,7 +47,7 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 
 ## 界面预览
 
-1. **回退按钮**：每条消息右下角、与「复制」同尺寸的 ↩ 按钮。
+1. **回退按钮**：每条已完成 AI 回复下方动作条里的 ↩ 按钮（与「赞/踩」并排）。
 
    ![回退按钮](./docs/images/rollback-button.png)
 
@@ -70,7 +70,7 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 | `src/core/` | 纯逻辑（无 DSH 依赖）：检查点模型、捕获合并、回退规划、滑动窗口、会话折叠，全部单测覆盖 |
 | `src/service.ts` | Host 侧执行：`tools/result` 捕获写/改的前置内容 + `session/event` 折叠轮次；执行恢复/删除/截断 |
 | `src/index.ts` | 插件体（Host 半侧）：注册 `rollback` 工具与 `/rollback` 命令 |
-| `src/client/index.ts` | 浏览器半侧：轮次脚注「回退」按钮 + 受影响文件对话框，经已出厂 `commands` Remote 触发宿主 |
+| `src/client/index.ts` | 浏览器半侧：官方 `assistant-actions` 槽的「回退」按钮 + 受影响文件对话框 + 本地化，经已出厂 `commands` Remote 触发宿主 |
 
 关键实现点：
 

@@ -19,7 +19,7 @@ A TRAE-style "roll back to before this turn" plugin for the [DeepSeek Harness](h
 | 10-turn sliding window | Mirrors TRAE's "last 10 turns only"; checkpoints beyond the window are dropped |
 | File rollback | Modified files are written back to their pre-turn content; files created this turn are deleted; unrestorable files are reported as skipped |
 | In-place truncation | Truncates the model context via a `user/message` surface `replace` (the same mechanism compaction uses), keeping the same session id |
-| Three entry points | The `rollback` model tool, the `/rollback` human command, and a per-turn Web rollback button |
+| Three entry points | The `rollback` model tool, the `/rollback` human command, and a Web rollback button on each finalized reply |
 | Affected-file list | The Web button opens a dialog listing the files affected by this and later turns and their actions (restore/delete/skip); clicking a file opens it in the editor |
 
 ## Getting started
@@ -38,7 +38,7 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 
 ### Usage
 
-1. **Web button**: a ↩ rollback button (reply-arrow icon, same size as the Copy button) appears next to the Copy button in the corner of each message bubble → opens the affected-files list → confirm to roll back.
+1. **Web button**: a ↩ rollback button appears in the action strip under each finalized assistant reply, alongside the feedback buttons → opens the affected-files list → confirm to roll back.
 2. **Human command**: type in the composer:
    - `/rollback list` — list the turns you can roll back to
    - `/rollback preview <n>` — preview the files affected when rolling back to before turn n (no execution)
@@ -47,21 +47,21 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 
 ## Interface preview
 
-1. **Rollback button**: a ↩ button, the same size as Copy, in the corner of each message.
+1. **Rollback button**: a ↩ button in the action strip under each finalized assistant reply (next to the feedback buttons).
 
-   ![Rollback button](./docs/images/rollback-button.png)
+   ![Rollback button](./docs/images/en/rollback-button.png)
 
 2. **Rollback dialog & file-change notice**: clicking ↩ opens a confirmation dialog listing each affected file and its action — modified files are written back, created files are deleted (unrestorable ones are flagged "skip").
 
-   ![Rollback dialog & file-change notice](./docs/images/rollback-dialog.png)
+   ![Rollback dialog & file-change notice](./docs/images/en/rollback-dialog.jpeg)
 
 3. **Rollback divider & message returned to the composer**: after confirming, the rolled-back messages are hidden from the flow and a ↩ divider is rendered; the rolled-back turn's text/images return to the composer for further editing.
 
-   ![Rollback divider & message returned to the composer](./docs/images/rollback-divider-and-composer.png)
+   ![Rollback divider & message returned to the composer](./docs/images/en/rollback-divider-and-composer.jpeg)
 
 4. **Rolling back the first message**: when rolling back to before the first message, the chat shows a "rolled back to the start of the conversation" welcome page.
 
-   ![Rolling back the first message](./docs/images/rollback-hero.png)
+   ![Rolling back the first message](./docs/images/en/rollback-hero.jpeg)
 
 ## Architecture
 
@@ -70,7 +70,7 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 | `src/core/` | Pure logic (no DSH dependencies): checkpoint model, capture/merge, rollback planning, sliding window, session folding — all unit-test-covered |
 | `src/service.ts` | Host-side execution: captures pre-write content via `tools/result` + folds turns via `session/event`; performs restore/delete/truncate |
 | `src/index.ts` | Plugin body (host half): registers the `rollback` tool and the `/rollback` command |
-| `src/client/index.ts` | Browser half: the per-turn rollback button + affected-files dialog, reaching the host through the shipped `commands` Remote |
+| `src/client/index.ts` | Browser half: the rollback button on the official `assistant-actions` slot + affected-files dialog + localization, reaching the host through the shipped `commands` Remote |
 
 Key implementation points:
 
