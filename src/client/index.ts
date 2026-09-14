@@ -21,7 +21,7 @@ import { createPortal } from 'react-dom'
 import { FishLogo, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 
 /** Required services: slots, the `commands` Remote, the conversation node registry, and locale. */
-export const inject = ['slots', 'remote', 'remote.commands', 'conversationEvents', 'locale']
+export const inject = ['slots', 'remote', 'remote.commands', 'conversationEvents', 'locale', 'workspaces']
 
 /** Console diagnostics; set to true to debug the client logic. */
 const DEBUG = false
@@ -56,6 +56,7 @@ const zh = {
   'dialog.warning': '此操作不可撤销，将恢复本轮及之后受影响的工作区文件并截断模型上下文。',
   'dialog.analyzing': '正在分析受影响文件…',
   'dialog.noFiles': '本轮及之后无文件变更。',
+  'dialog.openInEditor': '在编辑器中打开',
   'dialog.cancel': '取消',
   'dialog.confirm': '确认回退',
   'dialog.busy': '回退中…',
@@ -78,6 +79,7 @@ const en: Record<keyof typeof zh, string> = {
   'dialog.warning': 'This action is irreversible. It will restore workspace files affected by this turn and later, and truncate the model context.',
   'dialog.analyzing': 'Analyzing affected files…',
   'dialog.noFiles': 'No file changes in this turn and later.',
+  'dialog.openInEditor': 'Open in editor',
   'dialog.cancel': 'Cancel',
   'dialog.confirm': 'Roll back',
   'dialog.busy': 'Rolling back…',
@@ -212,7 +214,7 @@ const CSS =
   '.rbk-head{padding:14px 16px 8px;font-size:14px;font-weight:700;}' +
   '.rbk-warn{padding:0 16px 8px;font-size:12px;color:var(--dsw-alias-label-secondary);}' +
   '.rbk-list{overflow-y:auto;padding:2px 8px;flex:1;}' +
-  '.rbk-row{display:flex;align-items:center;gap:8px;width:100%;text-align:left;padding:6px 8px;border-radius:7px;border:none;background:transparent;color:var(--dsw-alias-label-primary);font-size:12.5px;}' +
+  '.rbk-row{display:flex;align-items:center;gap:8px;width:100%;text-align:left;padding:6px 8px;border-radius:7px;border:none;background:transparent;color:var(--dsw-alias-label-primary);font-size:12.5px;cursor:pointer;}' +
   '.rbk-row:hover{background:color-mix(in srgb,var(--dsw-alias-label-primary) 10%,transparent);}' +
   '.rbk-tag{flex:none;font-size:11px;padding:1px 6px;border-radius:5px;}' +
   '.rbk-tag-restore{background:color-mix(in srgb,var(--dsw-alias-state-success-primary, #3fb27f) 22%,transparent);color:var(--dsw-alias-state-success-primary, #3fb27f);}' +
@@ -441,6 +443,7 @@ function RollbackAction({ messageId, useSession, t }: any): React.ReactElement |
 interface DriverProps {
   preview: (turn: number) => Promise<PreviewFile[]>
   execute: (turn: number) => Promise<void>
+  openFile: (path: string) => Promise<void>
   useSession: <T>(selector: (snapshot: any) => T) => T
   t: (key: RollbackKey) => string
   inputActions?: { setDraft(text: string): void; addImages?(ids: readonly string[]): boolean; pruneImages?(ids: readonly string[]): void }
@@ -453,7 +456,7 @@ interface DriverProps {
  * confirmation dialog, opened from the assistant action through the module
  * bridge. Renders nothing into its own dock seat.
  */
-function RollbackDriver({ preview, execute, useSession, inputActions, restoreImages, t }: DriverProps): React.ReactElement | null {
+function RollbackDriver({ preview, execute, openFile, useSession, inputActions, restoreImages, t }: DriverProps): React.ReactElement | null {
   if (typeof useSession !== 'function') {
     warnOnce('useSession', 'props lack useSession', Object.keys({ useSession }))
     return null
@@ -547,8 +550,9 @@ function RollbackDriver({ preview, execute, useSession, inputActions, restoreIma
             ? React.createElement('div', { className: 'rbk-empty' }, t('dialog.noFiles'))
             : null,
           files !== null && files.length > 0
-            ? files.map(f => React.createElement('div', {
-                key: f.path, className: 'rbk-row',
+            ? files.map(f => React.createElement('button', {
+                key: f.path, type: 'button', className: 'rbk-row', title: t('dialog.openInEditor'),
+                onClick: () => { void openFile(f.path).catch(() => {}) },
               },
                 React.createElement('span', { className: 'rbk-tag rbk-tag-' + f.action }, t(('tag.' + f.action) as RollbackKey)),
                 React.createElement('span', { className: 'rbk-path' }, f.path),
@@ -659,6 +663,7 @@ export function apply(ctx: any): void {
         execute: async (turn: number) => {
           await extCommand(ctx, sessionId, '/rollback ' + turn)
         },
+        openFile: (path: string) => ctx.workspaces.openPath(path),
         restoreImages: async (images: { name: string; mediaType: string; attachment: any }[]): Promise<string[]> => {
           const conversation = ctx.get?.('conversation')
           if (conversation === undefined || conversation.resolveImage === undefined || conversation.createDraftImages === undefined) return []
