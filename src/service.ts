@@ -19,6 +19,7 @@ import { fsMutationFrom, SessionFold } from './core/session-fold.ts'
 import { planRollback, type RestoredFile, type RollbackPlan, type SkippedFile } from './core/restore-plan.ts'
 import {
   planTruncationMarker,
+  shadowedSurfaceFrom,
   type SessionView,
   type TruncationMarkerPlan,
 } from './core/truncation-plan.ts'
@@ -272,7 +273,7 @@ export class RollbackService {
     // surface (e.g. restored/image turns). The authoritative truncation — and
     // exactly what `execute` shadows — is the session surface itself, so report
     // THAT for the "对话截断" hint instead of the fold's stale tail.
-    const shadowed = shadowedSurfaceFrom(session, fromTurn)
+    const shadowed = shadowedSurfaceFrom(viewOf(session), fromTurn)
     return {
       ...plan,
       truncation: shadowed.length > 0 ? { start: shadowed[0]!, end: shadowed[shadowed.length - 1]! } : null,
@@ -329,7 +330,7 @@ export class RollbackService {
         restored.push(file)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
-        skipped.push({ path: file.path, reason: 'io-error: ' + message })
+        skipped.push({ path: file.path, reason: `io-error: ${message}` })
       }
     }
 

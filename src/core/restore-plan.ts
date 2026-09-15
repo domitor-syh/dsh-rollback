@@ -23,7 +23,12 @@ export interface RestoredFile {
 /** A file the rollback cannot act on. */
 export interface SkippedFile {
   readonly path: string
-  readonly reason: 'basis-unknown'
+  /**
+   * Why the rollback skipped it: `basis-unknown` when no pre-turn content was
+   * recorded for the path (the plan is honest about it rather than restoring a
+   * guess), or `io-error: <message>` when the filesystem refused the write.
+   */
+  readonly reason: 'basis-unknown' | `io-error: ${string}`
 }
 
 /** Inclusive surface seq range to truncate from derived model history. */
