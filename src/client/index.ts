@@ -63,6 +63,8 @@ const zh = {
   'tag.restore': '恢复',
   'tag.delete': '删除',
   'tag.skip': '跳过',
+  'hero.title': '已回退到对话发起前',
+  'hero.sub': '对话与文件已恢复 · 在下方输入框继续',
 } satisfies Record<string, string>
 
 const en: Record<keyof typeof zh, string> = {
@@ -79,6 +81,8 @@ const en: Record<keyof typeof zh, string> = {
   'tag.restore': 'restore',
   'tag.delete': 'delete',
   'tag.skip': 'skip',
+  'hero.title': 'Rolled back to the start',
+  'hero.sub': 'Conversation and files restored · continue below',
 }
 
 type RollbackKey = keyof typeof zh
@@ -214,7 +218,15 @@ const CSS =
   '.rbk-cancel:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary);}' +
   '.rbk-confirm{padding:5px 12px;border-radius:7px;border:none;background:var(--dsw-alias-state-error-primary, #e5484d);color:#fff;font-size:12.5px;cursor:pointer;}' +
   '.rbk-confirm:hover:not(:disabled){filter:brightness(1.12);}' +
-  '.rbk-confirm:disabled{opacity:.6;cursor:wait;}'
+  '.rbk-confirm:disabled{opacity:.6;cursor:wait;}' +
+  // The welcome hero, shown when a rollback emptied the whole surface (rolled
+  // back to before the first message). An ordinary rollback renders no divider,
+  // so these rules only ever apply to the hero.
+  '.rbk-hero{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;min-height:40vh;padding:40px 24px;text-align:center;}' +
+  '.rbk-hero-brand{color:var(--dsw-alias-label-secondary);opacity:.85;}' +
+  '.rbk-hero-brand svg{width:44px;height:auto;}' +
+  '.rbk-hero-title{font-size:16px;font-weight:600;color:var(--dsw-alias-label-primary);}' +
+  '.rbk-hero-sub{font-size:13px;color:var(--dsw-alias-label-tertiary);}'
 
 /** The curved reply/return arrow (↩), as a React element this time. */
 function ReplyIcon(): React.ReactElement {
@@ -410,9 +422,13 @@ function syncHides(snapshot: any, sessionId?: string): void {
     const seq = node?.anchorSeq
     if (typeof seq !== 'number') continue
     if (node?.kind === 'rollback-marker') {
-      // The marker renders nothing; keep its (empty) seat out of the flow.
-      el.style.display = 'none'
-      hidden += 1
+      // The marker renders the welcome hero ONLY when its rollback emptied the
+      // whole surface and nothing followed the marker; every other marker seat
+      // renders nothing (no divider) and stays out of the flow.
+      const markerSeq = typeof node?.data?.seq === 'number' ? node.data.seq : node?.anchorSeq
+      const showHero = emptied && markerSeq === latestSeq && !hasContentAfter
+      el.style.display = showHero ? '' : 'none'
+      if (!showHero) hidden += 1
       continue
     }
     // Before its marker lands, a pending rollback hides the seats of the turns
@@ -649,14 +665,20 @@ const markerDefinition = {
   },
 }
 
-/** The divider/hero view for the rolled-back range — intentionally nothing.
+/** The welcome hero for a rollback that emptied the whole surface.
  *
- * The marker node still exists (it is the durable anchor `syncHides` reads the
- * truncated range from), but the rolled-back range must leave NO trace in the
- * transcript: the model's history has nothing in its place, so the UI shows
- * nothing either. */
-function RollbackMarkerView(): any {
-  return null
+ * The marker node itself is the durable anchor `syncHides` reads the truncated
+ * range from. An ordinary rollback renders NOTHING here — the model's history has
+ * nothing in the rolled-back range's place, so the transcript shows no divider
+ * either. Only when the rollback emptied everything (the user rolled back to
+ * before the first message) does the node render the centered welcome hero. */
+function RollbackMarkerView({ node, t }: any): any {
+  if (node?.data?.payload?.emptied !== true) return null
+  return React.createElement('div', { className: 'rbk-hero', role: 'status', 'data-rbk-marker': 'true' },
+    React.createElement('div', { className: 'rbk-hero-brand' }, React.createElement(FishLogo, { size: 44 })),
+    React.createElement('div', { className: 'rbk-hero-title' }, t('hero.title')),
+    React.createElement('div', { className: 'rbk-hero-sub' }, t('hero.sub')),
+  )
 }
 
 /** Client plugin body: stylesheet, dictionaries, the assistant action, and the driver. */
@@ -672,11 +694,15 @@ export function apply(ctx: any): void {
 
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'rollback: dictionaries')
 
-  // The marker node is registered as an event definition only: it is the durable
-  // anchor `syncHides` reads the truncated range from, and it renders nothing —
-  // a rollback leaves no divider, exactly like it leaves nothing in the model's
-  // history.
+  // The marker node is the durable anchor `syncHides` reads the truncated range
+  // from, and it renders the welcome hero when its rollback emptied the surface
+  // (see RollbackMarkerView) — an ordinary rollback renders no divider.
   ctx.conversationEvents.register(markerDefinition)
+
+  ctx.slots.inject('conversation.chat.node', () => ctx.slots.register(
+    { name: 'conversation.chat.node', key: 'rollback-marker', locale: NS },
+    RollbackMarkerView,
+  ))
 
   ctx.slots.inject('conversation.chat.assistant-actions', () => ctx.slots.register(
     { name: 'conversation.chat.assistant-actions', id: 'rollback', order: 20, locale: NS },

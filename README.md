@@ -59,7 +59,9 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 
    ![被回退的消息隐藏与文本返回输入框](./docs/images/rollback-divider-and-composer.png)
 
-4. **回退到第一条消息之前**：被回退的消息全部隐藏，对话区不再渲染任何分隔线、欢迎页或占位内容（模型侧同样为空）。
+4. **回退首条消息的界面**：回退到第一条消息之前时，对话区显示「已回退到对话发起前」欢迎页。
+
+   ![回退首条消息的界面](./docs/images/rollback-hero.png)
 
 ## 架构
 
@@ -81,7 +83,7 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 
 ## 已知限制（Known Limitations）
 
-- **聊天记录仍显示已回退消息**：DSH 的人类聊天记录按 append-origin 事件渲染（与内置 compaction 的行为一致），表层 `replace` 只截断**模型上下文**。插件在 UI 层把被回退区间的消息隐藏：点击回退后由客户端立刻隐藏，随后由日志里的持久标记接管（刷新/重启后依然隐藏）。界面上**不渲染任何分隔线或回退提示**。
+- **聊天记录仍显示已回退消息**：DSH 的人类聊天记录按 append-origin 事件渲染（与内置 compaction 的行为一致），表层 `replace` 只截断**模型上下文**。插件在 UI 层把被回退区间的消息隐藏：点击回退后由客户端立刻隐藏，随后由日志里的持久标记接管（刷新/重启后依然隐藏）。界面上**不渲染任何分隔线或回退提示**（把整段对话回退掉时显示欢迎页）。
 - **截断在下一轮请求前落盘**：标记需要一个已开启的 step，而回退发生在轮次之间，所以它在下一个 `agent/pre-step` 落盘——你在回退后第一次发消息时，那一次的请求就已经不含被回退的内容（若这个 append 失败，会在下一个请求边界自动重试）。
 - **检查点为进程内存态 + 20 轮 sidecar**：会话内的折叠状态随会话对象存于 in-memory（`WeakMap`），重启后由 sidecar（`storages/dsh-rollback/checkpoints-v2/`）重建——`seedFromLog` 会重放日志并用 sidecar 里的完整前置内容还原历史检查点，保留窗口为最近 20 轮（`KEEP_TURNS`），超出窗口的记录在加载时被剪枝。
 - **新建文件删除走本地文件系统**：文件系统抽象层没有删除原语，删除通过 `processPath` + Node `unlink` 完成，仅对本地后端可靠。

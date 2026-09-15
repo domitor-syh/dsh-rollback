@@ -59,7 +59,9 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 
    ![Rolled-back messages hidden & text returned to the composer](./docs/images/en/rollback-divider-and-composer.jpeg)
 
-4. **Rolling back to before the first message**: every rolled-back message is hidden and the chat renders no divider, no welcome page, and no placeholder (the model side is empty too).
+4. **Rolling back the first message**: when rolling back to before the first message, the chat shows a "rolled back to the start of the conversation" welcome page.
+
+   ![Rolling back the first message](./docs/images/en/rollback-hero.jpeg)
 
 ## Architecture
 
@@ -81,7 +83,7 @@ Key implementation points:
 
 ## Known limitations
 
-- **The human chat log still shows rolled-back messages**: DSH's human chat log renders by append-origin events (the same as built-in compaction); a surface `replace` only truncates the **model context**. The plugin hides the rolled-back range at the UI layer — immediately from the client, then driven by the durable marker in the log (so it survives refresh/restart). **No divider or rollback notice is rendered.**
+- **The human chat log still shows rolled-back messages**: DSH's human chat log renders by append-origin events (the same as built-in compaction); a surface `replace` only truncates the **model context**. The plugin hides the rolled-back range at the UI layer — immediately from the client, then driven by the durable marker in the log (so it survives refresh/restart). **No divider or rollback notice is rendered** (a welcome hero appears when a rollback empties the whole conversation).
 - **The truncation lands before the next request**: the marker needs an open step and a rollback happens between turns, so it is committed at the next `agent/pre-step` — the first message you send after a rollback is already answered from the truncated history (a failed commit retries at the next request boundary).
 - **Checkpoints are process-in-memory plus a 20-turn sidecar**: the session's fold state lives with the session object in memory (`WeakMap`) and is rebuilt from the sidecar on restart (`storages/dsh-rollback/checkpoints-v2/`) — `seedFromLog` replays the log and restores historical checkpoints with their full prior content from the sidecar, keeping the most recent 20 turns (`KEEP_TURNS`); records beyond that window are pruned at load.
 - **Created-file deletion goes through the local filesystem**: the filesystem abstraction has no delete primitive; deletion uses `processPath` + Node `unlink`, which is only reliable for the local backend.
