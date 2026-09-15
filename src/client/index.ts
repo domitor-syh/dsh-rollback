@@ -25,13 +25,23 @@ export const inject = ['slots', 'remote', 'remote.commands', 'conversationEvents
 
 /** Console diagnostics; set to true to debug the client logic. */
 const DEBUG = false
-/** Bundle revision, logged at apply so a stale cached bundle is identifiable. */
-const BUNDLE_REV = 5
+/** Bundle revision — always reported once at apply, so a stale cached bundle is
+ * identifiable in the console instead of looking like "the fix did nothing". */
+const BUNDLE_REV = 6
 function log(...parts: unknown[]): void {
   if (DEBUG) console.info('[rollback]', ...parts)
 }
+/**
+ * Warn once per key about a condition that makes the UI silently wrong.
+ *
+ * Deliberately NOT gated by {@link DEBUG}: every call site fires only when the
+ * plugin malfunctions (a thrown hide pass, a marker whose state cannot be read),
+ * and those failures look exactly like "the plugin did nothing at all" — the
+ * most expensive way to learn about a bug. Routine tracing stays behind the flag.
+ * @param key - the once-per-key identity of this warning.
+ * @param parts - the message and any values worth printing.
+ */
 function warnOnce(key: string, ...parts: unknown[]): void {
-  if (!DEBUG) return
   const seen = warnOnce as unknown as Record<string, boolean>
   if (seen[key] === true) return
   seen[key] = true
@@ -322,6 +332,25 @@ function toBottomButtons(scrollport: HTMLElement | null): HTMLElement[] {
 }
 
 /**
+ * The surface cut a rollback-marker node records, or undefined when unreadable.
+ *
+ * This is the ONE place that knows the marker state's shape, which `start()`
+ * writes as a FLAT `{ seq, truncatedFromSeq }` (the event's own seq plus the
+ * `surfaceOp.start` it replaced from). Reading it through a stale path is how a
+ * working rollback once became a silent no-op: the host truncated the
+ * conversation, the client collected zero markers, and nothing was hidden. A
+ * marker without a readable cut is therefore reported rather than skipped.
+ * @param node - a chat node of kind `rollback-marker`.
+ * @returns the cut seq, or undefined when the node carries no readable one.
+ */
+function markerCutOf(node: any): number | undefined {
+  const from = node?.data?.truncatedFromSeq
+  if (typeof from === 'number') return from
+  warnOnce('marker-shape', 'rollback marker node carries no readable cut seq', node?.data)
+  return undefined
+}
+
+/**
  * Whether a rollback emptied the whole conversation: no real (non-marker) chat
  * node survives before its cut.
  *
@@ -363,9 +392,9 @@ function syncHides(snapshot: any): void {
   for (const key of order) {
     const node = store.get(key)
     if (node?.kind !== 'rollback-marker') continue
-    const from = node?.data?.payload?.truncatedFromSeq
+    const from = markerCutOf(node)
     const seq = typeof node?.data?.seq === 'number' ? node.data.seq : node?.anchorSeq
-    if (typeof from !== 'number') continue
+    if (from === undefined) continue
     markers.push({ from, seq })
   }
   if (markers.length === 0) return
@@ -654,7 +683,11 @@ function RollbackMarkerView({ t }: any): any {
 
 /** Client plugin body: stylesheet, dictionaries, the assistant action, and the driver. */
 export function apply(ctx: any): void {
-  log('client apply: bundle loaded rev', BUNDLE_REV)
+  // Always reported, once per page load: the first question when a rollback looks
+  // like it did nothing is whether the browser is even running the new bundle.
+  // One line is a fair price for answering it without a debugging round trip.
+  console.info('[rollback] client bundle rev', BUNDLE_REV)
+  log('client apply')
   ctx.effect(() => {
     const style = document.createElement('style')
     style.dataset.plugin = 'rollback'
