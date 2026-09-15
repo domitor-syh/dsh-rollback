@@ -27,7 +27,7 @@ export const inject = ['slots', 'remote', 'remote.commands', 'conversationEvents
 const DEBUG = false
 /** Bundle revision — always reported once at apply, so a stale cached bundle is
  * identifiable in the console instead of looking like "the fix did nothing". */
-const BUNDLE_REV = 8
+const BUNDLE_REV = 9
 function log(...parts: unknown[]): void {
   if (DEBUG) console.info('[rollback]', ...parts)
 }
@@ -362,6 +362,18 @@ function markerCutOf(node: any): number | undefined {
 const INFRASTRUCTURE_KINDS = new Set<string>(['turn-tail', 'command'])
 
 /**
+ * Whether the transcript is currently emptied by a rollback, as {@link syncHides}
+ * last determined.
+ *
+ * The driver reads this and renders the welcome hero into a host element IT
+ * injects into the transcript. The hero used to be revealed by un-hiding the
+ * marker node's own seat — which silently produced nothing whenever that seat was
+ * missing, or nested inside a container the hide pass had collapsed. Hosting it
+ * ourselves removes that dependency entirely.
+ */
+const heroWanted = { visible: false }
+
+/**
  * Visually hide every chat seat inside a rollback's shadowed range, and reset
  * bottom-follow over a short armed window after a NEW marker lands. Durable-log
  * side effect: hidden seats need no slot because DSH renders them from events
@@ -428,25 +440,27 @@ function syncHides(snapshot: any): void {
   // marker seat renders nothing at all.
   const emptied = visible === 0
   let markerSeats = 0
-  let heroShown = false
   for (const key of order) {
     const node = store.get(key)
     if (node?.kind !== 'rollback-marker') continue
     const el = seatByKey.get(key)
     if (el === undefined) {
-      // The node exists but the DOM never gave it a seat, and the hero can only
-      // live inside that seat — the failure that looks exactly like "the rollback
-      // worked and the page stayed empty".
+      // The node exists but the DOM never gave it a seat. Harmless now that the
+      // hero is hosted by the driver, but it explains a page that hides
+      // everything and shows nothing.
       warnOnce('marker-seat', 'rollback marker node has no DOM seat', { key, seq: node?.anchorSeq })
       continue
     }
     markerSeats += 1
-    const markerSeq = typeof node?.data?.seq === 'number' ? node.data.seq : node?.anchorSeq
-    const showHero = emptied && markerSeq === latestSeq
-    el.style.display = showHero ? '' : 'none'
-    if (showHero) heroShown = true
-    else hidden += 1
+    // A marker seat renders nothing at all: no divider, and no hero either — the
+    // welcome page is hosted by the driver (see `heroWanted`).
+    el.style.display = 'none'
+    hidden += 1
   }
+
+  // The hero stands in for an emptied transcript, and only for one a ROLLBACK
+  // emptied: a session that never had content must not greet the user with it.
+  heroWanted.visible = markers.length > 0 && emptied
 
   const column = document.querySelector<HTMLElement>('[data-chat-flow=""]')
 
@@ -472,7 +486,7 @@ function syncHides(snapshot: any): void {
       seatsInDom: seatByKey.size,
       visibleContent: visible,
       hiddenSeats: hidden,
-      hero: heroShown ? 'shown' : 'no',
+      hero: heroWanted.visible ? 'wanted' : 'no',
     })
   }
 
@@ -494,6 +508,46 @@ function syncHides(snapshot: any): void {
       try { btn.click() } catch { /* next pass retries */ }
     }
   }
+}
+
+/**
+ * Keep the hero's host element in step with the emptiness `syncHides` reported.
+ *
+ * The host is a plain element this plugin owns, appended to the transcript, and
+ * the driver portals the hero into it. Owning the location is what makes the hero
+ * reliable: revealing the marker node's own seat depended on that seat existing
+ * and on nothing above it having been collapsed, and a rollback that hid the
+ * whole transcript could therefore show nothing at all.
+ * @param ref - the driver's host slot.
+ * @param setOn - React state setter; React bails out when the value is unchanged.
+ */
+function syncHeroHost(ref: { current: HTMLElement | null }, setOn: (on: boolean) => void): void {
+  let host = ref.current
+  if (host !== null && !document.body.contains(host)) {
+    ref.current = null
+    host = null
+  }
+  if (!heroWanted.visible) {
+    if (host !== null) {
+      host.remove()
+      ref.current = null
+    }
+    setOn(false)
+    return
+  }
+  const column = document.querySelector<HTMLElement>('[data-chat-flow=""]')
+  if (column === null) {
+    setOn(false)
+    return
+  }
+  if (host === null || !column.contains(host)) {
+    host?.remove()
+    host = document.createElement('div')
+    host.setAttribute('data-rbk-hero-host', 'true')
+    column.appendChild(host)
+    ref.current = host
+  }
+  setOn(true)
 }
 
 /** Module-level bridge: the assistant action opens the single dock-hosted dialog. */
@@ -545,6 +599,8 @@ function RollbackDriver({ preview, execute, openFile, useSession, inputActions, 
   const [files, setFiles] = React.useState<PreviewFile[] | null>(null)
   const [error, setError] = React.useState<string | null>(null)
   const [busy, setBusy] = React.useState(false)
+  const [heroOn, setHeroOn] = React.useState(false)
+  const heroHostRef = React.useRef<HTMLElement | null>(null)
 
   const openDialog = React.useCallback((turn: number) => {
     setDialogTurn(turn)
@@ -562,6 +618,7 @@ function RollbackDriver({ preview, execute, openFile, useSession, inputActions, 
     const ensure = () => {
       try { syncHides(snapshotRef.current) } catch (e) { warnOnce('sync-hides', 'syncHides threw', e) }
       try { syncHiddenRpcRows() } catch (e) { warnOnce('sync-rpc-rows', 'syncHiddenRpcRows threw', e) }
+      try { syncHeroHost(heroHostRef, setHeroOn) } catch (e) { warnOnce('sync-hero', 'syncHeroHost threw', e) }
     }
     ensureRef.current = () => {
       if (raf) cancelAnimationFrame(raf)
@@ -613,8 +670,12 @@ function RollbackDriver({ preview, execute, openFile, useSession, inputActions, 
     )
   }
 
-  if (dialogTurn === null) return null
-  return createPortal(
+  const hero = heroOn && heroHostRef.current !== null
+    ? createPortal(React.createElement(RollbackHero, { t }), heroHostRef.current)
+    : null
+  const dialog = dialogTurn === null
+    ? null
+    : createPortal(
     React.createElement('div', {
       className: 'rbk-overlay',
       onMouseDown: (ev: React.MouseEvent) => { if (ev.target === ev.currentTarget) setDialogTurn(null) },
@@ -650,6 +711,8 @@ function RollbackDriver({ preview, execute, openFile, useSession, inputActions, 
     ),
     document.body,
   )
+  if (hero === null && dialog === null) return null
+  return React.createElement(React.Fragment, null, hero, dialog)
 }
 
 /** The durable rollback checkpoint node, recognized from the event itself. */
@@ -696,17 +759,23 @@ const markerDefinition = {
   },
 }
 
-/** The welcome hero a rollback renders in place of the range it removed.
+/** The marker node's view: nothing at all.
  *
- * The marker node doubles as the durable anchor `syncHides` reads the truncated
- * range from. It always renders the hero, hidden by default: `syncHides` reveals
- * this seat ONLY when the rollback emptied the whole conversation (the user
- * rolled back to before the first message) and nothing followed — an ordinary
- * rollback leaves it hidden, so no divider or notice appears anywhere. Hiding it
- * in the markup rather than in a post-paint pass is what keeps a large hero from
- * flashing before the visibility pass runs. */
-function RollbackMarkerView({ t }: any): any {
-  return React.createElement('div', { className: 'rbk-hero', role: 'status', 'data-rbk-marker': 'true', style: { display: 'none' } },
+ * It exists as the durable anchor `syncHides` reads the truncated range from, and
+ * a rollback must leave no trace in the transcript — no divider, no notice. The
+ * welcome hero is NOT rendered here, because a node's seat can be missing or sit
+ * inside a container the hide pass collapsed, which would swallow the hero
+ * silently; the driver hosts it instead (see {@link RollbackHero}). */
+function RollbackMarkerView(): null {
+  return null
+}
+
+/** The welcome page a rollback shows once the transcript is empty.
+ *
+ * Rendered by {@link RollbackDriver} into a host element it injects into the
+ * transcript, so its visibility never depends on any node's seat. */
+function RollbackHero({ t }: any): any {
+  return React.createElement('div', { className: 'rbk-hero', role: 'status', 'data-rbk-hero': 'true' },
     React.createElement('div', { className: 'rbk-hero-brand' }, React.createElement(FishLogo, { size: 44 })),
     React.createElement('div', { className: 'rbk-hero-title' }, t('hero.title')),
     React.createElement('div', { className: 'rbk-hero-sub' }, t('hero.sub')),
