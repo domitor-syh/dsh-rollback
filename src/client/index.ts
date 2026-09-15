@@ -322,30 +322,23 @@ function toBottomButtons(scrollport: HTMLElement | null): HTMLElement[] {
 }
 
 /**
- * Rollbacks this client executed whose truncation marker has not landed yet.
+ * Whether a rollback emptied the whole conversation: no real (non-marker) chat
+ * node survives before its cut.
  *
- * The host commits the marker at the next turn's `agent/pre-step` (the empty
- * assistant message DSH accepts only inside an open step), so between the click
- * and the next prompt the durable marker does not exist and its hide rule cannot
- * apply. The client therefore hides the rolled-back seats by turn number itself —
- * otherwise a rollback would look like it did nothing until the next message.
- * Session-scoped and memory-only: the durable log stays the single source of
- * truth. `afterSeq` is the transcript tail when the rollback ran, so only the
- * marker produced by THIS rollback ends the pending state.
+ * Derived here rather than carried on the marker, because a `user/message` is
+ * projected to the model VERBATIM — anything the plugin added to it would become
+ * model input. The marker event itself supplies the cut (`surfaceOp.start`) and
+ * this client supplies the rest.
  */
-const pendingRollbacks = new Map<string, { fromTurn: number; afterSeq: number }>()
-
-/** Highest surface seq currently rendered (the transcript tail), or -1. */
-function tailSeqOf(snapshot: any): number {
-  const order = snapshot?.chat?.order
-  const store = snapshot?.chat?.nodes
-  if (!Array.isArray(order) || typeof store?.get !== 'function') return -1
-  let max = -1
+function isEmptyingRollback(order: readonly string[], store: any, from: number): boolean {
   for (const key of order) {
-    const seq = store.get(key)?.anchorSeq
-    if (typeof seq === 'number' && seq > max) max = seq
+    const node = store.get(key)
+    const seq = node?.anchorSeq
+    if (typeof seq !== 'number' || seq >= from) continue
+    if (node?.kind === 'rollback-marker') continue
+    return false
   }
-  return max
+  return true
 }
 
 /**
@@ -354,7 +347,7 @@ function tailSeqOf(snapshot: any): number {
  * side effect: hidden seats need no slot because DSH renders them from events
  * this plugin declared non-surface.
  */
-function syncHides(snapshot: any, sessionId?: string): void {
+function syncHides(snapshot: any): void {
   const chat = snapshot?.chat
   const order = chat?.order
   const store = chat?.nodes
@@ -366,40 +359,20 @@ function syncHides(snapshot: any, sessionId?: string): void {
     if (k !== null) seatByKey.set(k, el)
   }
 
-  const markers: { from: number; seq: number; emptied: boolean; fromTurn: number | null }[] = []
+  const markers: { from: number; seq: number }[] = []
   for (const key of order) {
     const node = store.get(key)
     if (node?.kind !== 'rollback-marker') continue
     const from = node?.data?.payload?.truncatedFromSeq
     const seq = typeof node?.data?.seq === 'number' ? node.data.seq : node?.anchorSeq
     if (typeof from !== 'number') continue
-    const payload = node?.data?.payload ?? {}
-    markers.push({
-      from,
-      seq,
-      emptied: payload.emptied === true,
-      fromTurn: typeof payload.fromTurn === 'number' ? payload.fromTurn : null,
-    })
+    markers.push({ from, seq })
   }
+  if (markers.length === 0) return
 
-  // A pending rollback ends when ITS OWN marker lands (same fromTurn, appended
-  // after the transcript tail we recorded) — from then on the marker's bounded
-  // seq rule owns the hiding.
-  const pending = sessionId === undefined ? undefined : pendingRollbacks.get(sessionId)
-  let pendingTurn: number | undefined
-  if (pending !== undefined) {
-    if (markers.some(m => m.fromTurn === pending.fromTurn && m.seq > pending.afterSeq)) {
-      pendingRollbacks.delete(sessionId!)
-    } else {
-      pendingTurn = pending.fromTurn
-    }
-  }
-
-  if (markers.length === 0 && pendingTurn === undefined) return
-
-  const latest = markers.length > 0 ? markers[markers.length - 1]! : null
-  const latestSeq = latest === null ? -1 : latest.seq
-  const emptied = latest !== null && latest.emptied
+  const latest = markers[markers.length - 1]!
+  const latestSeq = latest.seq
+  const emptied = isEmptyingRollback(order, store, latest.from)
 
   const column = document.querySelector<HTMLElement>('[data-chat-flow=""]')
   if (emptied) {
@@ -431,11 +404,7 @@ function syncHides(snapshot: any, sessionId?: string): void {
       if (!showHero) hidden += 1
       continue
     }
-    // Before its marker lands, a pending rollback hides the seats of the turns
-    // it targeted: the marker will name the same fromTurn and take over.
-    const nodeTurn = turnNoOf(node?.location) ?? (typeof node?.data?.turn === 'number' ? node.data.turn : undefined)
-    const pendingHide = pendingTurn !== undefined && typeof nodeTurn === 'number' && nodeTurn >= pendingTurn
-    const hide = pendingHide || markers.some(m => seq >= m.from && seq < m.seq)
+    const hide = markers.some(m => seq >= m.from && seq < m.seq)
     if (hide) { el.style.display = 'none'; hidden += 1 }
     else el.style.display = ''
   }
@@ -448,18 +417,16 @@ function syncHides(snapshot: any, sessionId?: string): void {
 
   // A rollback collapses the transcript: seats vanish, DSH's own bottom-follow
   // concludes the viewport left the bottom, and its "back to bottom" chip pops
-  // out of the collapse itself. Arm a short window per collapse — keyed both on
-  // the click-time pending hide and on the durable marker when it lands, and on
-  // the FIRST of either in a session — then pin the viewport to the bottom and
-  // re-engage follow by pressing the chip.
-  const collapseKey = latest !== null ? latest.seq : pendingTurn !== undefined ? -1 : undefined
+  // out of the collapse itself. Arm a short window per collapse — keyed on the
+  // marker, so the FIRST rollback in a session also arms — then pin the viewport
+  // to the bottom and re-engage follow by pressing the chip.
   const scrollMeta = syncHides as unknown as { collapseKey?: number; clearUntil?: number }
-  if (collapseKey !== undefined && scrollMeta.collapseKey !== collapseKey) {
-    scrollMeta.collapseKey = collapseKey
+  if (scrollMeta.collapseKey !== latestSeq) {
+    scrollMeta.collapseKey = latestSeq
     scrollMeta.clearUntil = Date.now() + 800
   }
   const armed = scrollMeta.clearUntil !== undefined && Date.now() < scrollMeta.clearUntil
-  if (armed && (latest === null || !hasContentAfter)) {
+  if (armed && !hasContentAfter) {
     const scrollport = scrollportOf(column)
     if (scrollport !== null) scrollport.scrollTop = scrollport.scrollHeight
     for (const btn of toBottomButtons(scrollport)) {
@@ -492,8 +459,6 @@ interface DriverProps {
   preview: (turn: number) => Promise<PreviewFile[]>
   execute: (turn: number) => Promise<void>
   openFile: (path: string) => Promise<void>
-  /** Session this driver is mounted for (the pending-rollback hide is keyed by it). */
-  sessionId?: string
   useSession: <T>(selector: (snapshot: any) => T) => T
   t: (key: RollbackKey) => string
   inputActions?: { setDraft(text: string): void; addImages?(ids: readonly string[]): boolean; pruneImages?(ids: readonly string[]): void }
@@ -506,7 +471,7 @@ interface DriverProps {
  * confirmation dialog, opened from the assistant action through the module
  * bridge. Renders nothing into its own dock seat.
  */
-function RollbackDriver({ preview, execute, openFile, sessionId, useSession, inputActions, restoreImages, t }: DriverProps): React.ReactElement | null {
+function RollbackDriver({ preview, execute, openFile, useSession, inputActions, restoreImages, t }: DriverProps): React.ReactElement | null {
   if (typeof useSession !== 'function') {
     warnOnce('useSession', 'props lack useSession', Object.keys({ useSession }))
     return null
@@ -534,7 +499,7 @@ function RollbackDriver({ preview, execute, openFile, sessionId, useSession, inp
     snapshotRef.current = snapshot
     let raf = 0
     const ensure = () => {
-      try { syncHides(snapshotRef.current, sessionId) } catch (e) { warnOnce('sync-hides', 'syncHides threw', e) }
+      try { syncHides(snapshotRef.current) } catch (e) { warnOnce('sync-hides', 'syncHides threw', e) }
       try { syncHiddenRpcRows() } catch (e) { warnOnce('sync-rpc-rows', 'syncHiddenRpcRows threw', e) }
     }
     ensureRef.current = () => {
@@ -567,10 +532,9 @@ function RollbackDriver({ preview, execute, openFile, sessionId, useSession, inp
       () => {
         setBusy(false)
         setDialogTurn(null)
-        // The host restores files right away but appends the truncation marker
-        // only at the next turn's first step, so hide the rolled-back seats now
-        // (the marker will take over and clear this entry).
-        if (sessionId !== undefined) pendingRollbacks.set(sessionId, { fromTurn: turn, afterSeq: tailSeqOf(snapshotRef.current) })
+        // The host restores the files and replaces the model-visible range in the
+        // same call, so the durable marker is already in the log: refresh now and
+        // the hide rule below applies it.
         ensureRef.current()
         const prompt = findUserPrompt(snapshotRef.current, turn)
         const images = findUserImages(snapshotRef.current, turn)
@@ -627,27 +591,33 @@ function RollbackDriver({ preview, execute, openFile, sessionId, useSession, inp
   )
 }
 
-/**
- * The message object a rollback marker rides on, for both marker generations:
- * current builds append a `user/message` (the data IS the message — the only
- * surface replacement DSH accepts outside an open step), while builds up to
- * 0.1.0 appended an empty `assistant/message` (`data.message`).
- */
-function markerMessageOf(event: any): any {
-  if (event?.type === 'user/message') return event.data
-  if (event?.type === 'assistant/message') return event?.data?.message
-  return undefined
-}
-
-/** The durable rollback divider, driven by the inert `message.rollback` facts. */
+/** The durable rollback checkpoint node, recognized from the event itself. */
 const markerDefinition = {
   kind: 'rollback-marker',
   target: 'chat',
   match: (event: any) => {
-    if (markerMessageOf(event)?.rollback === undefined) return null
-    return { id: String(event.seq), role: 'start' }
+    const op = event?.surfaceOp
+    if (op === undefined || op === 'append' || op?.op !== 'replace') return null
+    // Current builds: a `user/message` stamped with this plugin's provenance.
+    // Its content is the model-facing checkpoint text, so the client reads the
+    // rolled-back range from the EVENT (`surfaceOp.start`) instead.
+    if (event?.type === 'user/message') {
+      const source = event?.data?.source
+      if (source?.kind !== 'plugin' || source?.plugin !== 'rollback') return null
+      return { id: String(event.seq), role: 'start' }
+    }
+    // Legacy builds (<= 852c656): an empty-content `assistant/message` whose
+    // message carried the rollback facts. Still recognized so an old session's
+    // markers keep hiding their range.
+    if (event?.type === 'assistant/message' && event?.data?.message?.rollback !== undefined) {
+      return { id: String(event.seq), role: 'start' }
+    }
+    return null
   },
-  start: (_context: any, match: any) => ({ seq: match.event.seq, payload: markerMessageOf(match.event)?.rollback }),
+  start: (_context: any, match: any) => {
+    const from = match?.event?.surfaceOp?.start
+    return typeof from === 'number' ? { seq: match.event.seq, truncatedFromSeq: from } : undefined
+  },
   update: (context: any) => context.state,
   buildViewNode: (context: any) => {
     if (context.state === undefined) return null
@@ -665,16 +635,17 @@ const markerDefinition = {
   },
 }
 
-/** The welcome hero for a rollback that emptied the whole surface.
+/** The welcome hero a rollback renders in place of the range it removed.
  *
- * The marker node itself is the durable anchor `syncHides` reads the truncated
- * range from. An ordinary rollback renders NOTHING here — the model's history has
- * nothing in the rolled-back range's place, so the transcript shows no divider
- * either. Only when the rollback emptied everything (the user rolled back to
- * before the first message) does the node render the centered welcome hero. */
-function RollbackMarkerView({ node, t }: any): any {
-  if (node?.data?.payload?.emptied !== true) return null
-  return React.createElement('div', { className: 'rbk-hero', role: 'status', 'data-rbk-marker': 'true' },
+ * The marker node doubles as the durable anchor `syncHides` reads the truncated
+ * range from. It always renders the hero, hidden by default: `syncHides` reveals
+ * this seat ONLY when the rollback emptied the whole conversation (the user
+ * rolled back to before the first message) and nothing followed — an ordinary
+ * rollback leaves it hidden, so no divider or notice appears anywhere. Hiding it
+ * in the markup rather than in a post-paint pass is what keeps a large hero from
+ * flashing before the visibility pass runs. */
+function RollbackMarkerView({ t }: any): any {
+  return React.createElement('div', { className: 'rbk-hero', role: 'status', 'data-rbk-marker': 'true', style: { display: 'none' } },
     React.createElement('div', { className: 'rbk-hero-brand' }, React.createElement(FishLogo, { size: 44 })),
     React.createElement('div', { className: 'rbk-hero-title' }, t('hero.title')),
     React.createElement('div', { className: 'rbk-hero-sub' }, t('hero.sub')),
@@ -716,7 +687,6 @@ export function apply(ctx: any): void {
       id: 'rollback-driver',
       locale: NS,
       inject: (sessionId: string) => ({
-        sessionId,
         preview: async (turn: number) => {
           const r = await extCommand(ctx, sessionId, '/rollback preview ' + turn)
           return parsePreview(r.text)
