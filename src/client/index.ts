@@ -63,13 +63,6 @@ const zh = {
   'tag.restore': '恢复',
   'tag.delete': '删除',
   'tag.skip': '跳过',
-  'marker.label': '↩ 已回退到本轮发起前',
-  'marker.restore': '恢复',
-  'marker.delete': '删除',
-  'marker.files': '个文件',
-  'marker.truncatedOnly': '对话已截断',
-  'hero.title': '已回退到对话发起前',
-  'hero.sub': '对话与文件已恢复 · 在下方输入框继续',
 } satisfies Record<string, string>
 
 const en: Record<keyof typeof zh, string> = {
@@ -86,13 +79,6 @@ const en: Record<keyof typeof zh, string> = {
   'tag.restore': 'restore',
   'tag.delete': 'delete',
   'tag.skip': 'skip',
-  'marker.label': '↩ rolled back to before this turn',
-  'marker.restore': 'restore',
-  'marker.delete': 'delete',
-  'marker.files': 'files',
-  'marker.truncatedOnly': 'conversation truncated',
-  'hero.title': 'Rolled back to the start',
-  'hero.sub': 'Conversation and files restored · continue below',
 }
 
 type RollbackKey = keyof typeof zh
@@ -228,17 +214,7 @@ const CSS =
   '.rbk-cancel:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary);}' +
   '.rbk-confirm{padding:5px 12px;border-radius:7px;border:none;background:var(--dsw-alias-state-error-primary, #e5484d);color:#fff;font-size:12.5px;cursor:pointer;}' +
   '.rbk-confirm:hover:not(:disabled){filter:brightness(1.12);}' +
-  '.rbk-confirm:disabled{opacity:.6;cursor:wait;}' +
-  '.rbk-marker{display:flex;align-items:center;gap:10px;margin:12px 0;color:var(--dsw-alias-label-tertiary);font-size:12px;white-space:nowrap;}' +
-  '.rbk-marker::before,.rbk-marker::after{content:"";flex:1;height:1px;background:var(--dsw-alias-border-l2);}' +
-  '.rbk-num-add{color:var(--dsw-alias-state-success-primary, #3fb27f);}' +
-  '.rbk-num-del{color:var(--dsw-alias-state-error-primary, #e5484d);}' +
-  '.rbk-hero{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;min-height:40vh;padding:40px 24px;text-align:center;}' +
-  '.rbk-hero-icon{font-size:26px;line-height:1;color:var(--dsw-alias-label-tertiary);}' +
-  '.rbk-hero-brand{color:var(--dsw-alias-label-secondary);opacity:.85;}' +
-  '.rbk-hero-brand svg{width:44px;height:auto;}' +
-  '.rbk-hero-title{font-size:16px;font-weight:600;color:var(--dsw-alias-label-primary);}' +
-  '.rbk-hero-sub{font-size:13px;color:var(--dsw-alias-label-tertiary);}'
+  '.rbk-confirm:disabled{opacity:.6;cursor:wait;}'
 
 /** The curved reply/return arrow (↩), as a React element this time. */
 function ReplyIcon(): React.ReactElement {
@@ -334,12 +310,39 @@ function toBottomButtons(scrollport: HTMLElement | null): HTMLElement[] {
 }
 
 /**
+ * Rollbacks this client executed whose truncation marker has not landed yet.
+ *
+ * The host commits the marker at the next turn's `agent/pre-step` (the empty
+ * assistant message DSH accepts only inside an open step), so between the click
+ * and the next prompt the durable marker does not exist and its hide rule cannot
+ * apply. The client therefore hides the rolled-back seats by turn number itself —
+ * otherwise a rollback would look like it did nothing until the next message.
+ * Session-scoped and memory-only: the durable log stays the single source of
+ * truth. `afterSeq` is the transcript tail when the rollback ran, so only the
+ * marker produced by THIS rollback ends the pending state.
+ */
+const pendingRollbacks = new Map<string, { fromTurn: number; afterSeq: number }>()
+
+/** Highest surface seq currently rendered (the transcript tail), or -1. */
+function tailSeqOf(snapshot: any): number {
+  const order = snapshot?.chat?.order
+  const store = snapshot?.chat?.nodes
+  if (!Array.isArray(order) || typeof store?.get !== 'function') return -1
+  let max = -1
+  for (const key of order) {
+    const seq = store.get(key)?.anchorSeq
+    if (typeof seq === 'number' && seq > max) max = seq
+  }
+  return max
+}
+
+/**
  * Visually hide every chat seat inside a rollback's shadowed range, and reset
  * bottom-follow over a short armed window after a NEW marker lands. Durable-log
  * side effect: hidden seats need no slot because DSH renders them from events
  * this plugin declared non-surface.
  */
-function syncHides(snapshot: any): void {
+function syncHides(snapshot: any, sessionId?: string): void {
   const chat = snapshot?.chat
   const order = chat?.order
   const store = chat?.nodes
@@ -351,20 +354,40 @@ function syncHides(snapshot: any): void {
     if (k !== null) seatByKey.set(k, el)
   }
 
-  const markers: { from: number; seq: number; emptied: boolean }[] = []
+  const markers: { from: number; seq: number; emptied: boolean; fromTurn: number | null }[] = []
   for (const key of order) {
     const node = store.get(key)
     if (node?.kind !== 'rollback-marker') continue
     const from = node?.data?.payload?.truncatedFromSeq
     const seq = typeof node?.data?.seq === 'number' ? node.data.seq : node?.anchorSeq
     if (typeof from !== 'number') continue
-    markers.push({ from, seq, emptied: node?.data?.payload?.emptied === true })
+    const payload = node?.data?.payload ?? {}
+    markers.push({
+      from,
+      seq,
+      emptied: payload.emptied === true,
+      fromTurn: typeof payload.fromTurn === 'number' ? payload.fromTurn : null,
+    })
   }
-  if (markers.length === 0) return
 
-  const latest = markers[markers.length - 1]!
-  const latestSeq = latest.seq
-  const emptied = latest.emptied
+  // A pending rollback ends when ITS OWN marker lands (same fromTurn, appended
+  // after the transcript tail we recorded) — from then on the marker's bounded
+  // seq rule owns the hiding.
+  const pending = sessionId === undefined ? undefined : pendingRollbacks.get(sessionId)
+  let pendingTurn: number | undefined
+  if (pending !== undefined) {
+    if (markers.some(m => m.fromTurn === pending.fromTurn && m.seq > pending.afterSeq)) {
+      pendingRollbacks.delete(sessionId!)
+    } else {
+      pendingTurn = pending.fromTurn
+    }
+  }
+
+  if (markers.length === 0 && pendingTurn === undefined) return
+
+  const latest = markers.length > 0 ? markers[markers.length - 1]! : null
+  const latestSeq = latest === null ? -1 : latest.seq
+  const emptied = latest !== null && latest.emptied
 
   const column = document.querySelector<HTMLElement>('[data-chat-flow=""]')
   if (emptied) {
@@ -387,13 +410,16 @@ function syncHides(snapshot: any): void {
     const seq = node?.anchorSeq
     if (typeof seq !== 'number') continue
     if (node?.kind === 'rollback-marker') {
-      const markerSeq = typeof node?.data?.seq === 'number' ? node.data.seq : node?.anchorSeq
-      if (markerSeq !== latestSeq) { el.style.display = 'none'; hidden += 1; continue }
-      if (emptied) el.style.display = hasContentAfter ? 'none' : ''
-      else el.style.display = ''
+      // The marker renders nothing; keep its (empty) seat out of the flow.
+      el.style.display = 'none'
+      hidden += 1
       continue
     }
-    const hide = markers.some(m => seq >= m.from && seq < m.seq)
+    // Before its marker lands, a pending rollback hides the seats of the turns
+    // it targeted: the marker will name the same fromTurn and take over.
+    const nodeTurn = turnNoOf(node?.location) ?? (typeof node?.data?.turn === 'number' ? node.data.turn : undefined)
+    const pendingHide = pendingTurn !== undefined && typeof nodeTurn === 'number' && nodeTurn >= pendingTurn
+    const hide = pendingHide || markers.some(m => seq >= m.from && seq < m.seq)
     if (hide) { el.style.display = 'none'; hidden += 1 }
     else el.style.display = ''
   }
@@ -404,14 +430,20 @@ function syncHides(snapshot: any): void {
     log('syncHides ' + (emptied ? 'FULL-RESET' : 'PARTIAL') + ' marker@' + latestSeq + ' hidden=' + hidden + (hasContentAfter ? ' (content resumed)' : ''))
   }
 
-  const scrollMeta = syncHides as unknown as { lastMarkerSeq?: number; clearUntil?: number }
-  if (scrollMeta.lastMarkerSeq === undefined) {
-    scrollMeta.lastMarkerSeq = latestSeq
-  } else if (scrollMeta.lastMarkerSeq !== latestSeq) {
-    scrollMeta.lastMarkerSeq = latestSeq
-    scrollMeta.clearUntil = Date.now() + 400
+  // A rollback collapses the transcript: seats vanish, DSH's own bottom-follow
+  // concludes the viewport left the bottom, and its "back to bottom" chip pops
+  // out of the collapse itself. Arm a short window per collapse — keyed both on
+  // the click-time pending hide and on the durable marker when it lands, and on
+  // the FIRST of either in a session — then pin the viewport to the bottom and
+  // re-engage follow by pressing the chip.
+  const collapseKey = latest !== null ? latest.seq : pendingTurn !== undefined ? -1 : undefined
+  const scrollMeta = syncHides as unknown as { collapseKey?: number; clearUntil?: number }
+  if (collapseKey !== undefined && scrollMeta.collapseKey !== collapseKey) {
+    scrollMeta.collapseKey = collapseKey
+    scrollMeta.clearUntil = Date.now() + 800
   }
-  if (!hasContentAfter && scrollMeta.clearUntil !== undefined && Date.now() < scrollMeta.clearUntil) {
+  const armed = scrollMeta.clearUntil !== undefined && Date.now() < scrollMeta.clearUntil
+  if (armed && (latest === null || !hasContentAfter)) {
     const scrollport = scrollportOf(column)
     if (scrollport !== null) scrollport.scrollTop = scrollport.scrollHeight
     for (const btn of toBottomButtons(scrollport)) {
@@ -444,6 +476,8 @@ interface DriverProps {
   preview: (turn: number) => Promise<PreviewFile[]>
   execute: (turn: number) => Promise<void>
   openFile: (path: string) => Promise<void>
+  /** Session this driver is mounted for (the pending-rollback hide is keyed by it). */
+  sessionId?: string
   useSession: <T>(selector: (snapshot: any) => T) => T
   t: (key: RollbackKey) => string
   inputActions?: { setDraft(text: string): void; addImages?(ids: readonly string[]): boolean; pruneImages?(ids: readonly string[]): void }
@@ -456,7 +490,7 @@ interface DriverProps {
  * confirmation dialog, opened from the assistant action through the module
  * bridge. Renders nothing into its own dock seat.
  */
-function RollbackDriver({ preview, execute, openFile, useSession, inputActions, restoreImages, t }: DriverProps): React.ReactElement | null {
+function RollbackDriver({ preview, execute, openFile, sessionId, useSession, inputActions, restoreImages, t }: DriverProps): React.ReactElement | null {
   if (typeof useSession !== 'function') {
     warnOnce('useSession', 'props lack useSession', Object.keys({ useSession }))
     return null
@@ -484,7 +518,7 @@ function RollbackDriver({ preview, execute, openFile, useSession, inputActions, 
     snapshotRef.current = snapshot
     let raf = 0
     const ensure = () => {
-      try { syncHides(snapshotRef.current) } catch (e) { warnOnce('sync-hides', 'syncHides threw', e) }
+      try { syncHides(snapshotRef.current, sessionId) } catch (e) { warnOnce('sync-hides', 'syncHides threw', e) }
       try { syncHiddenRpcRows() } catch (e) { warnOnce('sync-rpc-rows', 'syncHiddenRpcRows threw', e) }
     }
     ensureRef.current = () => {
@@ -517,6 +551,11 @@ function RollbackDriver({ preview, execute, openFile, useSession, inputActions, 
       () => {
         setBusy(false)
         setDialogTurn(null)
+        // The host restores files right away but appends the truncation marker
+        // only at the next turn's first step, so hide the rolled-back seats now
+        // (the marker will take over and clear this entry).
+        if (sessionId !== undefined) pendingRollbacks.set(sessionId, { fromTurn: turn, afterSeq: tailSeqOf(snapshotRef.current) })
+        ensureRef.current()
         const prompt = findUserPrompt(snapshotRef.current, turn)
         const images = findUserImages(snapshotRef.current, turn)
         if (inputActions !== undefined) {
@@ -572,17 +611,27 @@ function RollbackDriver({ preview, execute, openFile, useSession, inputActions, 
   )
 }
 
+/**
+ * The message object a rollback marker rides on, for both marker generations:
+ * current builds append a `user/message` (the data IS the message — the only
+ * surface replacement DSH accepts outside an open step), while builds up to
+ * 0.1.0 appended an empty `assistant/message` (`data.message`).
+ */
+function markerMessageOf(event: any): any {
+  if (event?.type === 'user/message') return event.data
+  if (event?.type === 'assistant/message') return event?.data?.message
+  return undefined
+}
+
 /** The durable rollback divider, driven by the inert `message.rollback` facts. */
 const markerDefinition = {
   kind: 'rollback-marker',
   target: 'chat',
   match: (event: any) => {
-    const message = event?.data?.message
-    if (event?.type !== 'assistant/message' || event?.surfaceOp === 'append') return null
-    if (message?.rollback === undefined || !Array.isArray(message.content) || message.content.length !== 0) return null
+    if (markerMessageOf(event)?.rollback === undefined) return null
     return { id: String(event.seq), role: 'start' }
   },
-  start: (_context: any, match: any) => ({ seq: match.event.seq, payload: match.event.data.message.rollback }),
+  start: (_context: any, match: any) => ({ seq: match.event.seq, payload: markerMessageOf(match.event)?.rollback }),
   update: (context: any) => context.state,
   buildViewNode: (context: any) => {
     if (context.state === undefined) return null
@@ -600,29 +649,14 @@ const markerDefinition = {
   },
 }
 
-/** The divider/hero view for the rolled-back range. */
-function RollbackMarkerView({ node, t }: any): any {
-  const d = node?.data?.payload ?? {}
-  if (d.emptied === true) {
-    return React.createElement('div', { className: 'rbk-hero', role: 'status', 'data-rbk-marker': 'true' },
-      React.createElement('div', { className: 'rbk-hero-brand' }, React.createElement(FishLogo, { size: 44 })),
-      React.createElement('div', { className: 'rbk-hero-title' }, t('hero.title')),
-      React.createElement('div', { className: 'rbk-hero-sub' }, t('hero.sub')),
-    )
-  }
-  const restored = d.restoredCount ?? 0
-  const deleted = d.deletedCount ?? 0
-  const files = restored + deleted
-  return React.createElement('div', { className: 'rbk-marker', role: 'separator', 'data-rbk-marker': 'true' },
-    t('marker.label'),
-    files > 0
-      ? React.createElement(React.Fragment, null, ' · ',
-          React.createElement('span', { className: 'rbk-num-add' }, t('marker.restore') + ' ' + restored),
-          ' / ',
-          React.createElement('span', { className: 'rbk-num-del' }, t('marker.delete') + ' ' + deleted),
-          ' ' + t('marker.files'))
-      : ' · ' + t('marker.truncatedOnly'),
-  )
+/** The divider/hero view for the rolled-back range — intentionally nothing.
+ *
+ * The marker node still exists (it is the durable anchor `syncHides` reads the
+ * truncated range from), but the rolled-back range must leave NO trace in the
+ * transcript: the model's history has nothing in its place, so the UI shows
+ * nothing either. */
+function RollbackMarkerView(): any {
+  return null
 }
 
 /** Client plugin body: stylesheet, dictionaries, the assistant action, and the driver. */
@@ -638,11 +672,11 @@ export function apply(ctx: any): void {
 
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'rollback: dictionaries')
 
+  // The marker node is registered as an event definition only: it is the durable
+  // anchor `syncHides` reads the truncated range from, and it renders nothing —
+  // a rollback leaves no divider, exactly like it leaves nothing in the model's
+  // history.
   ctx.conversationEvents.register(markerDefinition)
-  ctx.slots.inject('conversation.chat.node', () => ctx.slots.register(
-    { name: 'conversation.chat.node', key: 'rollback-marker', locale: NS },
-    RollbackMarkerView,
-  ))
 
   ctx.slots.inject('conversation.chat.assistant-actions', () => ctx.slots.register(
     { name: 'conversation.chat.assistant-actions', id: 'rollback', order: 20, locale: NS },
@@ -656,6 +690,7 @@ export function apply(ctx: any): void {
       id: 'rollback-driver',
       locale: NS,
       inject: (sessionId: string) => ({
+        sessionId,
         preview: async (turn: number) => {
           const r = await extCommand(ctx, sessionId, '/rollback preview ' + turn)
           return parsePreview(r.text)
