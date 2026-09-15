@@ -27,7 +27,7 @@ export const inject = ['slots', 'remote', 'remote.commands', 'conversationEvents
 const DEBUG = false
 /** Bundle revision — always reported once at apply, so a stale cached bundle is
  * identifiable in the console instead of looking like "the fix did nothing". */
-const BUNDLE_REV = 7
+const BUNDLE_REV = 8
 function log(...parts: unknown[]): void {
   if (DEBUG) console.info('[rollback]', ...parts)
 }
@@ -427,15 +427,25 @@ function syncHides(snapshot: any): void {
   // so it hides the hero without any extra "nothing followed?" test. Every other
   // marker seat renders nothing at all.
   const emptied = visible === 0
+  let markerSeats = 0
+  let heroShown = false
   for (const key of order) {
-    const el = seatByKey.get(key)
-    if (el === undefined) continue
     const node = store.get(key)
     if (node?.kind !== 'rollback-marker') continue
+    const el = seatByKey.get(key)
+    if (el === undefined) {
+      // The node exists but the DOM never gave it a seat, and the hero can only
+      // live inside that seat — the failure that looks exactly like "the rollback
+      // worked and the page stayed empty".
+      warnOnce('marker-seat', 'rollback marker node has no DOM seat', { key, seq: node?.anchorSeq })
+      continue
+    }
+    markerSeats += 1
     const markerSeq = typeof node?.data?.seq === 'number' ? node.data.seq : node?.anchorSeq
     const showHero = emptied && markerSeq === latestSeq
     el.style.display = showHero ? '' : 'none'
-    if (!showHero) hidden += 1
+    if (showHero) heroShown = true
+    else hidden += 1
   }
 
   const column = document.querySelector<HTMLElement>('[data-chat-flow=""]')
@@ -451,6 +461,19 @@ function syncHides(snapshot: any): void {
   if (sig !== (syncHides as unknown as { sig?: string }).sig) {
     ;(syncHides as unknown as { sig?: string }).sig = sig
     log('syncHides ' + (emptied ? 'FULL-RESET' : 'PARTIAL') + ' marker@' + latestSeq + ' hidden=' + hidden + (hasContentAfter ? ' (content resumed)' : ''))
+    // One unconditional line, emitted only when the transcript state CHANGES. It
+    // answers the question a "the rollback worked but nothing showed" report
+    // always raises — how many markers were found, whether they got DOM seats,
+    // how much content stayed visible — without another debugging round trip.
+    console.info('[rollback] hides:', {
+      markers: markers.length,
+      latestMarker: latestSeq,
+      markerSeats,
+      seatsInDom: seatByKey.size,
+      visibleContent: visible,
+      hiddenSeats: hidden,
+      hero: heroShown ? 'shown' : 'no',
+    })
   }
 
   // A rollback collapses the transcript: seats vanish, DSH's own bottom-follow
