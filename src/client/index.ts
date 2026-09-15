@@ -27,7 +27,7 @@ export const inject = ['slots', 'remote', 'remote.commands', 'conversationEvents
 const DEBUG = false
 /** Bundle revision — always reported once at apply, so a stale cached bundle is
  * identifiable in the console instead of looking like "the fix did nothing". */
-const BUNDLE_REV = 6
+const BUNDLE_REV = 7
 function log(...parts: unknown[]): void {
   if (DEBUG) console.info('[rollback]', ...parts)
 }
@@ -351,24 +351,15 @@ function markerCutOf(node: any): number | undefined {
 }
 
 /**
- * Whether a rollback emptied the whole conversation: no real (non-marker) chat
- * node survives before its cut.
+ * Chat node kinds that are infrastructure rather than conversation content.
  *
- * Derived here rather than carried on the marker, because a `user/message` is
- * projected to the model VERBATIM — anything the plugin added to it would become
- * model input. The marker event itself supplies the cut (`surfaceOp.start`) and
- * this client supplies the rest.
+ * A visible one of these must not hold the welcome hero back once every real
+ * message is hidden: `turn-tail` is a per-turn action affordance, and `command`
+ * is a slash-command receipt (this plugin hides its own receipts separately).
+ * Anything NOT listed counts as content, so an unrecognized kind errs toward
+ * keeping the hero away rather than showing it over a message.
  */
-function isEmptyingRollback(order: readonly string[], store: any, from: number): boolean {
-  for (const key of order) {
-    const node = store.get(key)
-    const seq = node?.anchorSeq
-    if (typeof seq !== 'number' || seq >= from) continue
-    if (node?.kind === 'rollback-marker') continue
-    return false
-  }
-  return true
-}
+const INFRASTRUCTURE_KINDS = new Set<string>(['turn-tail', 'command'])
 
 /**
  * Visually hide every chat seat inside a rollback's shadowed range, and reset
@@ -401,13 +392,6 @@ function syncHides(snapshot: any): void {
 
   const latest = markers[markers.length - 1]!
   const latestSeq = latest.seq
-  const emptied = isEmptyingRollback(order, store, latest.from)
-
-  const column = document.querySelector<HTMLElement>('[data-chat-flow=""]')
-  if (emptied) {
-    const loadMoreBtn = column === null ? null : column.querySelector<HTMLElement>(':scope > div:not([data-chat-flow-key]) button')
-    if (loadMoreBtn !== null) loadMoreBtn.style.display = 'none'
-  }
 
   let hasContentAfter = false
   for (const key of order) {
@@ -416,26 +400,51 @@ function syncHides(snapshot: any): void {
     if (typeof seq === 'number' && seq > latestSeq && node?.kind !== 'rollback-marker') { hasContentAfter = true; break }
   }
 
+  // Pass 1 — content seats: hide every seat a rollback shadowed, and count what
+  // is still visible. The hero's condition is stated in terms of that COUNT, not
+  // of node positions, because the human transcript keeps a seat for every
+  // append-origin event: the seats an earlier rollback already hid stay in
+  // `order` forever, so a "is anything positioned before the cut?" test answers
+  // YES from the first rollback onward and the hero can never appear again.
   let hidden = 0
+  let visible = 0
   for (const key of order) {
     const el = seatByKey.get(key)
     if (el === undefined) continue
     const node = store.get(key)
     const seq = node?.anchorSeq
     if (typeof seq !== 'number') continue
-    if (node?.kind === 'rollback-marker') {
-      // The marker renders the welcome hero ONLY when its rollback emptied the
-      // whole surface and nothing followed the marker; every other marker seat
-      // renders nothing (no divider) and stays out of the flow.
-      const markerSeq = typeof node?.data?.seq === 'number' ? node.data.seq : node?.anchorSeq
-      const showHero = emptied && markerSeq === latestSeq && !hasContentAfter
-      el.style.display = showHero ? '' : 'none'
-      if (!showHero) hidden += 1
-      continue
-    }
+    if (node?.kind === 'rollback-marker') continue
     const hide = markers.some(m => seq >= m.from && seq < m.seq)
-    if (hide) { el.style.display = 'none'; hidden += 1 }
-    else el.style.display = ''
+    if (hide) { el.style.display = 'none'; hidden += 1; continue }
+    el.style.display = ''
+    if (!INFRASTRUCTURE_KINDS.has(node?.kind)) visible += 1
+  }
+
+  // Pass 2 — marker seats. The welcome hero stands in for an emptied transcript,
+  // so it shows on the NEWEST marker's seat exactly when the rollbacks left
+  // nothing visible behind them. Content that resumed after a marker is visible,
+  // so it hides the hero without any extra "nothing followed?" test. Every other
+  // marker seat renders nothing at all.
+  const emptied = visible === 0
+  for (const key of order) {
+    const el = seatByKey.get(key)
+    if (el === undefined) continue
+    const node = store.get(key)
+    if (node?.kind !== 'rollback-marker') continue
+    const markerSeq = typeof node?.data?.seq === 'number' ? node.data.seq : node?.anchorSeq
+    const showHero = emptied && markerSeq === latestSeq
+    el.style.display = showHero ? '' : 'none'
+    if (!showHero) hidden += 1
+  }
+
+  const column = document.querySelector<HTMLElement>('[data-chat-flow=""]')
+
+  // An emptied transcript also stops offering "load more": there is no earlier
+  // range left to reach for.
+  if (emptied) {
+    const loadMoreBtn = column === null ? null : column.querySelector<HTMLElement>(':scope > div:not([data-chat-flow-key]) button')
+    if (loadMoreBtn !== null) loadMoreBtn.style.display = 'none'
   }
 
   const sig = (emptied ? 'f' : 'p') + ':' + latestSeq + ':' + (hasContentAfter ? 'restart' : 'clean') + ':' + hidden
