@@ -27,7 +27,7 @@
  * @module @domitor-syh/dsh-rollback/store
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -38,6 +38,33 @@ export interface CheckpointRecord {
   operation: 'create' | 'update'
   /** File content BEFORE this turn's first touch; null only for a created file. */
   before: string | null
+}
+
+/**
+ * A rollback whose file restore already ran but whose conversation truncation is
+ * still pending. DSH accepts a surface replacement outside an open step only as a
+ * `user/message` (compaction's checkpoint shape), and a rollback command runs
+ * between turns, so the replacement is appended at the next `agent/pre-step` —
+ * before that turn's request is derived. Persisted so a restart between the
+ * rollback and the next prompt still truncates.
+ */
+export interface PendingTruncation {
+  sessionId: string
+  /** Turn the rollback targeted: everything from this turn onward is shadowed. */
+  fromTurn: number
+  /**
+   * Shadowed surface range captured when the rollback ran. Absent only on records
+   * written by builds before the range was captured; the applier then derives the
+   * range from `fromTurn`, which is safe because it runs before the next turn's
+   * prompt is appended.
+   */
+  shadowedFirst?: number
+  /** Last shadowed surface seq captured when the rollback ran. */
+  shadowedLast?: number
+  restoredCount: number
+  deletedCount: number
+  /** Epoch ms the rollback executed (diagnostics only). */
+  at: number
 }
 
 export type CheckpointMap = Map<number, Map<string, { operation: 'create' | 'update'; before: string | null }>>
@@ -65,6 +92,66 @@ function storageRoot(): string {
 function sessionFile(sessionId: string): string {
   const safe = sessionId.replace(/[\\/:*?"<>|]/g, '_')
   return join(storageRoot(), `${safe}.jsonl`)
+}
+
+/** Per-session pending-truncation file (one JSON object, overwritten in place). */
+function pendingFile(sessionId: string): string {
+  const safe = sessionId.replace(/[\\/:*?"<>|]/g, '_')
+  return join(dshHome(), 'storages', 'dsh-rollback', `pending-v${FORMAT_VERSION}`, `${safe}.json`)
+}
+
+/** Structural validation for one pending truncation read back from the sidecar. */
+function validPending(value: unknown, sessionId: string): value is PendingTruncation {
+  if (value === null || typeof value !== 'object') return false
+  const r = value as Record<string, unknown>
+  const bounded = Number.isSafeInteger(r.shadowedFirst) && Number.isSafeInteger(r.shadowedLast)
+    && (r.shadowedFirst as number) <= (r.shadowedLast as number)
+  const unbounded = r.shadowedFirst === undefined && r.shadowedLast === undefined
+  return r.sessionId === sessionId
+    && Number.isSafeInteger(r.fromTurn)
+    && (r.fromTurn as number) >= 1
+    && (bounded || unbounded)
+    && Number.isSafeInteger(r.restoredCount)
+    && Number.isSafeInteger(r.deletedCount)
+    && Number.isSafeInteger(r.at)
+}
+
+/**
+ * Record a pending conversation truncation (best-effort durability): the
+ * rollback's file changes are already on disk, so losing this record would let
+ * the model see a range the user rolled back.
+ */
+export function savePendingTruncation(record: PendingTruncation): void {
+  try {
+    const file = pendingFile(record.sessionId)
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, JSON.stringify(record) + '\n', 'utf8')
+  } catch {
+    /* memory state still carries it for this process */
+  }
+}
+
+/** Load one session's pending truncation, or null when none is recorded. */
+export function loadPendingTruncation(sessionId: string): PendingTruncation | null {
+  const file = pendingFile(sessionId)
+  if (!existsSync(file)) return null
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'))
+    if (validPending(parsed, sessionId)) return parsed
+    console.warn(`[dsh-rollback] pending truncation for session ${sessionId} is malformed; ignoring it`)
+  } catch {
+    console.warn(`[dsh-rollback] pending truncation for session ${sessionId} is unreadable; ignoring it`)
+  }
+  return null
+}
+
+/** Drop one session's pending truncation once the marker has been appended. */
+export function clearPendingTruncation(sessionId: string): void {
+  try {
+    unlinkSync(pendingFile(sessionId))
+  } catch {
+    /* absent is the desired end state */
+  }
 }
 
 /** Structural validation for one line read back from the sidecar. */

@@ -31,7 +31,7 @@ function planText(plan: RollbackPlan, header: string): string {
     lines.push(`  [跳过] ${file.path}（${file.reason}）`)
   }
   if (plan.restored.length === 0 && plan.skipped.length === 0) lines.push('  （无文件变更）')
-  lines.push(`  对话截断：${plan.truncation === null ? '否' : '是'}`)
+  lines.push(`  对话截断：${plan.truncation === null ? '否' : '将截断（你下一次发消息时）'}`)
   return lines.join('\n')
 }
 
@@ -72,6 +72,7 @@ export function apply(ctx: Context): void {
           fromTurn: { type: 'number', required: true },
           executed: { type: 'boolean', required: true },
           truncated: { type: 'boolean', required: true },
+          deferred: { type: 'boolean', required: true },
           restored: {
             type: 'array', required: true,
             items: {
@@ -108,6 +109,10 @@ export function apply(ctx: Context): void {
           fromTurn: turn,
           executed: false,
           truncated: plan.truncation !== null,
+          // Executing replaces the surface right away; it is deferred only when
+          // the surface moves under the replacement, and then it retries at the
+          // next request boundary.
+          deferred: false,
           restored: plan.restored.map(f => ({ path: f.path, action: f.action })),
           skipped: plan.skipped,
           summary: summarize(plan),
@@ -118,6 +123,7 @@ export function apply(ctx: Context): void {
         fromTurn: outcome.fromTurn,
         executed: true,
         truncated: outcome.truncated,
+        deferred: outcome.deferred,
         restored: outcome.restored.map(f => ({ path: f.path, action: f.action })),
         skipped: outcome.skipped,
         summary: outcome.summary,
