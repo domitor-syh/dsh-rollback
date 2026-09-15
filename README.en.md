@@ -95,11 +95,26 @@ Key implementation points:
 ## Development
 
 ```sh
-pnpm install    # install deps (prepare also builds once)
-pnpm build      # emit lib/index.js, lib/invariant.js, lib/client.js from src/
-pnpm test       # run the dependency-free core unit tests
-pnpm typecheck  # type-check core and tests
+pnpm install        # install deps (prepare also builds once)
+pnpm build          # emit lib/index.js, lib/invariant.js, lib/client.js from src/
+pnpm test           # run the dependency-free core unit tests
+pnpm typecheck      # tsc over core + tests, then scripts/typecheck-host.mjs over
+                    #   src/service.ts, src/index.ts, src/client/index.ts
+                    #   (the @deepseek-ai/* packages they import are not installed
+                    #     here, so only the TS2307/TS7006/TS7016 those absences
+                    #     cause are ignored; everything else fails — including
+                    #     TS2304, an undefined identifier)
+pnpm deploy:profile # pack and deploy into the DSH profile (default "web");
+                    #   restarting DSH afterwards is still up to you
 ```
+
+> ️ **Editing code requires `pnpm deploy:profile`**: DSH does not load this plugin from this
+> repository — it loads the copy a package manager extracted into the profile's `node_modules`
+> from the `file:` tarball (see the header of `scripts/deploy-profile.mjs`). Running `pnpm build`
+> alone only changes this repository's `lib/`, so the runtime is unchanged. The script packs,
+> refreshes both the referenced tarball and the extracted copy, verifies they match the build,
+> and then reminds you of the one step it cannot take: **restarting DSH**, because the host half
+> is loaded at startup and a running process keeps the code it booted with.
 
 ## License
 

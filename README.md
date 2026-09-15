@@ -95,11 +95,22 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 ## 开发
 
 ```sh
-pnpm install    # 安装依赖（prepare 会先构建一次）
-pnpm build      # 从 src/ 产出 lib/index.js、lib/invariant.js、lib/client.js
-pnpm test       # 运行核心逻辑（src/core/）单测
-pnpm typecheck  # 类型检查无 DSH 依赖的 core 与 tests
+pnpm install        # 安装依赖（prepare 会先构建一次）
+pnpm build          # 从 src/ 产出 lib/index.js、lib/invariant.js、lib/client.js
+pnpm test           # 运行核心逻辑（src/core/）单测
+pnpm typecheck      # tsc 检查 core + tests；scripts/typecheck-host.mjs 再检查
+                    #   src/service.ts、src/index.ts、src/client/index.ts
+                    #   （这三个文件 import 的 @deepseek-ai/* 不在本仓库安装，
+                    #     故只忽略这些包造成的 TS2307/TS7006/TS7016，
+                    #     其余一律视为真错误——含 TS2304「未定义标识符」）
+pnpm deploy:profile # 打包并部署到 DSH profile（默认 web），随后需重启 DSH
 ```
+
+> ⚠️ **改了代码必须 `pnpm deploy:profile`**：DSH 不是从本仓库加载插件，而是从 profile 的
+> `node_modules` 加载 `file:` tarball 解出来的副本（见 `scripts/deploy-profile.mjs` 的说明）。
+> 只跑 `pnpm build` 改的是本仓库的 `lib/`，**运行时毫无变化**。脚本会打包、更新 profile 引用的
+> tarball、覆盖已解出的副本并校验字节一致，最后提醒重启 DSH 与刷新页面——而**重启必须由你手动做**：
+> 宿主半侧在启动时载入，脚本无法替正在运行的进程换代码。
 
 ## 许可证
 

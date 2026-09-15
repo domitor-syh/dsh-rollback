@@ -3,7 +3,13 @@ lib/
 *.tsbuildinfo
 coverage/
 *.tgz
-scripts/
+# Local scratch diagnostics stay untracked, but the two scripts the package's own
+# commands depend on belong to the repo: `pnpm typecheck` runs typecheck-host, and
+# `pnpm deploy:profile` automates the deploy step whose absence silently leaves
+# DSH running an older build.
+scripts/*
+!scripts/typecheck-host.mjs
+!scripts/deploy-profile.mjs
 
 # OS cruft
 .DS_Store

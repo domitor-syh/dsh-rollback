@@ -376,7 +376,7 @@ function syncHides(snapshot: any): void {
 
   const column = document.querySelector<HTMLElement>('[data-chat-flow=""]')
   if (emptied) {
-    const loadMoreBtn = column === null ? null : column.querySelector(':scope > div:not([data-chat-flow-key]) button')
+    const loadMoreBtn = column === null ? null : column.querySelector<HTMLElement>(':scope > div:not([data-chat-flow-key]) button')
     if (loadMoreBtn !== null) loadMoreBtn.style.display = 'none'
   }
 

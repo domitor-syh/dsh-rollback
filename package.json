@@ -34,7 +34,9 @@
     "build": "tsdown",
     "prepare": "tsdown",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && node scripts/typecheck-host.mjs",
+    "typecheck:host": "node scripts/typecheck-host.mjs",
+    "deploy:profile": "node scripts/deploy-profile.mjs"
   },
   "license": "MIT",
   "engines": {
