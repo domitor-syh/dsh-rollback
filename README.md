@@ -18,7 +18,7 @@
 | 按轮次检查点 | 每轮发起前建立检查点，只记录该轮实际触碰的文件（Copy-before-Write 前置内容），非全量快照 |
 | 10 轮滑动窗口 | 借鉴 TRAE「仅最近 10 轮」，超出窗口的检查点被丢弃 |
 | 文件回退 | 修改过的文件写回本轮前内容；本轮新建的文件被删除；无法恢复的文件单独报告跳过 |
-| 原位截断 | 用 `user/message` 表层 `replace`（compaction 同款机制）截断模型上下文，保持同一 session id |
+| 原位截断 | 用**空内容 `assistant/message`**（派生为 null，模型侧不留任何痕迹）就地替换模型上下文，保持同一 session id |
 | 三种触发入口 | 模型工具 `rollback`、人工命令 `/rollback`、Web 端每条已完成回复的「回退」按钮 |
 | 受影响文件列表 | Web 按钮弹出对话框，列出本轮及之后受影响文件及动作（恢复/删除/跳过），点击文件可在编辑器打开 |
 
@@ -55,13 +55,11 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 
    ![回退弹窗与文件修改提示](./docs/images/rollback-dialog.png)
 
-3. **回退分隔线与消息返回输入框**：确认后，被回退的消息从对话流中隐藏并渲染一条 ↩ 分隔线；被回退那一轮的用户文本 / 图片自动回到输入框，方便接着改。
+3. **被回退的消息从对话流中隐藏**：确认后被回退的消息立刻隐藏（不渲染分隔线，模型侧同样不留任何痕迹）；被回退那一轮的用户文本 / 图片自动回到输入框，方便接着改。
 
-   ![回退分隔线与消息返回输入框](./docs/images/rollback-divider-and-composer.png)
+   ![被回退的消息隐藏与文本返回输入框](./docs/images/rollback-divider-and-composer.png)
 
-4. **回退首条消息的界面**：回退到第一条消息之前时，对话区显示「已回退到对话发起前」欢迎页。
-
-   ![回退首条消息的界面](./docs/images/rollback-hero.png)
+4. **回退到第一条消息之前**：被回退的消息全部隐藏，对话区不再渲染任何分隔线、欢迎页或占位内容（模型侧同样为空）。
 
 ## 架构
 
@@ -75,13 +73,17 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 关键实现点：
 
 - **前置内容捕获**：`write`/`edit` 工具的执行结果里已带 `before`/`after`，通过 `ctx.on('tools/result')` 取到完整前置内容（会话日志里只有 3 行上下文 diff，不足以还原文件——所以必须用 live 结果）。
-- **原位截断**：对当前 `session.surface.nodes` 中「第 n 轮及之后」的连续节点，append 一个**空内容 `assistant/message`** 表层 `replace`（`surfaceOp: { op:'replace', start, end }` + `sourceEventSeqs` 覆盖所有被遮蔽节点）。空 assistant 派生为 null——模型下一次请求**完全不含**被回退内容，也不带任何标记；会话 id 不变。
+- **原位截断**：对当前 `session.surface.nodes` 中「第 n 轮及之后」的连续节点，append 一个**空内容 `assistant/message`** 表层 `replace`（`surfaceOp: { op:'replace', start, end }` + `sourceEventSeqs` 覆盖所有被遮蔽节点），就地替换这段历史；会话 id 不变。
+  - **模型侧完全无痕**：空内容 assistant 被 `deriveMessages` 投影为 null，所以被回退的内容从模型历史里消失，而且**没有任何东西取而代之**——不是摘要、不是提示、也不是空轮次，什么都不发往 provider。
+  - **落盘时机**：这样的消息必须处于已开启的 step 内，而 `/rollback` 命令运行在轮次之间，因此插件把截断记为 pending（`storages/dsh-rollback/pending-v2/`），在**下一轮的 `agent/pre-step`**（请求派生之前）用自己拥有的一个 step 承载该标记再落盘：用户发出下一条消息时，那一次的请求里就已经看不到被回退的内容了。失败会自动在下一个请求边界重试。
+  - **为什么不能自造轮次**：插件与 agent loop 各自维护「下一个轮次号」，合成轮次会让两者撞号（日志里出现两个同号 `turn/start`），Web 客户端装配对话树时会因「同一个 start 出现两次」直接抛错、整个历史窗口构建失败、该会话再也打不开。也不能在 `session/event` 观察者里直接 append（DSH 会拒绝：`session append cannot reenter while another append is being published`），所以选择在请求边界的 hook 里做。回归测试：`tests/truncation-plan.test.ts`。
 - **客户端传输**：不引入自定义 Typert 构建，复用已出厂 `ctx.remote.commands.execute` 调 `/rollback …`。
 
 ## 已知限制（Known Limitations）
 
-- **聊天记录仍显示已回退消息**：DSH 的人类聊天记录按 append-origin 事件渲染（与内置 compaction 的行为一致），表层 `replace` 只截断**模型上下文**。插件在 UI 层把被回退区间的消息直接隐藏（持久标记驱动，刷新/重启后保持），并渲染一条「↩ 已回退到本轮发起前」分隔线。
-- **检查点为进程内存态**：随会话对象存于 in-memory（`WeakMap`），重启后丢失；重启后本轮内新触碰的文件可被重新捕获，但历史检查点不复原。
+- **聊天记录仍显示已回退消息**：DSH 的人类聊天记录按 append-origin 事件渲染（与内置 compaction 的行为一致），表层 `replace` 只截断**模型上下文**。插件在 UI 层把被回退区间的消息隐藏：点击回退后由客户端立刻隐藏，随后由日志里的持久标记接管（刷新/重启后依然隐藏）。界面上**不渲染任何分隔线或回退提示**。
+- **截断在下一轮请求前落盘**：标记需要一个已开启的 step，而回退发生在轮次之间，所以它在下一个 `agent/pre-step` 落盘——你在回退后第一次发消息时，那一次的请求就已经不含被回退的内容（若这个 append 失败，会在下一个请求边界自动重试）。
+- **检查点为进程内存态 + 20 轮 sidecar**：会话内的折叠状态随会话对象存于 in-memory（`WeakMap`），重启后由 sidecar（`storages/dsh-rollback/checkpoints-v2/`）重建——`seedFromLog` 会重放日志并用 sidecar 里的完整前置内容还原历史检查点，保留窗口为最近 20 轮（`KEEP_TURNS`），超出窗口的记录在加载时被剪枝。
 - **新建文件删除走本地文件系统**：文件系统抽象层没有删除原语，删除通过 `processPath` + Node `unlink` 完成，仅对本地后端可靠。
 - **回退不可撤销**：执行即截断，与 TRAE 语义一致，不做 redo 链；对话框的受影响文件预览是该风险的补偿交互。
 - **命令副作用不在回退范围**：`npm install`、写数据库、发请求等外部副作用无法回退（所有 checkpoint 方案的天然边界）。

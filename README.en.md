@@ -18,7 +18,7 @@ A TRAE-style "roll back to before this turn" plugin for the [DeepSeek Harness](h
 | Per-turn checkpoints | A checkpoint is captured before each turn, recording only the files actually touched (Copy-before-Write prior content), not a full snapshot |
 | 10-turn sliding window | Mirrors TRAE's "last 10 turns only"; checkpoints beyond the window are dropped |
 | File rollback | Modified files are written back to their pre-turn content; files created this turn are deleted; unrestorable files are reported as skipped |
-| In-place truncation | Truncates the model context via a `user/message` surface `replace` (the same mechanism compaction uses), keeping the same session id |
+| In-place truncation | Truncates the model context with an **empty-content `assistant/message`** (projects to null — no trace on the model side), keeping the same session id |
 | Three entry points | The `rollback` model tool, the `/rollback` human command, and a Web rollback button on each finalized reply |
 | Affected-file list | The Web button opens a dialog listing the files affected by this and later turns and their actions (restore/delete/skip); clicking a file opens it in the editor |
 
@@ -55,13 +55,11 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 
    ![Rollback dialog & file-change notice](./docs/images/en/rollback-dialog.jpeg)
 
-3. **Rollback divider & message returned to the composer**: after confirming, the rolled-back messages are hidden from the flow and a ↩ divider is rendered; the rolled-back turn's text/images return to the composer for further editing.
+3. **Rolled-back messages hidden**: after confirming, the rolled-back messages are hidden immediately (no divider is rendered, and there is no trace on the model side either); the rolled-back turn's text/images return to the composer for further editing.
 
-   ![Rollback divider & message returned to the composer](./docs/images/en/rollback-divider-and-composer.jpeg)
+   ![Rolled-back messages hidden & text returned to the composer](./docs/images/en/rollback-divider-and-composer.jpeg)
 
-4. **Rolling back the first message**: when rolling back to before the first message, the chat shows a "rolled back to the start of the conversation" welcome page.
-
-   ![Rolling back the first message](./docs/images/en/rollback-hero.jpeg)
+4. **Rolling back to before the first message**: every rolled-back message is hidden and the chat renders no divider, no welcome page, and no placeholder (the model side is empty too).
 
 ## Architecture
 
@@ -75,13 +73,17 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 Key implementation points:
 
 - **Pre-content capture**: `write`/`edit` tool results already carry `before`/`after`; the full prior content is taken through `ctx.on('tools/result')` (the session log only keeps 3-line context diffs, which can't reconstruct a file — so the live result is required).
-- **In-place truncation**: for the consecutive nodes in `session.surface.nodes` from turn n onward, it appends an **empty-content `assistant/message`** surface `replace` (`surfaceOp: { op:'replace', start, end }` + `sourceEventSeqs` covering every shadowed node). The empty assistant derives to null — the model's next request contains **none** of the rolled-back content and carries no marker; the session id is unchanged.
+- **In-place truncation**: for the consecutive nodes in `session.surface.nodes` from turn n onward, it appends an **empty-content `assistant/message`** surface `replace` (`surfaceOp: { op:'replace', start, end }` + `sourceEventSeqs` covering every shadowed node), replacing that span of history in place; the session id is unchanged.
+  - **Nothing on the model side**: `deriveMessages` projects an empty assistant message to null, so the rolled-back range leaves the model's history with **nothing** in its place — no summary, no note, no empty turn; nothing extra is ever sent to the provider.
+  - **When it lands**: such a message must sit inside an open step, and a `/rollback` command runs between turns, so the plugin records the truncation as pending (`storages/dsh-rollback/pending-v2/`) and commits the marker at the **next turn's `agent/pre-step`** — before that request is derived. Your first message after a rollback is already answered from the truncated history; a failed commit retries at the next request boundary.
+  - **Why no synthetic turn**: the plugin and the agent loop each track "the next turn number" independently, so a synthetic turn makes them collide (two `turn/start` events with one number) — the Web client then refuses to rebuild the session ("… received more than one start Match"), losing the conversation after the rollback and leaving the session unopenable. Appending directly from a `session/event` observer is rejected too ("session append cannot reenter while another append is being published"), which is why the host uses the request-boundary hook. Regression tests: `tests/truncation-plan.test.ts`.
 - **Client transport**: no custom Typert build is introduced; it reuses the shipped `ctx.remote.commands.execute` to call `/rollback …`.
 
 ## Known limitations
 
-- **The human chat log still shows rolled-back messages**: DSH's human chat log renders by append-origin events (the same as built-in compaction); a surface `replace` only truncates the **model context**. The plugin hides the rolled-back range at the UI layer (persistent marker driven, survives refresh/restart) and renders a "↩ rolled back to before this turn" divider.
-- **Checkpoints are process-in-memory**: they live with the session object in memory (`WeakMap`) and are lost on restart; after a restart, files touched within the current turn can be re-captured, but historical checkpoints are not restored.
+- **The human chat log still shows rolled-back messages**: DSH's human chat log renders by append-origin events (the same as built-in compaction); a surface `replace` only truncates the **model context**. The plugin hides the rolled-back range at the UI layer — immediately from the client, then driven by the durable marker in the log (so it survives refresh/restart). **No divider or rollback notice is rendered.**
+- **The truncation lands before the next request**: the marker needs an open step and a rollback happens between turns, so it is committed at the next `agent/pre-step` — the first message you send after a rollback is already answered from the truncated history (a failed commit retries at the next request boundary).
+- **Checkpoints are process-in-memory plus a 20-turn sidecar**: the session's fold state lives with the session object in memory (`WeakMap`) and is rebuilt from the sidecar on restart (`storages/dsh-rollback/checkpoints-v2/`) — `seedFromLog` replays the log and restores historical checkpoints with their full prior content from the sidecar, keeping the most recent 20 turns (`KEEP_TURNS`); records beyond that window are pruned at load.
 - **Created-file deletion goes through the local filesystem**: the filesystem abstraction has no delete primitive; deletion uses `processPath` + Node `unlink`, which is only reliable for the local backend.
 - **Rollback is irreversible**: executing truncates, consistent with TRAE semantics, with no redo chain; the affected-files preview in the dialog compensates for this risk.
 - **Command side effects are out of scope**: `npm install`, database writes, network requests, and other external side effects cannot be rolled back (the inherent boundary of every checkpoint approach).
