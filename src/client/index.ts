@@ -27,7 +27,7 @@ export const inject = ['slots', 'remote', 'remote.commands', 'conversationEvents
 const DEBUG = false
 /** Bundle revision — always reported once at apply, so a stale cached bundle is
  * identifiable in the console instead of looking like "the fix did nothing". */
-const BUNDLE_REV = 10
+const BUNDLE_REV = 11
 function log(...parts: unknown[]): void {
   if (DEBUG) console.info('[rollback]', ...parts)
 }
@@ -400,7 +400,14 @@ function syncHides(snapshot: any): void {
     if (from === undefined) continue
     markers.push({ from, seq })
   }
-  if (markers.length === 0) return
+  // A session with no rollback marker must CLEAR the flag, not skip past it:
+// `heroWanted` is module state that outlives the session it was set in, so
+// returning early here left the welcome page standing at the end of every
+// conversation opened afterwards — until a page reload reset the module.
+  if (markers.length === 0) {
+    heroWanted.visible = false
+    return
+  }
 
   const latest = markers[markers.length - 1]!
   const latestSeq = latest.seq
@@ -643,6 +650,11 @@ function RollbackDriver({ preview, execute, openFile, useSession, inputActions, 
       obs.disconnect()
       if (raf) cancelAnimationFrame(raf)
       openRollbackDialog = null
+      // Leave no hero behind for the next session: the flag is module state, and
+      // this driver is unmounted when the user switches conversations.
+      heroWanted.visible = false
+      heroHostRef.current?.remove()
+      heroHostRef.current = null
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
