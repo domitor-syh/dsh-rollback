@@ -72,24 +72,23 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 
 关键实现点：
 
-- **前置内容捕获**：`write`/`edit` 工具的执行结果里已带 `before`/`after`，通过 `ctx.on('tools/result')` 取到完整前置内容（会话日志里只有 3 行上下文 diff，不足以还原文件——所以必须用 live 结果）。
-- **原位截断**：对当前 `session.surface.nodes` 中「第 n 轮及之后」的连续节点，append 一个 **`user/message`** 表层 `replace`（`surfaceOp: { op:'replace', start, end }` + `sourceEventSeqs` 覆盖所有被遮蔽节点），就地替换这段历史；会话 id 不变。
-  - **借的是官方那把刀**：DSH 自己就是用「`user/message` + 表层 `replace`」重写模型可见历史的——内置 `/compact` 的检查点（`compaction-basic`）与 `tool-result-pruner` 都是这个形状，所以这不是旁路，而是官方原语。
-  - **回退当场落盘**：`user/message` 是唯一不受会话不变式约束的消息类事件，**可以在轮次之间 append**（不需要已开启的 turn/step），因此标记在 `/rollback` 执行的那一刻就写进日志——被回退区间立即隐藏、欢迎页立即出现，刷新页面也不会让消息复活。
-  - **为什么不用「空 `assistant/message`」（模型侧完全无痕那个方案）**：空内容 assistant 确实被 `deriveMessages` 投影为 null、模型看不到，但 DSH 只接受它**处于已开启的 step 内**；而轮次之间没有 step，自建 step 又不可能——step 编号必须严格等于 agent loop 的下一个编号（顺序不变式），我们占掉之后 loop 自己的 `step/start` 会失败、整轮崩掉。自造 turn 更糟：插件与 agent loop 各自维护「下一个轮次号」，撞号会在日志里产生两个同号 `turn/start`，Web 客户端装配对话树时直接抛错、历史窗口构建失败、该会话再也打不开。
-  - **代价（有意换取）**：模型会看到这段检查点文字。措辞照抄 DSH 原生 compaction 的框架——明说这是什么、并指示模型不要提及——所以模型不需要猜、也不会当成待办；被回退的内容本身则**完全不在**模型历史里（表层 `replace` 已把它们移除）。
-  - 回归测试：`tests/truncation-plan.test.ts`（含「不得退回 assistant/message 或任何需要 step 的形状」的守卫用例）。
-- **欢迎页（hero）**：把整段对话回退掉之后显示。它由**插件自己注入到对话区的宿主元素**承载（driver 用 React portal 渲染进去），**不依赖标记节点是否拥有 DOM 座位**。早期实现靠"取消隐藏标记座位"来显示，座位缺失、或座位上层容器被折叠时会**静默失效**——表现为"全部隐藏却什么都不显示"，所以改成由插件自己提供位置。
-- **客户端传输**：不引入自定义 Typert 构建，复用已出厂 `ctx.remote.commands.execute` 调 `/rollback …`。
+- **前置内容捕获**：`write`/`edit` 的执行结果里已带 `before`/`after`，用 `ctx.on('tools/result')` 取完整前置内容；`str_replace_editor` 的结果只有渲染文本，改由 `tools/pre-execute` 在调用前预读目标。
+- **原位截断**：对当前 `session.surface.nodes` 中「第 n 轮及之后」的连续节点，append 一条 **`user/message`** 表层 `replace`（`surfaceOp: { op:'replace', start, end }` + `sourceEventSeqs` 覆盖全部被遮蔽节点），就地替换这段历史；会话 id 不变。
+  - 标记在 `/rollback` 执行时**当场**写入日志，被回退区间随即从模型历史中消失。
+  - 标记内容是一段自动生成的检查点说明，并指示模型不要提及它；再次回退到同一点时，新标记的替换范围覆盖旧标记，只保留一条。
+- **界面隐藏**：客户端按标记的替换起点，把被回退区间内的聊天座位隐藏（`display:none`）；隐藏由日志里的持久标记驱动，刷新/重启后保持。
+- **欢迎页**：把整段对话回退掉之后，由 driver 往对话区注入宿主元素，再用 React portal 把欢迎页渲染进去。
+- **客户端传输**：复用已出厂 `ctx.remote.commands.execute` 调 `/rollback …`。
+- **回归测试**：`tests/truncation-plan.test.ts`（10 个）+ `tests/core.test.ts`（24 个）。
 
 ## 已知限制（Known Limitations）
 
-- **聊天记录仍显示已回退消息**：DSH 的人类聊天记录按 append-origin 事件渲染（与内置 compaction 的行为一致），表层 `replace` 只截断**模型上下文**。插件在 UI 层把被回退区间的消息隐藏，由日志里的持久标记驱动（回退当场即生效，刷新/重启后依然隐藏）。界面上**不渲染任何分隔线或回退提示**（把整段对话回退掉时显示欢迎页）。
-- **模型会看到一行检查点文字**：这是「回退当场生效 + 刷新不丢」的代价。模型侧完全无痕的方案要求把标记放进一个已开启的 step，而轮次之间做不到（见上方「为什么不用空 assistant/message」）。该文字与 `/compact` 的检查点同类、并明确指示模型不要提及；每条约 60 token，反复回退到第一条消息时只保留一条（新标记的替换范围会覆盖旧标记）。
-- **检查点为进程内存态 + 20 轮 sidecar**：会话内的折叠状态随会话对象存于 in-memory（`WeakMap`），重启后由 sidecar（`storages/dsh-rollback/checkpoints-v2/`）重建——`seedFromLog` 会重放日志并用 sidecar 里的完整前置内容还原历史检查点，保留窗口为最近 20 轮（`KEEP_TURNS`），超出窗口的记录在加载时被剪枝。
+- **聊天轨迹仍保留已回退的消息**：DSH 的聊天轨迹按 append-origin 事件渲染，而日志本身 append-only、无法改写；表层 `replace` 只作用于**模型上下文**。插件在界面层把被回退区间隐藏（由日志里的持久标记驱动，刷新/重启后保持）。
+- **模型会读到一行检查点文字**：轮次之间写不出"模型不可见"的标记（那需要一个已开启的 step），所以模型会读到那段检查点说明，约 60 token。
+- **检查点为进程内存态 + 20 轮 sidecar**：折叠状态随会话对象存于内存（`WeakMap`）；重启后由 sidecar（`storages/dsh-rollback/checkpoints-v2/`）重建，保留最近 20 轮（`KEEP_TURNS`），更早的记录在加载时被剪枝。
 - **新建文件删除走本地文件系统**：文件系统抽象层没有删除原语，删除通过 `processPath` + Node `unlink` 完成，仅对本地后端可靠。
-- **回退不可撤销**：执行即截断，与 TRAE 语义一致，不做 redo 链；对话框的受影响文件预览是该风险的补偿交互。
-- **命令副作用不在回退范围**：`npm install`、写数据库、发请求等外部副作用无法回退（所有 checkpoint 方案的天然边界）。
+- **回退不可撤销**：执行即替换历史，不提供 redo 链。
+- **命令与外部副作用不在回退范围**：`npm install`、写数据库、发请求等无法回退。
 
 ## 开发
 
