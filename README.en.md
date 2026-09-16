@@ -84,7 +84,7 @@ Key implementation points:
 ## Known limitations
 
 - **The chat trail still keeps rolled-back messages**: DSH renders that trail from append-origin events, and the log itself is append-only, so a surface `replace` only affects the **model context**. The plugin hides the rolled-back range in the UI, driven by the durable marker in the log (preserved across refresh/restart).
-- **The model reads one line of checkpoint text**: a marker the model cannot see cannot be written between turns (that needs an open step), so the model reads the checkpoint notice — roughly 60 tokens.
+- **The model reads one line of checkpoint text**: a marker the model cannot see cannot be written between turns (that needs an open step), so the model reads the checkpoint notice — roughly 60 tokens. The notice itself tells the model to treat what remains as established background, continue from the messages that follow, and **not to mind or acknowledge the checkpoint**.
 - **Checkpoints are process-in-memory plus a 20-turn sidecar**: the fold state lives with the session object in memory (`WeakMap`); after a restart it is rebuilt from the sidecar (`storages/dsh-rollback/checkpoints-v2/`), which keeps the most recent 20 turns (`KEEP_TURNS`) and prunes older records at load.
 - **Created-file deletion goes through the local filesystem**: the filesystem abstraction has no delete primitive; deletion uses `processPath` + Node `unlink`, reliable only for the local backend.
 - **Rollback is irreversible**: it replaces history in place and offers no redo.
