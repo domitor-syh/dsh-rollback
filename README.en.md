@@ -55,9 +55,7 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 
    ![Rollback dialog & file-change notice](./docs/images/en/rollback-dialog.jpeg)
 
-3. **Rolled-back messages hidden**: after confirming, the rolled-back messages are hidden immediately (no divider is rendered, and there is no trace on the model side either); the rolled-back turn's text/images return to the composer for further editing.
-
-   ![Rolled-back messages hidden & text returned to the composer](./docs/images/en/rollback-divider-and-composer.jpeg)
+3. **Rolled-back messages hidden**: after confirming, the rolled-back messages are hidden immediately (no divider is rendered in the UI); the rolled-back turn's text/images return to the composer for further editing.
 
 4. **Rolling back the first message**: when rolling back to before the first message, the chat shows a "rolled back to the start of the conversation" welcome page.
 
@@ -81,6 +79,7 @@ Key implementation points:
   - **Why not an empty `assistant/message` (the model-invisible form)**: an empty assistant message does project to null, but DSH accepts it only **inside an open step**. There is no step between turns, and opening one is impossible: the sequential-step invariant requires the agent loop's own next number, so a step of ours would make the loop's own `step/start` fail and break the whole turn. Inventing a turn is worse: the plugin and the agent loop each track "the next turn number" independently, so a synthetic turn duplicates that number — two `turn/start` events with one turn — and the Web client then refuses to rebuild the conversation at all.
   - **The deliberate cost**: the model DOES see that checkpoint text. It is framed the way DSH frames its own compaction checkpoint — explicit about what it is, and instructing the model not to acknowledge it — so the model neither has to guess nor treat it as a task. The rolled-back content itself is **entirely absent** from the model's history (the surface `replace` removed it).
   - Regression tests: `tests/truncation-plan.test.ts` (including a guard that the marker must never go back to an `assistant/message` or any step-scoped shape).
+- **Welcome hero**: shown once a rollback has emptied the whole conversation. It lives in a **host element the plugin injects into the transcript** (the driver portals it in), so it does **not** depend on the marker node having a DOM seat. The earlier implementation revealed the marker node's own seat, which failed silently whenever that seat was missing or sat inside a collapsed container — a page that hid everything and showed nothing.
 - **Client transport**: no custom Typert build is introduced; it reuses the shipped `ctx.remote.commands.execute` to call `/rollback …`.
 
 ## Known limitations

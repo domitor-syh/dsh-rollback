@@ -55,9 +55,7 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 
    ![回退弹窗与文件修改提示](./docs/images/rollback-dialog.png)
 
-3. **被回退的消息从对话流中隐藏**：确认后被回退的消息立刻隐藏（不渲染分隔线，模型侧同样不留任何痕迹）；被回退那一轮的用户文本 / 图片自动回到输入框，方便接着改。
-
-   ![被回退的消息隐藏与文本返回输入框](./docs/images/rollback-divider-and-composer.png)
+3. **被回退的消息从对话流中隐藏**：确认后被回退的消息立刻隐藏（界面上不渲染分隔线）；被回退那一轮的用户文本 / 图片自动回到输入框，方便接着改。
 
 4. **回退首条消息的界面**：回退到第一条消息之前时，对话区显示「已回退到对话发起前」欢迎页。
 
@@ -81,6 +79,7 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
   - **为什么不用「空 `assistant/message`」（模型侧完全无痕那个方案）**：空内容 assistant 确实被 `deriveMessages` 投影为 null、模型看不到，但 DSH 只接受它**处于已开启的 step 内**；而轮次之间没有 step，自建 step 又不可能——step 编号必须严格等于 agent loop 的下一个编号（顺序不变式），我们占掉之后 loop 自己的 `step/start` 会失败、整轮崩掉。自造 turn 更糟：插件与 agent loop 各自维护「下一个轮次号」，撞号会在日志里产生两个同号 `turn/start`，Web 客户端装配对话树时直接抛错、历史窗口构建失败、该会话再也打不开。
   - **代价（有意换取）**：模型会看到这段检查点文字。措辞照抄 DSH 原生 compaction 的框架——明说这是什么、并指示模型不要提及——所以模型不需要猜、也不会当成待办；被回退的内容本身则**完全不在**模型历史里（表层 `replace` 已把它们移除）。
   - 回归测试：`tests/truncation-plan.test.ts`（含「不得退回 assistant/message 或任何需要 step 的形状」的守卫用例）。
+- **欢迎页（hero）**：把整段对话回退掉之后显示。它由**插件自己注入到对话区的宿主元素**承载（driver 用 React portal 渲染进去），**不依赖标记节点是否拥有 DOM 座位**。早期实现靠"取消隐藏标记座位"来显示，座位缺失、或座位上层容器被折叠时会**静默失效**——表现为"全部隐藏却什么都不显示"，所以改成由插件自己提供位置。
 - **客户端传输**：不引入自定义 Typert 构建，复用已出厂 `ctx.remote.commands.execute` 调 `/rollback …`。
 
 ## 已知限制（Known Limitations）
