@@ -27,7 +27,7 @@ export const inject = ['slots', 'remote', 'remote.commands', 'conversationEvents
 const DEBUG = false
 /** Bundle revision — always reported once at apply, so a stale cached bundle is
  * identifiable in the console instead of looking like "the fix did nothing". */
-const BUNDLE_REV = 9
+const BUNDLE_REV = 10
 function log(...parts: unknown[]): void {
   if (DEBUG) console.info('[rollback]', ...parts)
 }
@@ -412,55 +412,61 @@ function syncHides(snapshot: any): void {
     if (typeof seq === 'number' && seq > latestSeq && node?.kind !== 'rollback-marker') { hasContentAfter = true; break }
   }
 
-  // Pass 1 — content seats: hide every seat a rollback shadowed, and count what
-  // is still visible. The hero's condition is stated in terms of that COUNT, not
-  // of node positions, because the human transcript keeps a seat for every
-  // append-origin event: the seats an earlier rollback already hid stay in
-  // `order` forever, so a "is anything positioned before the cut?" test answers
-  // YES from the first rollback onward and the hero can never appear again.
-  let hidden = 0
-  let visible = 0
+  // Pass 1 — emptiness, decided from the chat NODES and never from the seats the
+// DOM happens to hold. A message reaches the log before React renders its seat,
+// so counting seats made a brand-new message invisible to this test for several
+// frames — long enough to flash the hero between the old conversation and the new
+// message. Every non-marker node either is covered by a rollback's range (hidden)
+// or is still standing content, and the transcript is empty when nothing is left
+// standing.
+  let contentLeft = 0
   for (const key of order) {
-    const el = seatByKey.get(key)
-    if (el === undefined) continue
     const node = store.get(key)
     const seq = node?.anchorSeq
     if (typeof seq !== 'number') continue
     if (node?.kind === 'rollback-marker') continue
-    const hide = markers.some(m => seq >= m.from && seq < m.seq)
-    if (hide) { el.style.display = 'none'; hidden += 1; continue }
-    el.style.display = ''
-    if (!INFRASTRUCTURE_KINDS.has(node?.kind)) visible += 1
+    if (INFRASTRUCTURE_KINDS.has(node?.kind)) continue
+    if (markers.some(m => seq >= m.from && seq < m.seq)) continue
+    contentLeft += 1
   }
+  const emptied = contentLeft === 0
 
-  // Pass 2 — marker seats. The welcome hero stands in for an emptied transcript,
-  // so it shows on the NEWEST marker's seat exactly when the rollbacks left
-  // nothing visible behind them. Content that resumed after a marker is visible,
-  // so it hides the hero without any extra "nothing followed?" test. Every other
-  // marker seat renders nothing at all.
-  const emptied = visible === 0
+  // Pass 2 — marker seats render nothing at all: no divider, and no hero either
+  // (the welcome page is hosted by the driver, see `heroWanted`). A marker whose
+  // seat never appeared is reported, since it still explains an empty page.
+  let hidden = 0
   let markerSeats = 0
   for (const key of order) {
     const node = store.get(key)
     if (node?.kind !== 'rollback-marker') continue
     const el = seatByKey.get(key)
     if (el === undefined) {
-      // The node exists but the DOM never gave it a seat. Harmless now that the
-      // hero is hosted by the driver, but it explains a page that hides
-      // everything and shows nothing.
       warnOnce('marker-seat', 'rollback marker node has no DOM seat', { key, seq: node?.anchorSeq })
       continue
     }
     markerSeats += 1
-    // A marker seat renders nothing at all: no divider, and no hero either — the
-    // welcome page is hosted by the driver (see `heroWanted`).
     el.style.display = 'none'
     hidden += 1
   }
 
+  // Pass 3 — hide every seat a rollback covered. Seats that do not exist yet need
+  // nothing: they render already-covered nodes, and the emptiness decision above
+  // never depended on them.
+  for (const key of order) {
+    const el = seatByKey.get(key)
+    if (el === undefined) continue
+    const node = store.get(key)
+    const seq = node?.anchorSeq
+    if (typeof seq !== 'number' || node?.kind === 'rollback-marker') continue
+    const hide = markers.some(m => seq >= m.from && seq < m.seq)
+    el.style.display = hide ? 'none' : ''
+    if (hide) hidden += 1
+  }
+
   // The hero stands in for an emptied transcript, and only for one a ROLLBACK
-  // emptied: a session that never had content must not greet the user with it.
-  heroWanted.visible = markers.length > 0 && emptied
+  // emptied — `markers` is non-empty here, since this pass returns early without
+  // one, and a session that never had content therefore never reaches it.
+  heroWanted.visible = emptied
 
   const column = document.querySelector<HTMLElement>('[data-chat-flow=""]')
 
@@ -484,7 +490,7 @@ function syncHides(snapshot: any): void {
       latestMarker: latestSeq,
       markerSeats,
       seatsInDom: seatByKey.size,
-      visibleContent: visible,
+      contentLeft,
       hiddenSeats: hidden,
       hero: heroWanted.visible ? 'wanted' : 'no',
     })
@@ -546,6 +552,12 @@ function syncHeroHost(ref: { current: HTMLElement | null }, setOn: (on: boolean)
     host.setAttribute('data-rbk-hero-host', 'true')
     column.appendChild(host)
     ref.current = host
+  } else if (column.lastElementChild !== host) {
+    // Keep the hero LAST. React appends the seats it renders after whatever it
+    // finds at the end of the column, so a message sent after a rollback would
+    // otherwise render below the hero — stranding the welcome page in the middle
+    // of the transcript, between the old conversation and the new message.
+    column.appendChild(host)
   }
   setOn(true)
 }
