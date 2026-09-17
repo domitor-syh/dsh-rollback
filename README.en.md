@@ -73,7 +73,7 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 Key implementation points:
 
 - **Pre-content capture**: `write`/`edit` results already carry `before`/`after`, read through `ctx.on('tools/result')`; `str_replace_editor` returns only rendered text, so its target is read ahead of the call in `tools/pre-execute`.
-- **Drive-root write fallback**: on Windows, `write` cannot create a file directly under a drive root — the filesystem layer pre-creates the parent directory, `dirname('E:\\file.txt')` is `E:\` **with its trailing separator**, and Windows answers a mkdir on a volume root with EPERM. The plugin wraps `ctx.fs.writeText`: **only when the original path throws exactly that error shape** does it land the bytes as a sibling temp file plus a `rename`, with no mkdir preflight. Every other error, and any target the policy does not permit (fail closed), is rethrown untouched. If the filesystem layer stops pre-creating the directory, this branch becomes unreachable and retires itself.
+- **Drive-root fallback**: on Windows the file tools cannot touch a file directly under a drive root — the filesystem layer pre-creates the parent directory, `dirname('E:\\file.txt')` is `E:\` **with its trailing separator**, and Windows answers a mkdir on a volume root with EPERM. The plugin wraps `ctx.fs.writeText` and `ctx.fs.editText`: **only when the original path throws exactly that error shape** does it land the bytes as a sibling temp file plus a `rename`, with no mkdir preflight. The edit branch also reproduces the provider's literal-match semantics word for word (the `FS_EDIT_NOT_FOUND` / `FS_AMBIGUOUS_EDIT` decisions and messages) and keeps the original file's **line-ending style** and permission bits; only methods the mounted backend actually implements are wrapped. Every other error, and any target the policy does not permit (fail closed), is rethrown untouched. If the filesystem layer stops pre-creating the directory, this branch becomes unreachable and retires itself.
 - **Write-preference hint**: one always-on runtime context line tells the model that a file changed through a shell command cannot be rolled back, so content changes should go through `write`/`edit`.
 - **In-place truncation**: for the consecutive nodes in `session.surface.nodes` from turn n onward, a **`user/message`** surface `replace` (`surfaceOp: { op:'replace', start, end }` + `sourceEventSeqs` covering every shadowed node) is appended, replacing that span of history in place; the session id is unchanged.
   - The marker enters the log the moment `/rollback` runs, so the rolled-back range leaves the model's history immediately.
@@ -81,7 +81,7 @@ Key implementation points:
 - **UI hiding**: the client hides the chat seats inside the rolled-back range (`display: none`), driven by the durable marker in the log, so the hiding survives a refresh or restart.
 - **Welcome hero**: once a rollback has emptied the whole conversation, the driver injects a host element into the transcript and portals the hero into it.
 - **Client transport**: reuses the shipped `ctx.remote.commands.execute` to call `/rollback …`.
-- **Regression tests**: `tests/truncation-plan.test.ts` (10), `tests/core.test.ts` (24), `tests/root-write.test.ts` (14), and `tests/root-write-fallback.test.ts` (9).
+- **Regression tests**: `tests/truncation-plan.test.ts` (10), `tests/core.test.ts` (24), `tests/root-write.test.ts` (14), `tests/root-write-fallback.test.ts` (15), and `tests/literal-edit.test.ts` (12).
 
 ## Known limitations
 

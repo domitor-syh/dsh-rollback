@@ -73,7 +73,7 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 关键实现点：
 
 - **前置内容捕获**：`write`/`edit` 的执行结果里已带 `before`/`after`，用 `ctx.on('tools/result')` 取完整前置内容；`str_replace_editor` 的结果只有渲染文本，改由 `tools/pre-execute` 在调用前预读目标。
-- **盘根写入兜底**：Windows 上 `write` 无法在盘符根目录正下方创建文件——文件系统层写前会先 `mkdir` 父目录，而 `dirname('E:\\file.txt')` 是**带尾分隔符**的 `E:\`，Windows 对卷根 mkdir 返回 EPERM。插件包装 `ctx.fs.writeText`：**仅当原路抛出这一精确形状的错误时**，改用「同目录临时文件 + `rename`」落盘（不做 mkdir 预检）；其余错误、以及策略不允许的路径（fail closed）一律按原样抛出。文件系统层若不再预建目录，该分支自动失效。
+- **盘根写入兜底**：Windows 上文件工具无法操作盘符根目录**正下方**的文件——文件系统层写前会先 `mkdir` 父目录，而 `dirname('E:\\file.txt')` 是**带尾分隔符**的 `E:\`，Windows 对卷根 mkdir 返回 EPERM。插件包装 `ctx.fs.writeText` 与 `ctx.fs.editText`：**仅当原路抛出这一精确形状的错误时**，改用「同目录临时文件 + `rename`」落盘（不做 mkdir 预检）。`edit` 分支还逐字复刻了字面匹配语义（`FS_EDIT_NOT_FOUND` / `FS_AMBIGUOUS_EDIT` 的判定与文案）并保留原文件的**行尾风格**与权限位；只包装后端实际实现了的方法。其余错误、以及策略不允许的路径（fail closed）一律按原样抛出。文件系统层若不再预建目录，该分支自动失效。
 - **写入偏好提示**：向模型注入一条常驻运行说明——经 shell 修改的文件无法回退，内容改动请用 `write`/`edit`。
 - **原位截断**：对当前 `session.surface.nodes` 中「第 n 轮及之后」的连续节点，append 一条 **`user/message`** 表层 `replace`（`surfaceOp: { op:'replace', start, end }` + `sourceEventSeqs` 覆盖全部被遮蔽节点），就地替换这段历史；会话 id 不变。
   - 标记在 `/rollback` 执行时**当场**写入日志，被回退区间随即从模型历史中消失。
@@ -81,7 +81,7 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 - **界面隐藏**：客户端按标记的替换起点，把被回退区间内的聊天座位隐藏（`display:none`）；隐藏由日志里的持久标记驱动，刷新/重启后保持。
 - **欢迎页**：把整段对话回退掉之后，由 driver 往对话区注入宿主元素，再用 React portal 把欢迎页渲染进去。
 - **客户端传输**：复用已出厂 `ctx.remote.commands.execute` 调 `/rollback …`。
-- **回归测试**：`tests/truncation-plan.test.ts`（10）+ `tests/core.test.ts`（24）+ `tests/root-write.test.ts`（14）+ `tests/root-write-fallback.test.ts`（9）。
+- **回归测试**：`tests/truncation-plan.test.ts`（10）+ `tests/core.test.ts`（24）+ `tests/root-write.test.ts`（14）+ `tests/root-write-fallback.test.ts`（15）+ `tests/literal-edit.test.ts`（12）。
 
 ## 已知限制（Known Limitations）
 

@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, rm, stat as nodeStat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, stat as nodeStat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -26,14 +26,20 @@ interface Target {
 }
 
 /** The fs service face, backed by real files, with the provider's failure simulated. */
-function fakeFs(fail: (target: Target, content: string) => unknown | undefined) {
+function fakeFs(fail: () => unknown | undefined) {
   return {
     async writeText(target: Target, content: string) {
-      const error = fail(target, content)
+      const error = fail()
       if (error !== undefined) throw error
       await writeFile(target.hostPath, content, 'utf8')
       const info = await nodeStat(target.hostPath)
       return { operation: 'update', version: `v:${info.size}`, before: null, after: content }
+    },
+    async editText(target: Target) {
+      // The provider's edit path fails the same way, on the same preflight.
+      const error = fail()
+      if (error !== undefined) throw error
+      return { version: 'v:edited', before: '', after: '' }
     },
     async stat(target: Target) {
       try {
@@ -216,5 +222,109 @@ describe('installRootWriteFallback', () => {
 
     expect(await readFile(target.hostPath, 'utf8')).toBe('present')
     expect((await readdir(directory)).filter(name => name.includes('rbk-tmp'))).toEqual([])
+  })
+})
+
+/** Call the wrapped edit the way the edit tool does: the policy stamped last. */
+function editVia(
+  fs: unknown,
+  target: Target,
+  edit: unknown,
+  expected?: unknown,
+  policy?: unknown,
+): Promise<{ version?: unknown; before?: string; after?: string }> {
+  const editText = (fs as { editText: (...args: unknown[]) => Promise<never> }).editText
+  return editText(target, edit, expected, undefined, policy) as Promise<{
+    version?: unknown
+    before?: string
+    after?: string
+  }>
+}
+
+describe('the edit fallback', () => {
+  const policy = { mode: 'danger-full-access' }
+
+  it('edits a file at the drive root and keeps its line-ending style on disk', async () => {
+    const target = targetFor('crlf.txt')
+    await writeFile(target.hostPath, 'a\r\nb\r\nc\r\n', 'utf8')
+
+    const fs = fakeFs(() => rootMkdirEperm())
+    installRootWriteFallback(fakeContext(fs))
+
+    const outcome = await editVia(fs, target, { oldString: 'b', newString: 'B', replaceAll: false }, undefined, policy)
+
+    // The outcome reports the LF-normalized diff basis the provider reports...
+    expect(outcome.before).toBe('a\nb\nc\n')
+    expect(outcome.after).toBe('a\nB\nc\n')
+    // ...while the file on disk keeps CRLF.
+    expect(await readFile(target.hostPath, 'utf8')).toBe('a\r\nB\r\nc\r\n')
+    expect((await readdir(directory)).filter(name => name.includes('rbk-tmp'))).toEqual([])
+  })
+
+  it('replaces every match when the request asks for it', async () => {
+    const target = targetFor('all.txt')
+    await writeFile(target.hostPath, 'x x x\n', 'utf8')
+    const fs = fakeFs(() => rootMkdirEperm())
+    installRootWriteFallback(fakeContext(fs))
+
+    await editVia(fs, target, { oldString: 'x', newString: 'y', replaceAll: true }, undefined, policy)
+    expect(await readFile(target.hostPath, 'utf8')).toBe('y y y\n')
+  })
+
+  it('reports the provider codes for its guarded preconditions', async () => {
+    const fs = fakeFs(() => rootMkdirEperm())
+    installRootWriteFallback(fakeContext(fs))
+
+    // A missing target reports the stale code, exactly as the provider does.
+    await expect(editVia(fs, targetFor('missing.txt'), { oldString: 'a', newString: 'b' }, undefined, policy))
+      .rejects.toMatchObject({ code: 'FS_STALE_VERSION' })
+
+    // A directory is not a regular file.
+    const asDirectory = targetFor('adir')
+    await mkdir(asDirectory.hostPath, { recursive: true })
+    await expect(editVia(fs, asDirectory, { oldString: 'a', newString: 'b' }, undefined, policy))
+      .rejects.toMatchObject({ code: 'FS_NOT_REGULAR_FILE' })
+
+    // A stale version guard refuses before touching the file.
+    const guarded = targetFor('guarded-edit.txt')
+    await writeFile(guarded.hostPath, 'keep\n', 'utf8')
+    await expect(editVia(fs, guarded, { oldString: 'keep', newString: 'gone' }, { version: 'v:999' }, policy))
+      .rejects.toMatchObject({ code: 'FS_STALE_VERSION' })
+    expect(await readFile(guarded.hostPath, 'utf8')).toBe('keep\n')
+  })
+
+  it('refuses an ambiguous match without writing anything', async () => {
+    const target = targetFor('ambiguous.txt')
+    await writeFile(target.hostPath, 'dup\ndup\n', 'utf8')
+    const fs = fakeFs(() => rootMkdirEperm())
+    installRootWriteFallback(fakeContext(fs))
+
+    await expect(editVia(fs, target, { oldString: 'dup', newString: 'one', replaceAll: false }, undefined, policy))
+      .rejects.toMatchObject({ code: 'FS_AMBIGUOUS_EDIT' })
+    expect(await readFile(target.hostPath, 'utf8')).toBe('dup\ndup\n')
+    expect((await readdir(directory)).filter(name => name.includes('rbk-tmp'))).toEqual([])
+  })
+
+  it('refuses a binary file', async () => {
+    const target = targetFor('binary.bin')
+    await writeFile(target.hostPath, Buffer.from([0x61, 0x00, 0x62]))
+    const fs = fakeFs(() => rootMkdirEperm())
+    installRootWriteFallback(fakeContext(fs))
+
+    await expect(editVia(fs, target, { oldString: 'a', newString: 'b' }, undefined, policy))
+      .rejects.toMatchObject({ code: 'FS_NOT_TEXT' })
+  })
+
+  it('refuses a target the policy would not have permitted', async () => {
+    const target = targetFor('outside-edit.txt')
+    await writeFile(target.hostPath, 'unchanged\n', 'utf8')
+    const fs = fakeFs(() => rootMkdirEperm())
+    installRootWriteFallback(fakeContext(fs))
+
+    await expect(editVia(fs, target, { oldString: 'unchanged', newString: 'changed' }, undefined, {
+      mode: 'workspace-write',
+      workspaceRoot: join(directory, 'elsewhere'),
+    })).rejects.toMatchObject({ code: 'EPERM' })
+    expect(await readFile(target.hostPath, 'utf8')).toBe('unchanged\n')
   })
 })
