@@ -27,7 +27,7 @@ export const inject = ['slots', 'remote', 'remote.commands', 'conversationEvents
 const DEBUG = false
 /** Bundle revision — always reported once at apply, so a stale cached bundle is
  * identifiable in the console instead of looking like "the fix did nothing". */
-const BUNDLE_REV = 11
+const BUNDLE_REV = 12
 function log(...parts: unknown[]): void {
   if (DEBUG) console.info('[rollback]', ...parts)
 }
@@ -456,16 +456,21 @@ function syncHides(snapshot: any): void {
     hidden += 1
   }
 
-  // Pass 3 — hide every seat a rollback covered. Seats that do not exist yet need
-  // nothing: they render already-covered nodes, and the emptiness decision above
-  // never depended on them.
+  // Pass 3 — hide every seat a rollback covered, and — while the hero is up —
+  // every seat that is still visible. An emptied transcript has no content left
+  // by definition (Pass 1 proved it), so what remains are log-only rows that sit
+  // BEFORE the rollback point and were never in the model's context: permission
+  // switches (the host `/permission` command's receipt) and turn tails. Leaving
+  // one above the welcome page reads as a broken screen, and hiding it cannot
+  // desync the model, because the model never saw it. Those rows return with the
+  // transcript's content, since a rollback only removes the range it targeted.
   for (const key of order) {
     const el = seatByKey.get(key)
     if (el === undefined) continue
     const node = store.get(key)
     const seq = node?.anchorSeq
     if (typeof seq !== 'number' || node?.kind === 'rollback-marker') continue
-    const hide = markers.some(m => seq >= m.from && seq < m.seq)
+    const hide = emptied || markers.some(m => seq >= m.from && seq < m.seq)
     el.style.display = hide ? 'none' : ''
     if (hide) hidden += 1
   }
