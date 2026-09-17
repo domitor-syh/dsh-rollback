@@ -13,12 +13,24 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { RollbackPlan } from './core/restore-plan.ts'
+import { installRootWriteFallback } from './root-write-fallback.ts'
 import { RollbackService, summarize } from './service.ts'
 
 export const name = 'rollback'
 export const inject = ['fs', 'sessions', 'tools', 'commands', 'sandboxPolicy']
 
 const WINDOW_HINT = '(仅最近 10 轮)'
+
+/**
+ * Runtime context the model reads every request.
+ *
+ * A file changed only through a shell command is invisible to this plugin, so it
+ * cannot be rolled back — steering content changes to the file tools is what keeps
+ * them inside the captured path. Phrased as the consequence rather than as a rule,
+ * so it stays true whatever the model decides.
+ */
+const FILE_TOOL_HINT =
+  'File changes made through a shell command cannot be rolled back; prefer the write/edit tools when changing file contents.'
 
 /** Format a plan's affected-file list into a human-readable text block. */
 function planText(plan: RollbackPlan, header: string): string {
@@ -31,7 +43,7 @@ function planText(plan: RollbackPlan, header: string): string {
     lines.push(`  [跳过] ${file.path}（${file.reason}）`)
   }
   if (plan.restored.length === 0 && plan.skipped.length === 0) lines.push('  （无文件变更）')
-  lines.push(`  对话截断：${plan.truncation === null ? '否' : '将截断（你下一次发消息时）'}`)
+  lines.push(`  对话截断：${plan.truncation === null ? '否' : '将截断'}`)
   return lines.join('\n')
 }
 
@@ -45,6 +57,20 @@ function listText(service: RollbackService, session: { id: string }): string {
 
 export function apply(ctx: Context): void {
   const service = new RollbackService(ctx)
+
+  // Let `write` reach a file directly under a drive root instead of failing with
+  // the provider's mkdir EPERM and pushing the model onto the shell.
+  installRootWriteFallback(ctx)
+
+  // Tell the model what the capture can and cannot see, so it does not route a
+  // content change through a channel this plugin cannot roll back.
+  ctx.inject(['systemPrompt'], (scope) => {
+    scope.systemPrompt.context({
+      name: 'rollback:file-tools',
+      order: 199,
+      text: () => FILE_TOOL_HINT,
+    })
+  })
 
   ctx.tools.register(defineTool({
     name: 'rollback',

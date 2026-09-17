@@ -73,13 +73,15 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 关键实现点：
 
 - **前置内容捕获**：`write`/`edit` 的执行结果里已带 `before`/`after`，用 `ctx.on('tools/result')` 取完整前置内容；`str_replace_editor` 的结果只有渲染文本，改由 `tools/pre-execute` 在调用前预读目标。
+- **盘根写入兜底**：Windows 上 `write` 无法在盘符根目录正下方创建文件——文件系统层写前会先 `mkdir` 父目录，而 `dirname('E:\\file.txt')` 是**带尾分隔符**的 `E:\`，Windows 对卷根 mkdir 返回 EPERM。插件包装 `ctx.fs.writeText`：**仅当原路抛出这一精确形状的错误时**，改用「同目录临时文件 + `rename`」落盘（不做 mkdir 预检）；其余错误、以及策略不允许的路径（fail closed）一律按原样抛出。文件系统层若不再预建目录，该分支自动失效。
+- **写入偏好提示**：向模型注入一条常驻运行说明——经 shell 修改的文件无法回退，内容改动请用 `write`/`edit`。
 - **原位截断**：对当前 `session.surface.nodes` 中「第 n 轮及之后」的连续节点，append 一条 **`user/message`** 表层 `replace`（`surfaceOp: { op:'replace', start, end }` + `sourceEventSeqs` 覆盖全部被遮蔽节点），就地替换这段历史；会话 id 不变。
   - 标记在 `/rollback` 执行时**当场**写入日志，被回退区间随即从模型历史中消失。
   - 标记内容是一段自动生成的检查点说明，并指示模型不要提及它；再次回退到同一点时，新标记的替换范围覆盖旧标记，只保留一条。
 - **界面隐藏**：客户端按标记的替换起点，把被回退区间内的聊天座位隐藏（`display:none`）；隐藏由日志里的持久标记驱动，刷新/重启后保持。
 - **欢迎页**：把整段对话回退掉之后，由 driver 往对话区注入宿主元素，再用 React portal 把欢迎页渲染进去。
 - **客户端传输**：复用已出厂 `ctx.remote.commands.execute` 调 `/rollback …`。
-- **回归测试**：`tests/truncation-plan.test.ts`（10 个）+ `tests/core.test.ts`（24 个）。
+- **回归测试**：`tests/truncation-plan.test.ts`（10）+ `tests/core.test.ts`（24）+ `tests/root-write.test.ts`（14）+ `tests/root-write-fallback.test.ts`（9）。
 
 ## 已知限制（Known Limitations）
 
@@ -88,7 +90,7 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 - **检查点为进程内存态 + 20 轮 sidecar**：折叠状态随会话对象存于内存（`WeakMap`）；重启后由 sidecar（`storages/dsh-rollback/checkpoints-v2/`）重建，保留最近 20 轮（`KEEP_TURNS`），更早的记录在加载时被剪枝。
 - **新建文件删除走本地文件系统**：文件系统抽象层没有删除原语，删除通过 `processPath` + Node `unlink` 完成，仅对本地后端可靠。
 - **回退不可撤销**：执行即替换历史，不提供 redo 链。
-- **命令与外部副作用不在回退范围**：`npm install`、写数据库、发请求等无法回退。
+- **经 shell 修改或删除的文件不在回退范围**：插件只从 `write`/`edit` 的结果里捕获文件改动；`pwsh`/`bash` 的副作用（重定向、`sed -i`、`Remove-Item`、`git`、`npm install` 写文件等）无论在工作区内还是外都无法回退。插件会注入提示引导模型改走文件工具，但无法强制。
 
 ## 开发
 

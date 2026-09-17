@@ -73,13 +73,15 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 Key implementation points:
 
 - **Pre-content capture**: `write`/`edit` results already carry `before`/`after`, read through `ctx.on('tools/result')`; `str_replace_editor` returns only rendered text, so its target is read ahead of the call in `tools/pre-execute`.
+- **Drive-root write fallback**: on Windows, `write` cannot create a file directly under a drive root — the filesystem layer pre-creates the parent directory, `dirname('E:\\file.txt')` is `E:\` **with its trailing separator**, and Windows answers a mkdir on a volume root with EPERM. The plugin wraps `ctx.fs.writeText`: **only when the original path throws exactly that error shape** does it land the bytes as a sibling temp file plus a `rename`, with no mkdir preflight. Every other error, and any target the policy does not permit (fail closed), is rethrown untouched. If the filesystem layer stops pre-creating the directory, this branch becomes unreachable and retires itself.
+- **Write-preference hint**: one always-on runtime context line tells the model that a file changed through a shell command cannot be rolled back, so content changes should go through `write`/`edit`.
 - **In-place truncation**: for the consecutive nodes in `session.surface.nodes` from turn n onward, a **`user/message`** surface `replace` (`surfaceOp: { op:'replace', start, end }` + `sourceEventSeqs` covering every shadowed node) is appended, replacing that span of history in place; the session id is unchanged.
   - The marker enters the log the moment `/rollback` runs, so the rolled-back range leaves the model's history immediately.
   - Its content is an automatically generated checkpoint notice that tells the model not to acknowledge it; rolling back to the same point again lets the newer marker's range cover the older one, leaving a single marker.
 - **UI hiding**: the client hides the chat seats inside the rolled-back range (`display: none`), driven by the durable marker in the log, so the hiding survives a refresh or restart.
 - **Welcome hero**: once a rollback has emptied the whole conversation, the driver injects a host element into the transcript and portals the hero into it.
 - **Client transport**: reuses the shipped `ctx.remote.commands.execute` to call `/rollback …`.
-- **Regression tests**: `tests/truncation-plan.test.ts` (10) and `tests/core.test.ts` (24).
+- **Regression tests**: `tests/truncation-plan.test.ts` (10), `tests/core.test.ts` (24), `tests/root-write.test.ts` (14), and `tests/root-write-fallback.test.ts` (9).
 
 ## Known limitations
 
@@ -88,7 +90,7 @@ Key implementation points:
 - **Checkpoints are process-in-memory plus a 20-turn sidecar**: the fold state lives with the session object in memory (`WeakMap`); after a restart it is rebuilt from the sidecar (`storages/dsh-rollback/checkpoints-v2/`), which keeps the most recent 20 turns (`KEEP_TURNS`) and prunes older records at load.
 - **Created-file deletion goes through the local filesystem**: the filesystem abstraction has no delete primitive; deletion uses `processPath` + Node `unlink`, reliable only for the local backend.
 - **Rollback is irreversible**: it replaces history in place and offers no redo.
-- **Command and external side effects are out of scope**: `npm install`, database writes, network requests, and the like cannot be rolled back.
+- **Files changed or deleted through a shell are out of scope**: the plugin captures file changes only from `write`/`edit` results, so the side effects of `pwsh`/`bash` (redirection, `sed -i`, `Remove-Item`, `git`, `npm install` writing files) cannot be rolled back, whether they land inside the workspace or outside it. The plugin injects a hint steering content changes to the file tools, but it cannot enforce that.
 
 ## Development
 
