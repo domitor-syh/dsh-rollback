@@ -17,6 +17,8 @@ import { resolve } from 'node:path'
 import type { FsMutation } from './core/model.ts'
 import { fsMutationFrom, SessionFold } from './core/session-fold.ts'
 import { planRollback, type RestoredFile, type RollbackPlan, type SkippedFile } from './core/restore-plan.ts'
+import { turnStartTimeMs } from './core/dir-cleanup.ts'
+import { cleanupEmptyDirs } from './empty-dirs.ts'
 import {
   planTruncationMarker,
   shadowedSurfaceFrom,
@@ -53,12 +55,14 @@ function mutationOf(exec: MutationActor, value: unknown): FsMutation | null {
 }
 
 /** Human/machine one-line summary of a rollback plan. */
-export function summarize(plan: RollbackPlan): string {
+export function summarize(plan: RollbackPlan, options: { removedDirs?: readonly string[] } = {}): string {
   const restored = plan.restored.filter(f => f.action === 'restore').length
   const deleted = plan.restored.filter(f => f.action === 'delete').length
   const parts: string[] = []
   if (restored > 0) parts.push(`${restored} 个文件恢复`)
   if (deleted > 0) parts.push(`${deleted} 个新建文件删除`)
+  const removedDirs = options.removedDirs ?? []
+  if (removedDirs.length > 0) parts.push(`${removedDirs.length} 个空目录删除`)
   if (plan.skipped.length > 0) {
     const detail = plan.skipped.map(s => `${s.path}（${s.reason}）`).join('；')
     parts.push(`${plan.skipped.length} 个文件无法恢复：${detail}`)
@@ -301,6 +305,8 @@ export class RollbackService {
     // to writeText.
     const restored: RestoredFile[] = []
     const skipped: SkippedFile[] = [...plan.skipped]
+    /** Host paths of the files this rollback deleted, for the empty-directory pass. */
+    const deletedHostPaths: string[] = []
     const policy = this.ctx.sandboxPolicy.resolve({ session })
     for (const file of plan.restored) {
       try {
@@ -314,11 +320,13 @@ export class RollbackService {
           // through an untracked side channel (e.g. bash `rm`) or an earlier
           // rollback. Treat that as success instead of aborting the whole
           // rollback; only real failures (EACCES, EBUSY, …) propagate.
+          const hostPath = this.ctx.fs.processPath(target)
           try {
-            await unlink(this.ctx.fs.processPath(target))
+            await unlink(hostPath)
           } catch (error) {
             if ((error as { code?: string } | null)?.code !== 'ENOENT') throw error
           }
+          deletedHostPaths.push(hostPath)
           // Refresh the observation-policy cache so the model's NEXT write to
           // this path sees "absent" (createIfAbsent) instead of a stale
           // "present + old version" that would fail with FS_STALE_VERSION.
@@ -342,7 +350,33 @@ export class RollbackService {
       throw new Error(`回退失败，请重试：${detail}`)
     }
 
-    // 2) Replace the rolled-back range in the model-visible surface (same session
+    // 2) Remove the directories this rollback emptied.
+    //
+    // The files are gone, but the directories that held them were created by
+    // something this plugin never recorded — a shell `New-Item`/`mkdir`, or the file
+    // tool's own parent pre-creation — so they outlive the rollback and leave an
+    // empty husk behind. A directory is removed only when it is now empty (counting
+    // children this same pass removes) AND its creation time says the rolled-back
+    // span made it: a directory that predates the rollback point is left alone, which
+    // is what keeps "roll back only the turn that wrote the file" from removing the
+    // directory an earlier turn created.
+    const removedDirs: string[] = []
+    if (deletedHostPaths.length > 0) {
+      const spanStartMs = turnStartTimeMs(session.events as never, fromTurn)
+      if (spanStartMs === undefined) {
+        // No opening time in the log: the creation-time test cannot be made, and this
+        // pass fails closed by doing nothing.
+        console.warn(`[dsh-rollback] no turn/start time for turn ${fromTurn}; skipping empty-directory cleanup`)
+      } else {
+        const cleanup = await cleanupEmptyDirs(deletedHostPaths, spanStartMs, policy.workspaceRoot)
+        removedDirs.push(...cleanup.removed)
+        for (const failure of cleanup.failed) {
+          console.warn(`[dsh-rollback] could not remove emptied directory ${failure.path}: ${failure.reason}`)
+        }
+      }
+    }
+
+    // 3) Replace the rolled-back range in the model-visible surface (same session
     // id), NOW — the replaced range leaves the model's history with only the
     // checkpoint text in its place, so the model stops remembering the rolled-back
     // turns from its very next request.
@@ -381,7 +415,7 @@ export class RollbackService {
       }
     }
 
-    // 3) Drop the now-undone checkpoints and reset the in-flight state.
+    // 4) Drop the now-undone checkpoints and reset the in-flight state.
     fold.dropFrom(fromTurn)
 
     return {
@@ -396,7 +430,7 @@ export class RollbackService {
         restored,
         skipped,
         truncation: markerPlan === null ? null : { start: markerPlan.surfaceOp.start, end: markerPlan.surfaceOp.end },
-      }),
+      }, { removedDirs }),
     }
   }
 }
