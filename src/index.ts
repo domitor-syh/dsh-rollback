@@ -11,7 +11,6 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { RollbackPlan } from './core/restore-plan.ts'
 import { installRootWriteFallback } from './root-write-fallback.ts'
 import { RollbackService, summarize } from './service.ts'
@@ -76,85 +75,6 @@ export function apply(ctx: Context): void {
       text: () => FILE_TOOL_HINT,
     })
   })
-
-  ctx.tools.register(defineTool({
-    name: 'rollback',
-    description:
-      'Roll back the conversation and workspace files to before a given 1-based turn number, ' +
-      'removing that turn and all later turns from the model context and restoring any files they changed. ' +
-      'This is IRREVERSIBLE: only call when the user has clearly asked to roll back. ' +
-      'Pass preview: true to only list affected files without changing anything.',
-    parameters: {
-      turn: {
-        type: 'number',
-        required: true,
-        description: 'Roll back to before this 1-based turn number (removes it and all later turns).',
-      },
-      preview: {
-        type: 'boolean',
-        description: 'When true, only compute and return the affected-file plan; do not execute.',
-      },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          fromTurn: { type: 'number', required: true },
-          executed: { type: 'boolean', required: true },
-          truncated: { type: 'boolean', required: true },
-          restored: {
-            type: 'array', required: true,
-            items: {
-              type: 'object', additionalProperties: false,
-              properties: {
-                path: { type: 'string', required: true },
-                action: { type: 'string', required: true, enum: ['restore', 'recover', 'delete'] },
-              },
-            },
-          },
-          skipped: {
-            type: 'array', required: true,
-            items: {
-              type: 'object', additionalProperties: false,
-              properties: {
-                path: { type: 'string', required: true },
-                reason: { type: 'string', required: true },
-              },
-            },
-          },
-          summary: { type: 'string', required: true },
-        },
-      },
-      render: (_args, value) => [{ type: 'text', text: value.summary as string }],
-    },
-    async execute(args, exec) {
-      const session = exec.agent?.session
-      if (session === undefined) throw new Error('rollback tool requires an agent session')
-      const turn = Number(args.turn)
-      if (!Number.isSafeInteger(turn) || turn < 1) throw new Error('turn must be a positive integer')
-      const plan = await service.preview(session as never, turn)
-      if (args.preview === true) {
-        return {
-          fromTurn: turn,
-          executed: false,
-          truncated: plan.truncation !== null,
-          restored: plan.restored.map(f => ({ path: f.path, action: f.action })),
-          skipped: plan.skipped,
-          summary: summarize(plan),
-        }
-      }
-      const outcome = await service.execute(session as never, turn, exec.signal)
-      return {
-        fromTurn: outcome.fromTurn,
-        executed: true,
-        truncated: outcome.truncated,
-        restored: outcome.restored.map(f => ({ path: f.path, action: f.action })),
-        skipped: outcome.skipped,
-        summary: outcome.summary,
-      }
-    },
-  }))
 
   ctx.commands.register({
     name: 'rollback',

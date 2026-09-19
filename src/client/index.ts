@@ -19,6 +19,7 @@
 import * as React from 'react'
 import { createPortal } from 'react-dom'
 import { FishLogo, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
+import { footerEntryNeeded } from '../core/turn-entry.ts'
 
 /** Required services: slots, the `commands` Remote, the conversation node registry, and locale. */
 export const inject = ['slots', 'remote', 'remote.commands', 'conversationEvents', 'locale', 'workspaces']
@@ -27,7 +28,7 @@ export const inject = ['slots', 'remote', 'remote.commands', 'conversationEvents
 const DEBUG = false
 /** Bundle revision — always reported once at apply, so a stale cached bundle is
  * identifiable in the console instead of looking like "the fix did nothing". */
-const BUNDLE_REV = 12
+const BUNDLE_REV = 13
 function log(...parts: unknown[]): void {
   if (DEBUG) console.info('[rollback]', ...parts)
 }
@@ -61,6 +62,7 @@ const NS = 'rollback'
 
 const zh = {
   'action.label': '回退到本轮对话发起前',
+  'action.running': '本轮还在进行中：暂停或等它结束后才能回退',
   'dialog.title': '回退到本轮对话发起前',
   'dialog.aria': '回退确认',
   'dialog.warning': '此操作不可撤销，将恢复本轮及之后受影响的工作区文件并截断模型上下文。',
@@ -79,6 +81,7 @@ const zh = {
 
 const en: Record<keyof typeof zh, string> = {
   'action.label': 'Roll back to before this turn',
+  'action.running': 'This turn is still running: pause it or wait for it to finish',
   'dialog.title': 'Roll back to before this turn',
   'dialog.aria': 'Rollback confirmation',
   'dialog.warning': 'This action is irreversible. It will restore workspace files affected by this turn and later, and truncate the model context.',
@@ -581,17 +584,79 @@ let openRollbackDialog: ((turn: number) => void) | null = null
 
 /** The rollback action rendered on each finalized assistant message's action strip. */
 function RollbackAction({ messageId, useSession, t }: any): React.ReactElement | null {
-  if (typeof useSession !== 'function') return null
+  if (typeof useSession !== 'function') {
+    // Never silent: a missing button must always be traceable to a reason.
+    warnOnce('action-session', 'assistant action lacks useSession')
+    return null
+  }
   const snapshot = useSession((s: any) => s)
-  const running = snapshot?.running === true
+  const open = snapshot?.running === true
   const turn = React.useMemo(() => turnForMessageId(snapshot, messageId), [snapshot, messageId])
-  const disabled = running || turn === undefined
+  const disabled = open || turn === undefined
+  const label = open ? t('action.running') : t('action.label')
+  const button = React.createElement('button', {
+    type: 'button',
+    className: 'rbk-act',
+    'aria-label': label,
+    disabled,
+    onClick: () => { if (turn !== undefined && openRollbackDialog !== null) openRollbackDialog(turn) },
+  }, React.createElement(ReplyIcon))
+  return React.createElement(Tooltip, { label, side: 'bottom' }, button)
+}
+
+/**
+ * Routing selector for the turn-footer entry, and the reason this entry is a CHAIN
+ * contribution: a chain entry MUST supply `select` (the framework throws without it),
+ * and its non-null result becomes the component's `matched` prop.
+ *
+ * Returning null whenever the assistant action strip can offer the button keeps the
+ * familiar placement and guarantees one button per turn — the footer shows up only
+ * where that strip cannot exist (an interrupted turn, which has no closing message).
+ * The tail data is read through the location's own reader rather than from the node,
+ * because the selector only ever receives the owner props.
+ */
+function selectFooterAction(owner: any): { turn: number } | null {
+  const location = owner?.turn
+  const turnNo = turnNoOf(location)
+  if (turnNo === undefined) return null
+  let closing: unknown
+  try {
+    closing = location?.data?.get?.('turn-tail')?.closing
+  } catch (e) {
+    // Fail open: a missing button is worse than one the host may decline.
+    warnOnce('footer-tail-data', 'turn footer could not read its tail data', e)
+    return { turn: turnNo }
+  }
+  if (!footerEntryNeeded(closing as never)) return null
+  return { turn: turnNo }
+}
+
+/**
+ * The same rollback action, rendered in the turn FOOTER for turns the assistant
+ * action strip cannot serve.
+ *
+ * There is no in-progress state to handle here: the footer node only exists once its
+ * turn ENDED (`tailData` requires a `turn/end` match), so a running turn simply has no
+ * footer to render into. The host refuses a rollback while any turn is open, which is
+ * the rule that actually has to hold — the button's absence during a run is a
+ * consequence of that, not a second mechanism.
+ */
+function RollbackTurnAction({ turn: location, matched, useSession, t }: any): React.ReactElement | null {
+  if (typeof useSession !== 'function') {
+    warnOnce('footer-action-session', 'turn footer action lacks useSession')
+    return null
+  }
+  const turnNo = matched?.turn ?? turnNoOf(location)
+  if (turnNo === undefined) {
+    warnOnce('footer-action-turn', 'turn footer action could not resolve its turn', location)
+    return null
+  }
+  log('turn-footer action rendered', { turn: turnNo })
   const button = React.createElement('button', {
     type: 'button',
     className: 'rbk-act',
     'aria-label': t('action.label'),
-    disabled,
-    onClick: () => { if (turn !== undefined && openRollbackDialog !== null) openRollbackDialog(turn) },
+    onClick: () => { if (openRollbackDialog !== null) openRollbackDialog(turnNo) },
   }, React.createElement(ReplyIcon))
   return React.createElement(Tooltip, { label: t('action.label'), side: 'bottom' }, button)
 }
@@ -845,6 +910,30 @@ export function apply(ctx: any): void {
     { name: 'conversation.chat.assistant-actions', id: 'rollback', order: 20, locale: NS },
     RollbackAction,
   ))
+
+  // The turn footer covers what the action strip cannot: an interrupted turn has no
+  // closing assistant message, so the strip contributes no actions and the button
+  // would be missing exactly when it is wanted. `selectFooterAction` returns null for
+  // every other turn, so this never duplicates the strip's button.
+  //
+  // The registration is guarded because a chain entry's shape is easy to get wrong
+  // (it needs `select`, not the `id`/`order` a list entry takes) and the framework's
+  // rejection left a silently empty row behind the last time. A failure here is
+  // reported loudly and leaves the strip's button as the only — still working — entry.
+  ctx.slots.inject('conversation.chat.turnTail', () => {
+    try {
+      const dispose = ctx.slots.register({
+        name: 'conversation.chat.turnTail',
+        select: selectFooterAction,
+        locale: NS,
+      }, RollbackTurnAction)
+      console.info('[rollback] turn-footer action registered (rev ' + BUNDLE_REV + ')')
+      return dispose
+    } catch (error) {
+      console.error('[rollback] turn-footer action registration FAILED — interrupted turns will have no rollback button', error)
+      return () => {}
+    }
+  })
 
   ctx.slots.inject('conversation.input.dock', () => {
     log('dock entry registering')

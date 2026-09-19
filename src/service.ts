@@ -18,6 +18,7 @@ import type { FsMutation } from './core/model.ts'
 import { fsMutationFrom, SessionFold } from './core/session-fold.ts'
 import { planRollback, type RestoredFile, type RollbackPlan, type SkippedFile } from './core/restore-plan.ts'
 import { turnStartTimeMs } from './core/dir-cleanup.ts'
+import { rollbackRefusal } from './core/rollback-guard.ts'
 import { BoundaryRescan } from './boundary-rescan.ts'
 import { cleanupEmptyDirs } from './empty-dirs.ts'
 import {
@@ -392,14 +393,13 @@ export class RollbackService {
    * Execute a rollback: restore/delete affected files, then truncate the
    * conversation surface in place.
    *
-   * @throws when `fromTurn` is the in-progress turn (mid-turn rollback is unsafe).
+   * @throws when any turn is still open (a mid-run rollback is unsafe).
    */
   async execute(session: Session, fromTurn: number, signal?: AbortSignal): Promise<RollbackOutcome> {
     const fold = this.foldFor(session)
-    const inProgress = fold.inProgressTurn()
-    if (inProgress !== null && fromTurn >= inProgress) {
-      throw new Error(`cannot roll back to before turn ${fromTurn}: turn ${inProgress} is still in progress`)
-    }
+    // NO rollback while a turn is running, whatever the target: see rollbackRefusal.
+    const refusal = rollbackRefusal(fold.inProgressTurn())
+    if (refusal !== null) throw new Error(refusal)
     // A scan triggered by the turn's own end may still be reading files; planning
     // without waiting would miss exactly the change this rollback is meant to undo.
     const settlingId = typeof session.id === 'string' ? session.id : ''

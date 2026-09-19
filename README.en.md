@@ -17,10 +17,11 @@ A TRAE-style "roll back to before this turn" plugin for the [DeepSeek Harness](h
 | --- | --- |
 | Per-turn checkpoints | A checkpoint is captured before each turn, recording only the files actually touched (Copy-before-Write prior content), not a full snapshot |
 | 10-turn sliding window | Mirrors TRAE's "last 10 turns only"; checkpoints beyond the window are dropped |
-| File rollback | Modified files are written back to their pre-turn content; files created this turn are deleted; unrestorable files are reported as skipped |
+| File rollback | Modified files are written back to their pre-turn content; files deleted since are brought back; files created this turn are deleted; unrestorable files are reported as skipped |
 | In-place truncation | Rewrites the model context with a **`user/message` surface `replace`** — the same primitive the built-in `/compact` uses — taking effect the moment the rollback runs, keeping the same session id |
-| Three entry points | The `rollback` model tool, the `/rollback` human command, and a Web rollback button on each finalized reply |
-| Affected-file list | The Web button opens a dialog listing the files affected by this and later turns and their actions (restore/delete/skip); clicking a file opens it in the editor |
+| Two entry points | The `/rollback` human command, and a Web rollback button after every turn (on the reply's action strip for a normal turn, in the turn footer for an interrupted one) |
+| Affected-file list | The Web button opens a dialog listing the files affected by this and later turns and their actions (restore/recover/delete/skip); clicking a file opens it in the editor |
+| No rollback while running | Any open turn refuses a rollback outright; wait for the turn to end or pause it (a running turn has no button to press anyway) |
 
 ## Getting started
 
@@ -43,15 +44,15 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
    - `/rollback list` — list the turns you can roll back to
    - `/rollback preview <n>` — preview the files affected when rolling back to before turn n (no execution)
    - `/rollback <n>` — roll back to before turn n
-3. **Model tool**: the AI can invoke `rollback` on its own (pass `turn` plus optional `preview: true`).
+3. **No model tool**: a model-invoked rollback would always happen while a turn is running, and a running turn refuses every rollback — so the tool cannot exist. A rollback is always started by a human.
 
 ## Interface preview
 
-1. **Rollback button**: a ↩ button in the action strip under each finalized assistant reply (next to the feedback buttons).
+1. **Rollback button**: appears after every turn — in the reply's action strip for a normal turn (next to the feedback buttons), and in the **turn footer** for an interrupted one (that turn has no closing reply, so the strip cannot carry a button). While a turn is running the button stays and greys out.
 
    ![Rollback button](./docs/images/en/rollback-button.png)
 
-2. **Rollback dialog & file-change notice**: clicking ↩ opens a confirmation dialog listing each affected file and its action — modified files are written back, created files are deleted (unrestorable ones are flagged "skip").
+2. **Rollback dialog & file-change notice**: clicking ↩ opens a confirmation dialog listing each affected file and its action — modified files are written back (`restore`), deleted files are brought back (`recover`), files created this turn are deleted (`delete`), and unrestorable ones are flagged "skip".
 
    ![Rollback dialog & file-change notice](./docs/images/en/rollback-dialog.jpeg)
 
@@ -82,9 +83,11 @@ Key implementation points:
   - Its content is an automatically generated checkpoint notice that tells the model not to acknowledge it; rolling back to the same point again lets the newer marker's range cover the older one, leaving a single marker.
 - **UI hiding**: the client hides the chat seats inside the rolled-back range (`display: none`), driven by the durable marker in the log, so the hiding survives a refresh or restart.
 - **Four rollback tags**: `restore` (the file is still there; old content goes back · green), `recover` (the file was deleted; it is brought back · blue), `delete` (undo a file this span created · red), and `skip` (cannot be restored). The first three are distinguished by the recorded kind (`updated` / `removed` / `created`), so writing content back and bringing a file back are two different things in the data itself. An empty list no longer claims there were no file changes: the plugin cannot see files a shell command wrote directly, so it does not make that promise.
+- **Two placements, one button per turn**: a normal turn keeps its button on the **assistant action strip**, where it has always been; only an **interrupted** turn (no closing reply, so the strip cannot carry a button) gets one in the **turn footer**. The footer entry is a contribution to the official `conversation.chat.turnTail` slot, which is a **chain** slot: an entry MUST supply `select`, and returning null means "do not render" — which is exactly how "only where the strip cannot" is implemented. The registration is guarded and reports itself in the console, so a silently missing button cannot happen again.
+- **No rollback while a turn runs**: an open turn refuses a rollback entirely (`src/core/rollback-guard.ts`), whatever the target turn. The agent loop holds a position in the model-visible surface and keeps appending, so truncating underneath it would shadow history the turn is still writing while its later output stays; a command does not interrupt the run either, so the refusal itself is what keeps the two from interleaving. A running turn simply has NO button (the footer node only exists once its turn ends, and the action strip only once a reply finalizes), so there is one rule here and no second disabling mechanism.
 - **Welcome hero**: once a rollback has emptied the whole conversation, the driver injects a host element into the transcript and portals the hero into it.
 - **Client transport**: reuses the shipped `ctx.remote.commands.execute` to call `/rollback …`.
-- **Regression tests**: `tests/core.test.ts` (32), `tests/truncation-plan.test.ts` (10), `tests/root-write.test.ts` (14), `tests/root-write-fallback.test.ts` (15), `tests/literal-edit.test.ts` (12), `tests/dir-cleanup.test.ts` (15), `tests/empty-dirs.test.ts` (5), `tests/boundary-scan.test.ts` (10), `tests/boundary-rescan.test.ts` (13), and `tests/boundary-pipeline.test.ts` (5).
+- **Regression tests**: `tests/core.test.ts` (32), `tests/truncation-plan.test.ts` (10), `tests/root-write.test.ts` (14), `tests/root-write-fallback.test.ts` (15), `tests/literal-edit.test.ts` (12), `tests/dir-cleanup.test.ts` (15), `tests/empty-dirs.test.ts` (5), `tests/boundary-scan.test.ts` (10), `tests/boundary-rescan.test.ts` (13), and `tests/boundary-pipeline.test.ts` (5), `tests/rollback-guard.test.ts` (2), and `tests/turn-entry.test.ts` (3).
 
 ## Known limitations
 

@@ -17,10 +17,11 @@
 | --- | --- |
 | 按轮次检查点 | 每轮发起前建立检查点，只记录该轮实际触碰的文件（Copy-before-Write 前置内容），非全量快照 |
 | 10 轮滑动窗口 | 借鉴 TRAE「仅最近 10 轮」，超出窗口的检查点被丢弃 |
-| 文件回退 | 修改过的文件写回本轮前内容；本轮新建的文件被删除；无法恢复的文件单独报告跳过 |
+| 文件回退 | 修改过的文件写回本轮前内容；已被删除的文件放回来；本轮新建的文件被删除；无法恢复的文件单独报告跳过 |
 | 原位截断 | 用 **`user/message` 承载的表层 `replace`**（内置 `/compact` 同款官方原语）就地替换模型上下文，**回退当场即生效**，保持同一 session id |
-| 三种触发入口 | 模型工具 `rollback`、人工命令 `/rollback`、Web 端每条已完成回复的「回退」按钮 |
-| 受影响文件列表 | Web 按钮弹出对话框，列出本轮及之后受影响文件及动作（恢复/删除/跳过），点击文件可在编辑器打开 |
+| 两种触发入口 | 人工命令 `/rollback`、Web 端每轮结束后的「回退」按钮（正常轮次在回复的动作条上；被中断的轮次在轮次页脚） |
+| 受影响文件列表 | Web 按钮弹出对话框，列出本轮及之后受影响文件及动作（恢复/找回/删除/跳过），点击文件可在编辑器打开 |
+| 运行中禁止回退 | 只要有一轮还在跑就整体拒绝，必须等它结束或暂停（运行中的轮次本来也不会出现按钮） |
 
 ## 快速上手
 
@@ -43,15 +44,15 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
    - `/rollback list` — 列出可回退到的轮次
    - `/rollback preview <n>` — 预览回退到第 n 轮前会影响的文件（不执行）
    - `/rollback <n>` — 回退到第 n 轮发起之前
-3. **模型工具**：AI 可自主调用 `rollback`（传 `turn` + 可选 `preview: true`）。
+3. **不提供模型工具**：模型自己调用回退必然发生在"某一轮进行中"，而运行中一律禁止回退，所以这个工具无法成立，已移除（回退始终由人发起）。
 
 ## 界面预览
 
-1. **回退按钮**：每条已完成 AI 回复下方动作条里的 ↩ 按钮（与「赞/踩」并排）。
+1. **回退按钮**：每轮结束后出现——正常轮次在回复下方动作条里（与「赞/踩」并排）；**被中断的轮次**在轮次页脚（那一轮没有收尾回复，动作条上不可能有按钮）。运行中按钮保留但置灰。
 
    ![回退按钮](./docs/images/rollback-button.png)
 
-2. **回退弹窗与文件修改提示**：点击 ↩ 后弹出确认框，逐条列出受影响文件及其动作——修改过的写回原内容、新建的删除（无法恢复的单独标「跳过」）。
+2. **回退弹窗与文件修改提示**：点击 ↩ 后弹出确认框，逐条列出受影响文件及其动作——修改过的写回原内容（`恢复`）、被删掉的放回来（`找回`）、新建的删除（`删除`）、无法恢复的标「跳过」。
 
    ![回退弹窗与文件修改提示](./docs/images/rollback-dialog.png)
 
@@ -82,9 +83,11 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
   - 标记内容是一段自动生成的检查点说明，并指示模型不要提及它；再次回退到同一点时，新标记的替换范围覆盖旧标记，只保留一条。
 - **界面隐藏**：客户端按标记的替换起点，把被回退区间内的聊天座位隐藏（`display:none`）；隐藏由日志里的持久标记驱动，刷新/重启后保持。
 - **回退标签分四类**：`恢复`（文件还在，写回旧内容 · 绿）、`找回`（文件已被删除，重新放回 · 蓝）、`删除`（撤销该区间新建的文件 · 红）、`跳过`（无法恢复）。前三者的区别由记录里的 kind 决定（`updated` / `removed` / `created`），所以"写回内容"和"把文件找回来"在数据上就是两件事。空列表**不再**显示"无文件变更"——插件看不见 shell 直接写出的文件，这种话它保证不了。
+- **回退入口分两处，但**每轮只有一个按钮**：正常轮次的按钮仍在**助手回复的动作条**（你熟悉的位置）；只有**被中断的轮次**（没有收尾回复 → 动作条上不可能有按钮）才改由**轮次页脚**提供。页脚条目走官方 `conversation.chat.turnTail` 槽——它是 **chain** 槽，条目**必须提供 `select`**（缺了会抛错且界面毫无痕迹），`select` 返回 null 即不渲染，这正是"只在动作条无法提供时才出现"的实现方式；注册带 try/catch 并在控制台留痕，**不允许再出现"按钮静默消失"**。
+- **运行中一律禁止回退**：只要有一轮处于打开状态就整体拒绝（`src/core/rollback-guard.ts`），无论目标是哪一轮。agent loop 持有表层位置并持续追加，在它下面截断会把"这一轮正在写的历史"遮蔽掉、而它更晚的输出还在；命令也不会打断运行，所以**拒绝本身**才是让两者不交错的原因。运行中的轮次**本来就没有按钮**（页脚节点要等该轮 `turn/end` 才存在，动作条要等助手消息收尾），所以这里只有一条规则、没有第二套禁用机制。
 - **欢迎页**：把整段对话回退掉之后，由 driver 往对话区注入宿主元素，再用 React portal 把欢迎页渲染进去。
 - **客户端传输**：复用已出厂 `ctx.remote.commands.execute` 调 `/rollback …`。
-- **回归测试**：`tests/core.test.ts`（32）+ `tests/truncation-plan.test.ts`（10）+ `tests/root-write.test.ts`（14）+ `tests/root-write-fallback.test.ts`（15）+ `tests/literal-edit.test.ts`（12）+ `tests/dir-cleanup.test.ts`（15）+ `tests/empty-dirs.test.ts`（5）+ `tests/boundary-scan.test.ts`（10）+ `tests/boundary-rescan.test.ts`（13）+ `tests/boundary-pipeline.test.ts`（5）。
+- **回归测试**：`tests/core.test.ts`（32）+ `tests/truncation-plan.test.ts`（10）+ `tests/root-write.test.ts`（14）+ `tests/root-write-fallback.test.ts`（15）+ `tests/literal-edit.test.ts`（12）+ `tests/dir-cleanup.test.ts`（15）+ `tests/empty-dirs.test.ts`（5）+ `tests/boundary-scan.test.ts`（10）+ `tests/boundary-rescan.test.ts`（13）+ `tests/boundary-pipeline.test.ts`（5）+ `tests/rollback-guard.test.ts`（2）+ `tests/turn-entry.test.ts`（3）。
 
 ## 已知限制（Known Limitations）
 
