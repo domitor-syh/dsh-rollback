@@ -152,4 +152,43 @@ describe('boundary re-scan to rollback', () => {
       { path: file, action: 'restore', content: 'written before the restart', kind: 'updated' },
     ])
   })
+
+  it('catches a deletion when the turn that made it ends, with no further message', async () => {
+    // The scenario a user actually performs: ask the model to delete the file, then
+    // roll back — without sending anything else. The turn's own end is the boundary.
+    const sessionId = 'pipeline-turn-end'
+    const file = join(workspace, 'victim.txt')
+    const { fold, scanner, recorded } = wire(sessionId)
+
+    // Turn 1 creates the file through the tools.
+    fold.fold({ kind: 'turn-start', turn: 1, seq: 0 })
+    fold.fold({ kind: 'surface', seq: 1 })
+    await writeFile(file, 'important', 'utf8')
+    scanner.observe(sessionId, file, 'important')
+    fold.fold({ kind: 'fs-mutation', mutation: { path: file, operation: 'create', before: null, after: 'important' } })
+    appendCheckpoint({ sessionId, turn: 1, path: file, operation: 'create', before: null, after: 'important' })
+    fold.fold({ kind: 'turn-end', turn: 1, seq: 1 })
+
+    // Turn 2 deletes it with a shell command, and ends. The end triggers the scan,
+    // anchored at turn 2 — the turn the deletion belongs to.
+    fold.fold({ kind: 'turn-start', turn: 2, seq: 2 })
+    fold.fold({ kind: 'surface', seq: 3 })
+    await unlink(file)
+    await scanner.scan(sessionId, 2)
+    fold.fold({ kind: 'turn-end', turn: 2, seq: 3 })
+
+    expect(recorded).toEqual([{ turn: 2, path: file }])
+
+    // Rolling back to before turn 2 restores it: the deletion is turn 2's doing.
+    const plan = planRollback(fold.snapshots(), 2, fold.surfaceTail())
+    expect(plan.restored).toEqual([
+      { path: file, action: 'restore', content: 'important', kind: 'updated' },
+    ])
+
+    // And rolling back past the creation still deletes what turn 1 created.
+    const backToCreation = planRollback(fold.snapshots(), 1, fold.surfaceTail())
+    expect(backToCreation.restored).toEqual([
+      { path: file, action: 'delete', content: null, kind: 'created' },
+    ])
+  })
 })

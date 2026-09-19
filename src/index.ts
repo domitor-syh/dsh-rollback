@@ -128,7 +128,7 @@ export function apply(ctx: Context): void {
       if (session === undefined) throw new Error('rollback tool requires an agent session')
       const turn = Number(args.turn)
       if (!Number.isSafeInteger(turn) || turn < 1) throw new Error('turn must be a positive integer')
-      const plan = service.preview(session as never, turn)
+      const plan = await service.preview(session as never, turn)
       if (args.preview === true) {
         return {
           fromTurn: turn,
@@ -168,7 +168,7 @@ export function apply(ctx: Context): void {
           if (!Number.isSafeInteger(turn) || turn < 1) {
             return { kind: 'error', text: '用法：/rollback preview <turn>  （turn 为正整数轮次）' }
           }
-          const plan = service.preview(session as never, turn)
+          const plan = await service.preview(session as never, turn)
           return { kind: 'success', text: planText(plan, `回退到第 ${turn} 轮发起前，受影响文件：`) }
         }
         const turn = Number(raw)

@@ -149,22 +149,30 @@ export class RollbackService {
         case 'turn/start':
           fold.fold({ kind: 'turn-start', turn: event.data.turn, seq: event.seq })
           break
-        case 'turn/end':
+        case 'turn/end': {
+          // The turn's own end is the boundary that matters most: a shell command
+          // that ran during this turn must be noticed BEFORE the user rolls back.
+          // Waiting for their next message would catch the deletion a turn too late,
+          // and not at all if they rolled back first. The turn number is read before
+          // the fold closes the turn.
+          const endedSessionId = typeof session.id === 'string' ? session.id : ''
+          if (endedSessionId !== '') void this.rescan.scan(endedSessionId, event.data.turn)
           fold.fold({ kind: 'turn-end', turn: event.data.turn, seq: event.seq })
           break
+        }
         case 'user/message':
         case 'assistant/message':
         case 'tool/result':
           // Only append-origin surface events advance a live turn's span.
           if (event.surfaceOp === 'append') fold.fold({ kind: 'surface', seq: event.seq })
-          // A user message is the boundary the re-scan anchors to: it is the interval
-          // the user thinks in, and the turn it opens is the one a later rollback
-          // would target. The turn is read NOW — the scan itself is asynchronous — and
-          // nothing is awaited on the message path.
+          // A user message is also a boundary, catching anything that changed between
+          // the last turn's end and this message (a shell command the user ran
+          // themselves, for instance). The turn is read NOW — the scan itself is
+          // asynchronous — and nothing is awaited on the message path.
           if (event.type === 'user/message') {
-            const turn = fold.inProgressTurn()
+            const openedTurn = fold.inProgressTurn()
             const sessionId = typeof session.id === 'string' ? session.id : ''
-            if (turn !== null && sessionId !== '') void this.rescan.scan(sessionId, turn)
+            if (openedTurn !== null && sessionId !== '') void this.rescan.scan(sessionId, openedTurn)
           }
           break
         default:
@@ -342,9 +350,20 @@ export class RollbackService {
     this.pendingBefore.set(exec.callId ?? '', { path: target.displayPath, kind: 'updated', before })
   }
 
-  /** Compute a read-only rollback plan (does not mutate anything). */
-  preview(session: Session, fromTurn: number): RollbackPlan {
+  /**
+   * Compute a read-only rollback plan (does not mutate anything).
+   *
+   * Waits for a boundary re-scan already running, for the same reason `execute`
+   * does: a plan computed a moment after a turn ends must include what that turn's
+   * scan found, or the preview would under-report what the rollback will do.
+   * @param session - the session to plan against.
+   * @param fromTurn - restore the state before this turn.
+   * @returns the plan.
+   */
+  async preview(session: Session, fromTurn: number): Promise<RollbackPlan> {
     const fold = this.foldFor(session)
+    const sessionId = typeof session.id === 'string' ? session.id : ''
+    if (sessionId !== '') await this.rescan.settled(sessionId)
     const plan = planRollback(fold.snapshots(), fromTurn, fold.surfaceTail())
     // The fold's in-memory surface tail can lag behind the durable session
     // surface (e.g. restored/image turns). The authoritative truncation — and
@@ -369,6 +388,10 @@ export class RollbackService {
     if (inProgress !== null && fromTurn >= inProgress) {
       throw new Error(`cannot roll back to before turn ${fromTurn}: turn ${inProgress} is still in progress`)
     }
+    // A scan triggered by the turn's own end may still be reading files; planning
+    // without waiting would miss exactly the change this rollback is meant to undo.
+    const settlingId = typeof session.id === 'string' ? session.id : ''
+    if (settlingId !== '') await this.rescan.settled(settlingId)
 
     const plan = planRollback(fold.snapshots(), fromTurn, fold.surfaceTail())
 

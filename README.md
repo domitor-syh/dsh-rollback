@@ -75,7 +75,7 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 - **前置内容捕获**：`write`/`edit` 的执行结果里已带 `before`/`after`，用 `ctx.on('tools/result')` 取完整前置内容；`str_replace_editor` 的结果只有渲染文本，改由 `tools/pre-execute` 在调用前预读目标。
 - **盘根写入兜底**：Windows 上文件工具无法操作盘符根目录**正下方**的文件——文件系统层写前会先 `mkdir` 父目录，而 `dirname('E:\\file.txt')` 是**带尾分隔符**的 `E:\`，Windows 对卷根 mkdir 返回 EPERM。插件包装 `ctx.fs.writeText` 与 `ctx.fs.editText`：**仅当原路抛出这一精确形状的错误时**，改用「同目录临时文件 + `rename`」落盘（不做 mkdir 预检）。`edit` 分支还逐字复刻了字面匹配语义（`FS_EDIT_NOT_FOUND` / `FS_AMBIGUOUS_EDIT` 的判定与文案）并保留原文件的**行尾风格**与权限位；只包装后端实际实现了的方法。其余错误、以及策略不允许的路径（fail closed）一律按原样抛出。文件系统层若不再预建目录，该分支自动失效。
 - **空目录清理**：回退删掉它创建的文件后，把「**已被清空、且创建时间落在被回退时间段内**」的祖先目录一并删除（最深优先；把本次即将删除的子目录视为已不存在，所以整条新目录链会一起清掉）。创建时间用于区分两种情况：目录在第 3 轮创建、文件在第 5 轮创建时——回退到第 5 轮之前**只删文件、保留目录**，回退到第 3 轮之前**两者都删**。创建时间不可得、目录不可读、或仍有内容时一律保留（fail closed）。
-- **边界重扫 + 最后已知内容**：捕获只看得到文件工具，所以插件在**每条用户消息边界**复查它监视过的那些路径（状态指纹不变就只 stat、不读），把「被 shell 改写」或「被 shell 删除」的变化记到**该边界开启的那一轮**上——回退到该轮之前即可恢复。判定是 fail-closed 的：内容从未被读过就消失的文件**不记录**（记了也只会在恢复阶段被标为无法恢复，而**任何一个无法恢复的文件都会中止整次回退**），只报一次警告；超过 8MiB 的文件不再监视而不是假装能恢复；回退成功后注册表只清"内容记忆"、**保留路径继续监视**（否则回退会悄悄丢掉覆盖）。
+- **边界重扫 + 最后已知内容**：捕获只看得到文件工具，所以插件**在每一轮结束时（以及每条用户消息到来时）**复查它监视过的那些路径（状态指纹不变就只 stat、不读），把「被 shell 改写」或「被 shell 删除」的变化记到**该轮**上——模型删完、这一轮一结束就已经记录，**不需要你再多发一条消息**；回退到该轮之前即可恢复（回退在规划前会等待正在进行的扫描，避免"刚结束就回退"的竞态）。判定是 fail-closed 的：内容从未被读过就消失的文件**不记录**（记了也只会在恢复阶段被标为无法恢复，而**任何一个无法恢复的文件都会中止整次回退**），只报一次警告；超过 8MiB 的文件不再监视而不是假装能恢复；回退成功后注册表只清"内容记忆"、**保留路径继续监视**（否则回退会悄悄丢掉覆盖）。
 - **写入偏好提示**：向模型注入一条常驻运行说明——只有被 `write`/`edit` 触碰过的文件才进入回退跟踪，改内容请用这两个工具而不是 shell。
 - **原位截断**：对当前 `session.surface.nodes` 中「第 n 轮及之后」的连续节点，append 一条 **`user/message`** 表层 `replace`（`surfaceOp: { op:'replace', start, end }` + `sourceEventSeqs` 覆盖全部被遮蔽节点），就地替换这段历史；会话 id 不变。
   - 标记在 `/rollback` 执行时**当场**写入日志，被回退区间随即从模型历史中消失。
@@ -83,7 +83,7 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 - **界面隐藏**：客户端按标记的替换起点，把被回退区间内的聊天座位隐藏（`display:none`）；隐藏由日志里的持久标记驱动，刷新/重启后保持。
 - **欢迎页**：把整段对话回退掉之后，由 driver 往对话区注入宿主元素，再用 React portal 把欢迎页渲染进去。
 - **客户端传输**：复用已出厂 `ctx.remote.commands.execute` 调 `/rollback …`。
-- **回归测试**：`tests/truncation-plan.test.ts`（10）+ `tests/core.test.ts`（28）+ `tests/root-write.test.ts`（14）+ `tests/root-write-fallback.test.ts`（15）+ `tests/literal-edit.test.ts`（12）+ `tests/dir-cleanup.test.ts`（12）+ `tests/empty-dirs.test.ts`（5）+ `tests/boundary-scan.test.ts`（10）+ `tests/boundary-rescan.test.ts`（8）+ `tests/boundary-pipeline.test.ts`（3）。
+- **回归测试**：`tests/truncation-plan.test.ts`（10）+ `tests/core.test.ts`（28）+ `tests/root-write.test.ts`（14）+ `tests/root-write-fallback.test.ts`（15）+ `tests/literal-edit.test.ts`（12）+ `tests/dir-cleanup.test.ts`（12）+ `tests/empty-dirs.test.ts`（5）+ `tests/boundary-scan.test.ts`（10）+ `tests/boundary-rescan.test.ts`（10）+ `tests/boundary-pipeline.test.ts`（4）。
 
 ## 已知限制（Known Limitations）
 

@@ -52,8 +52,10 @@ const MAX_WATCHED_BYTES = 8 * 1024 * 1024
 export class BoundaryRescan {
   /** Per session: display path to what the plugin last observed. */
   private readonly watched = new Map<string, Map<string, TrackedFile>>()
-  /** Sessions with a scan already running; one at a time, newest wins. */
-  private readonly running = new Set<string>()
+  /** The scan currently running per session. */
+  private readonly inFlight = new Map<string, Promise<void>>()
+  /** A newer anchor requested while a scan was already running. */
+  private readonly queued = new Map<string, number>()
   /** Warnings that should appear once per path, not once per boundary. */
   private readonly warned = new Set<string>()
 
@@ -74,27 +76,58 @@ export class BoundaryRescan {
   /**
    * Re-check every watched file of one session, anchored at `turn`.
    *
-   * Fire-and-forget by design: the caller invokes it from the message path and
-   * ignores the promise, and the scan swallows its own failures.
+   * Fire-and-forget by design: the caller invokes it from the event path and ignores
+   * the promise, and the scan swallows its own failures. A request arriving while a
+   * scan is already running is remembered and run afterwards, so a finding is never
+   * anchored to a turn the user has already left behind.
    * @param sessionId - the session to scan.
-   * @param turn - the turn the boundary opened.
+   * @param turn - the turn the boundary belongs to.
+   * @returns the running scan, for a caller that needs to wait for it.
    */
-  async scan(sessionId: string, turn: number): Promise<void> {
-    if (this.running.has(sessionId)) return
-    this.running.add(sessionId)
-    try {
-      const tracked = this.registryFor(sessionId)
-      for (const [path, state] of [...tracked]) {
-        try {
-          await this.checkOne(sessionId, turn, path, state, tracked)
-        } catch (error) {
-          this.deps.warn(`[dsh-rollback] boundary re-check failed for ${path}: ${error instanceof Error ? error.message : String(error)}`)
+  scan(sessionId: string, turn: number): Promise<void> {
+    const running = this.inFlight.get(sessionId)
+    if (running !== undefined) {
+      this.queued.set(sessionId, turn)
+      return running
+    }
+    const task = (async () => {
+      try {
+        await this.runOnce(sessionId, turn)
+        while (this.queued.has(sessionId)) {
+          const next = this.queued.get(sessionId)!
+          this.queued.delete(sessionId)
+          await this.runOnce(sessionId, next)
         }
+      } finally {
+        this.inFlight.delete(sessionId)
+        this.queued.delete(sessionId)
       }
-    } catch (error) {
-      this.deps.warn(`[dsh-rollback] boundary re-scan failed for session ${sessionId}: ${error instanceof Error ? error.message : String(error)}`)
-    } finally {
-      this.running.delete(sessionId)
+    })()
+    this.inFlight.set(sessionId, task)
+    return task
+  }
+
+  /**
+   * Wait for any running scan of this session to finish.
+   *
+   * A rollback can be asked for the very instant a turn ends, while the scan that
+   * turn triggered is still reading files; planning without waiting would miss
+   * exactly the change the user is rolling back.
+   * @param sessionId - the session.
+   */
+  async settled(sessionId: string): Promise<void> {
+    await this.inFlight.get(sessionId)
+  }
+
+  /** One pass over the session's watched files. */
+  private async runOnce(sessionId: string, turn: number): Promise<void> {
+    const tracked = this.registryFor(sessionId)
+    for (const [path, state] of [...tracked]) {
+      try {
+        await this.checkOne(sessionId, turn, path, state, tracked)
+      } catch (error) {
+        this.deps.warn(`[dsh-rollback] boundary re-check failed for ${path}: ${error instanceof Error ? error.message : String(error)}`)
+      }
     }
   }
 

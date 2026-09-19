@@ -180,4 +180,58 @@ describe('BoundaryRescan', () => {
     scanner.prime('s1')
     await expect(scanner.scan('s1', 1)).resolves.toBeUndefined()
   })
+
+  it('settles only after a running scan has recorded what it found', async () => {
+    // A rollback can be asked for the instant a turn ends, while the scan that turn
+    // triggered is still reading. Planning before it settles would miss the change.
+    const file = join(root, 'slow.txt')
+    await writeFile(file, 'content', 'utf8')
+    let release = (): void => {}
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const records: { turn: number; mutation: FsMutation }[] = []
+    const scanner = new BoundaryRescan({
+      hostPathOf: async (_sessionId, path) => { await gate; return path },
+      watchedPaths: () => [],
+      knownContent: () => new Map(),
+      record: (_sessionId, turn, mutation) => { records.push({ turn, mutation }) },
+      warn: () => {},
+    })
+    scanner.observe('s1', file, 'content')
+    await unlink(file)
+
+    void scanner.scan('s1', 3)
+    let settled = false
+    const waiting = scanner.settled('s1').then(() => { settled = true })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+
+    release()
+    await waiting
+    expect(settled).toBe(true)
+    expect(records).toHaveLength(1)
+  })
+
+  it('runs an anchor requested while a scan was already in flight', async () => {
+    // The newer anchor must still be scanned: a finding must never be attributed to
+    // a turn the user has already left behind.
+    const file = join(root, 'queued.txt')
+    await writeFile(file, 'content', 'utf8')
+    let release = (): void => {}
+    const gate = new Promise<void>(resolve => { release = resolve })
+    let lookups = 0
+    const scanner = new BoundaryRescan({
+      hostPathOf: async (_sessionId, path) => { lookups += 1; await gate; return path },
+      watchedPaths: () => [],
+      knownContent: () => new Map(),
+      record: () => {},
+      warn: () => {},
+    })
+    scanner.observe('s1', file, 'content')
+
+    void scanner.scan('s1', 3)
+    void scanner.scan('s1', 4)
+    release()
+    await scanner.settled('s1')
+    expect(lookups).toBe(2)
+  })
 })
