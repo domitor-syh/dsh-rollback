@@ -75,14 +75,15 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 - **前置内容捕获**：`write`/`edit` 的执行结果里已带 `before`/`after`，用 `ctx.on('tools/result')` 取完整前置内容；`str_replace_editor` 的结果只有渲染文本，改由 `tools/pre-execute` 在调用前预读目标。
 - **盘根写入兜底**：Windows 上文件工具无法操作盘符根目录**正下方**的文件——文件系统层写前会先 `mkdir` 父目录，而 `dirname('E:\\file.txt')` 是**带尾分隔符**的 `E:\`，Windows 对卷根 mkdir 返回 EPERM。插件包装 `ctx.fs.writeText` 与 `ctx.fs.editText`：**仅当原路抛出这一精确形状的错误时**，改用「同目录临时文件 + `rename`」落盘（不做 mkdir 预检）。`edit` 分支还逐字复刻了字面匹配语义（`FS_EDIT_NOT_FOUND` / `FS_AMBIGUOUS_EDIT` 的判定与文案）并保留原文件的**行尾风格**与权限位；只包装后端实际实现了的方法。其余错误、以及策略不允许的路径（fail closed）一律按原样抛出。文件系统层若不再预建目录，该分支自动失效。
 - **空目录清理**：回退删掉它创建的文件后，把「**已被清空、且创建时间落在被回退时间段内**」的祖先目录一并删除（最深优先；把本次即将删除的子目录视为已不存在，所以整条新目录链会一起清掉）。创建时间用于区分两种情况：目录在第 3 轮创建、文件在第 5 轮创建时——回退到第 5 轮之前**只删文件、保留目录**，回退到第 3 轮之前**两者都删**。创建时间不可得、目录不可读、或仍有内容时一律保留（fail closed）。
-- **写入偏好提示**：向模型注入一条常驻运行说明——经 shell 修改的文件无法回退，内容改动请用 `write`/`edit`。
+- **边界重扫 + 最后已知内容**：捕获只看得到文件工具，所以插件在**每条用户消息边界**复查它监视过的那些路径（状态指纹不变就只 stat、不读），把「被 shell 改写」或「被 shell 删除」的变化记到**该边界开启的那一轮**上——回退到该轮之前即可恢复。判定是 fail-closed 的：内容从未被读过就消失的文件**不记录**（记了也只会在恢复阶段被标为无法恢复，而**任何一个无法恢复的文件都会中止整次回退**），只报一次警告；超过 8MiB 的文件不再监视而不是假装能恢复；回退成功后注册表只清"内容记忆"、**保留路径继续监视**（否则回退会悄悄丢掉覆盖）。
+- **写入偏好提示**：向模型注入一条常驻运行说明——只有被 `write`/`edit` 触碰过的文件才进入回退跟踪，改内容请用这两个工具而不是 shell。
 - **原位截断**：对当前 `session.surface.nodes` 中「第 n 轮及之后」的连续节点，append 一条 **`user/message`** 表层 `replace`（`surfaceOp: { op:'replace', start, end }` + `sourceEventSeqs` 覆盖全部被遮蔽节点），就地替换这段历史；会话 id 不变。
   - 标记在 `/rollback` 执行时**当场**写入日志，被回退区间随即从模型历史中消失。
   - 标记内容是一段自动生成的检查点说明，并指示模型不要提及它；再次回退到同一点时，新标记的替换范围覆盖旧标记，只保留一条。
 - **界面隐藏**：客户端按标记的替换起点，把被回退区间内的聊天座位隐藏（`display:none`）；隐藏由日志里的持久标记驱动，刷新/重启后保持。
 - **欢迎页**：把整段对话回退掉之后，由 driver 往对话区注入宿主元素，再用 React portal 把欢迎页渲染进去。
 - **客户端传输**：复用已出厂 `ctx.remote.commands.execute` 调 `/rollback …`。
-- **回归测试**：`tests/truncation-plan.test.ts`（10）+ `tests/core.test.ts`（24）+ `tests/root-write.test.ts`（14）+ `tests/root-write-fallback.test.ts`（15）+ `tests/literal-edit.test.ts`（12）+ `tests/dir-cleanup.test.ts`（12）+ `tests/empty-dirs.test.ts`（5）。
+- **回归测试**：`tests/truncation-plan.test.ts`（10）+ `tests/core.test.ts`（28）+ `tests/root-write.test.ts`（14）+ `tests/root-write-fallback.test.ts`（15）+ `tests/literal-edit.test.ts`（12）+ `tests/dir-cleanup.test.ts`（12）+ `tests/empty-dirs.test.ts`（5）+ `tests/boundary-scan.test.ts`（10）+ `tests/boundary-rescan.test.ts`（8）+ `tests/boundary-pipeline.test.ts`（3）。
 
 ## 已知限制（Known Limitations）
 
@@ -91,7 +92,7 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 - **检查点为进程内存态 + 20 轮 sidecar**：折叠状态随会话对象存于内存（`WeakMap`）；重启后由 sidecar（`storages/dsh-rollback/checkpoints-v2/`）重建，保留最近 20 轮（`KEEP_TURNS`），更早的记录在加载时被剪枝。
 - **新建文件删除与空目录清理走本地文件系统**：文件系统抽象层没有删除原语，删除通过 `processPath` + Node `unlink`、空目录清理通过 Node `rmdir` 完成，仅对本地后端可靠。
 - **回退不可撤销**：执行即替换历史，不提供 redo 链。
-- **经 shell 修改或删除的文件不在回退范围**：插件只从 `write`/`edit` 的结果里捕获文件改动；`pwsh`/`bash` 的副作用（重定向、`sed -i`、`Remove-Item`、`git`、`npm install` 写文件等）无论在工作区内还是外都无法回退。插件会注入提示引导模型改走文件工具，但无法强制。
+- **shell 新建的文件、以及从未被文件工具碰过的文件不在回退范围**：插件只从 `write`/`edit` 的结果里捕获改动，并在消息边界复查这些路径——所以「shell 改写了/删除了**已登记**文件」（含工作区外，如 `E:\`、桌面）**可以**回退；而「shell 新建一个全新文件」或「改动一个从未被工具碰过的文件」无法回退（后者连它存在过都不知道）。插件会注入提示引导模型改走文件工具，但无法强制。
 
 ## 开发
 

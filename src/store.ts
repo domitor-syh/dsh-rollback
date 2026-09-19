@@ -38,6 +38,16 @@ export interface CheckpointRecord {
   operation: 'create' | 'update'
   /** File content BEFORE this turn's first touch; null only for a created file. */
   before: string | null
+  /**
+   * Content the touch left behind, when the plugin observed it.
+   *
+   * The boundary re-scan needs it: a file this plugin watched can be deleted or
+   * rewritten by a shell command it never sees, and restoring that change requires
+   * the last content the plugin ACTUALLY knew — which `before` cannot supply for a
+   * file that was created here (`before` is null). Records written by earlier builds
+   * omit it, which is why it is optional.
+   */
+  after?: string
 }
 
 export type CheckpointMap = Map<number, Map<string, { operation: 'create' | 'update'; before: string | null }>>
@@ -76,6 +86,7 @@ function validRecord(value: unknown, sessionId: string): value is CheckpointReco
     && typeof r.path === 'string'
     && (r.operation === 'create' || r.operation === 'update')
     && (r.before === null || typeof r.before === 'string')
+    && (r.after === undefined || typeof r.after === 'string')
 }
 
 /** Append one captured mutation to the store (best-effort durability). */
@@ -87,6 +98,50 @@ export function appendCheckpoint(record: CheckpointRecord): void {
   } catch {
     /* a failed checkpoint write only degrades restore, never the session */
   }
+}
+
+/**
+ * The last content this plugin observed for each path of one session.
+ *
+ * Read from the sidecar's `after` fields, newest record winning, so a restarted
+ * process can still restore a file that an unseen shell command removed after the
+ * plugin last looked at it. Paths whose records predate that field, or whose only
+ * observation never recorded content, are absent — the caller then has to read the
+ * file to learn it.
+ * @param sessionId - the session whose sidecar to read.
+ * @returns path to the most recently observed content.
+ */
+export function loadKnownContent(sessionId: string): Map<string, string> {
+  const known = new Map<string, string>()
+  for (const row of readRecords(sessionId)) {
+    if (typeof row.after === 'string' && row.after !== '') known.set(row.path, row.after)
+  }
+  return known
+}
+
+/**
+ * Every structurally valid record in one session's sidecar, in file order.
+ * @param sessionId - the session whose sidecar to read.
+ * @returns the records, oldest first.
+ */
+function readRecords(sessionId: string): CheckpointRecord[] {
+  const file = sessionFile(sessionId)
+  if (!existsSync(file)) return []
+  const rows: CheckpointRecord[] = []
+  try {
+    for (const line of readFileSync(file, 'utf8').split('\n')) {
+      if (line.trim() === '') continue
+      try {
+        const parsed: unknown = JSON.parse(line)
+        if (validRecord(parsed, sessionId)) rows.push(parsed)
+      } catch {
+        /* corrupt lines are reported by the loader that compacts the file */
+      }
+    }
+  } catch {
+    /* unreadable file means nothing is known */
+  }
+  return rows
 }
 
 /**

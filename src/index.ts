@@ -30,7 +30,7 @@ const WINDOW_HINT = '(仅最近 10 轮)'
  * so it stays true whatever the model decides.
  */
 const FILE_TOOL_HINT =
-  'File changes made through a shell command cannot be rolled back; prefer the write/edit tools when changing file contents.'
+  'Only files touched by the write/edit tools are tracked for rollback; change file contents with those tools rather than a shell command.'
 
 /** Format a plan's affected-file list into a human-readable text block. */
 function planText(plan: RollbackPlan, header: string): string {

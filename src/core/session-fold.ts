@@ -93,6 +93,32 @@ export class SessionFold {
     return this.current === null ? null : this.current.turn
   }
 
+  /**
+   * Record one fs mutation against a SPECIFIC turn, open or already closed.
+   *
+   * The boundary re-scan reads the filesystem asynchronously, so the turn it anchors
+   * to can close while it waits — and folding then would drop the mutation, losing
+   * exactly the change the re-scan exists to catch. A turn that already left the
+   * retained window cannot take the change; the caller is told so.
+   * @param turn - the turn the mutation belongs to.
+   * @param mutation - the change to record.
+   * @returns whether the mutation found a home.
+   */
+  mutationInto(turn: number, mutation: FsMutation): boolean {
+    if (this.current !== null && this.current.turn === turn) {
+      this.current = recordChange(this.current, mutation)
+      return true
+    }
+    const retained = this.checkpoints.snapshot()
+    const index = retained.findIndex(checkpoint => checkpoint.turn === turn)
+    if (index === -1) return false
+    const merged = recordChange(retained[index]!, mutation)
+    const rebuilt = [...retained.slice(0, index), merged, ...retained.slice(index + 1)]
+    this.checkpoints.clear()
+    for (const checkpoint of rebuilt) this.checkpoints.push(checkpoint)
+    return true
+  }
+
   /** Retained checkpoints, oldest first (ascending turn). */
   snapshots(): readonly TurnCheckpoint[] {
     return this.checkpoints.snapshot()

@@ -125,6 +125,52 @@ describe('SessionFold', () => {
     f.setTail(100)
     expect(f.surfaceTail()).toBe(100)
   })
+
+  describe('mutationInto', () => {
+    const change = (path: string, before: string, after: string): FsMutation =>
+      ({ path, operation: 'update', before, after })
+
+    it('records against the open turn', () => {
+      const f = new SessionFold(10)
+      f.fold({ kind: 'turn-start', turn: 7, seq: 0 })
+      expect(f.mutationInto(7, change('a.txt', 'old', 'new'))).toBe(true)
+      f.fold({ kind: 'turn-end', turn: 7, seq: 0 })
+      expect(f.snapshots()[0]!.changes['a.txt']).toMatchObject({ before: 'old', after: 'new' })
+    })
+
+    it('records against a turn that already closed', () => {
+      // The boundary re-scan reads the filesystem asynchronously, so the turn it
+      // anchors to can close while it waits; dropping the mutation then would lose
+      // exactly the change the re-scan exists to catch.
+      const f = new SessionFold(10)
+      f.fold({ kind: 'turn-start', turn: 3, seq: 0 })
+      f.fold({ kind: 'surface', seq: 1 })
+      f.fold({ kind: 'turn-end', turn: 3, seq: 1 })
+      expect(f.mutationInto(3, change('gone.txt', 'content', ''))).toBe(true)
+      expect(f.snapshots()[0]!.changes['gone.txt']).toMatchObject({ before: 'content', after: '' })
+    })
+
+    it('keeps the first before-state when a later mutation joins the same turn', () => {
+      const f = new SessionFold(10)
+      f.fold({ kind: 'turn-start', turn: 2, seq: 0 })
+      f.fold({ kind: 'surface', seq: 1 })
+      f.fold({ kind: 'turn-end', turn: 2, seq: 1 })
+      f.mutationInto(2, change('x.txt', 'first', 'second'))
+      f.mutationInto(2, change('x.txt', 'second', 'third'))
+      expect(f.snapshots()[0]!.changes['x.txt']).toMatchObject({ before: 'first', after: 'third' })
+    })
+
+    it('refuses a turn that left the retained window', () => {
+      const f = new SessionFold(2)
+      for (let t = 1; t <= 5; t++) {
+        f.fold({ kind: 'turn-start', turn: t, seq: t })
+        f.fold({ kind: 'surface', seq: t })
+        f.fold({ kind: 'turn-end', turn: t, seq: t })
+      }
+      expect(f.mutationInto(1, change('old.txt', 'a', 'b'))).toBe(false)
+      expect(f.mutationInto(5, change('new.txt', 'a', 'b'))).toBe(true)
+    })
+  })
 })
 
 describe('fsMutationFrom', () => {

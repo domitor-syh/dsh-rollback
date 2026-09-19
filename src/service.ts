@@ -18,6 +18,7 @@ import type { FsMutation } from './core/model.ts'
 import { fsMutationFrom, SessionFold } from './core/session-fold.ts'
 import { planRollback, type RestoredFile, type RollbackPlan, type SkippedFile } from './core/restore-plan.ts'
 import { turnStartTimeMs } from './core/dir-cleanup.ts'
+import { BoundaryRescan } from './boundary-rescan.ts'
 import { cleanupEmptyDirs } from './empty-dirs.ts'
 import {
   planTruncationMarker,
@@ -25,7 +26,7 @@ import {
   type SessionView,
   type TruncationMarkerPlan,
 } from './core/truncation-plan.ts'
-import { appendCheckpoint, loadCheckpoints } from './store.ts'
+import { appendCheckpoint, loadCheckpoints, loadKnownContent } from './store.ts'
 
 /** Retained checkpoint window: "仅支持回退至最近 10 轮会话内" (sliding window). */
 export const ROLLBACK_WINDOW = 10
@@ -82,13 +83,65 @@ function viewOf(session: Session): SessionView {
   return session as unknown as SessionView
 }
 
+/**
+ * The paths one session's sidecar holds — everything worth watching.
+ *
+ * The sidecar is the durable record of what the file tools touched, so it is also
+ * the list a restarted process should keep re-checking.
+ * @param sessionId - the session.
+ * @returns distinct display paths, in no particular order.
+ */
+function watchablePaths(sessionId: string): string[] {
+  const paths = new Set<string>()
+  for (const byPath of loadCheckpoints(sessionId).values()) {
+    for (const path of byPath.keys()) paths.add(path)
+  }
+  return [...paths]
+}
+
 /** The rollback service: capture + preview + execute, keyed by live session. */
 export class RollbackService {
   private readonly folds = new WeakMap<object, SessionFold>()
   /** Copy-before-Write carrier for `str_replace_editor`, keyed by call id. */
   private readonly pendingBefore = new Map<string, { path: string; kind: 'created' | 'updated'; before: string | null }>()
+  /** Watchdog for files the file tools touched, re-checked at message boundaries. */
+  private readonly rescan: BoundaryRescan
 
   constructor(private readonly ctx: Context) {
+    // The re-scan needs the session's policy to resolve a path, and the fold to
+    // anchor a finding at the boundary's turn.
+    this.rescan = new BoundaryRescan({
+      hostPathOf: async (sessionId, path) => {
+        const session = this.ctx.sessions.get(sessionId)
+        if (session === undefined) return undefined
+        const policy = this.ctx.sandboxPolicy.resolve({ session })
+        const target = await this.ctx.fs.resolve(path, { cwd: policy.workspaceRoot })
+        return this.ctx.fs.processPath(target)
+      },
+      watchedPaths: sessionId => watchablePaths(sessionId),
+      knownContent: sessionId => loadKnownContent(sessionId),
+      record: (sessionId, turn, mutation) => {
+        const session = this.ctx.sessions.get(sessionId)
+        if (session === undefined) return
+        const fold = this.foldFor(session)
+        if (!fold.mutationInto(turn, mutation)) {
+          // The boundary's turn already left the retained window: recording it
+          // elsewhere would restore the wrong state, so it is dropped with a word.
+          console.warn(`[dsh-rollback] turn ${turn} left the retained window before its boundary scan finished; ${mutation.path} was not recorded`)
+          return
+        }
+        appendCheckpoint({
+          sessionId,
+          turn,
+          path: mutation.path,
+          operation: mutation.operation,
+          before: mutation.before,
+          after: mutation.after,
+        })
+      },
+      warn: message => console.warn(message),
+    })
+
     ctx.on('session/event', (_session, event) => {
       const session = _session as Session
       const fold = this.foldFor(session)
@@ -104,6 +157,15 @@ export class RollbackService {
         case 'tool/result':
           // Only append-origin surface events advance a live turn's span.
           if (event.surfaceOp === 'append') fold.fold({ kind: 'surface', seq: event.seq })
+          // A user message is the boundary the re-scan anchors to: it is the interval
+          // the user thinks in, and the turn it opens is the one a later rollback
+          // would target. The turn is read NOW — the scan itself is asynchronous — and
+          // nothing is awaited on the message path.
+          if (event.type === 'user/message') {
+            const turn = fold.inProgressTurn()
+            const sessionId = typeof session.id === 'string' ? session.id : ''
+            if (turn !== null && sessionId !== '') void this.rescan.scan(sessionId, turn)
+          }
           break
         default:
           break
@@ -148,9 +210,16 @@ export class RollbackService {
 
       const fold = this.foldFor(sessionObj)
       fold.fold({ kind: 'fs-mutation', mutation })
+      // The file tools are the plugin's only window onto the workspace; every path
+      // they touch becomes one the boundary re-scan watches from now on.
+      if (typeof sessionObj.id === 'string' && sessionObj.id !== '') {
+        this.rescan.observe(sessionObj.id, mutation.path, mutation.after)
+      }
 
       // Persist the pre-turn content so a later restart can still restore it
-      // (the log only keeps 3-line diff hunks, not whole files).
+      // (the log only keeps 3-line diff hunks, not whole files), and the content
+      // this touch left behind so a restart can still restore a file a later shell
+      // command removes.
       const turn = fold.inProgressTurn()
       if (turn !== null && typeof sessionObj.id === 'string') {
         appendCheckpoint({
@@ -159,6 +228,7 @@ export class RollbackService {
           path: mutation.path,
           operation: mutation.operation,
           before: mutation.before,
+          after: mutation.after,
         })
       }
     })
@@ -181,6 +251,9 @@ export class RollbackService {
   private seedFromLog(session: Session): void {
     if (this.folds.has(session)) return
     const fold = this.foldFor(session)
+    // Keep watching whatever the sidecar already knows, so a restarted process
+    // still notices a shell command that removes one of those files.
+    if (typeof session.id === 'string' && session.id !== '') this.rescan.prime(session.id)
     const durable = loadCheckpoints(String(session.id))
     const calls = new Map<string, { name: string; argsRaw: string }>()
     for (const event of session.events) {
@@ -417,6 +490,10 @@ export class RollbackService {
 
     // 4) Drop the now-undone checkpoints and reset the in-flight state.
     fold.dropFrom(fromTurn)
+    // The re-scan registry describes the PRE-rollback state of files this rollback
+    // just rewrote, so it starts learning again; comparing against the old picture
+    // would invent a change for every file the rollback touched.
+    if (typeof session.id === 'string' && session.id !== '') this.rescan.forget(session.id)
 
     return {
       fromTurn,
