@@ -91,7 +91,7 @@ describe('boundary re-scan to rollback', () => {
     // Rolling back to before turn 2 must bring the file back with its content.
     const plan = planRollback(fold.snapshots(), 2, fold.surfaceTail())
     expect(plan.restored).toEqual([
-      { path: file, action: 'restore', content: 'authored content', kind: 'updated' },
+      { path: file, action: 'recover', content: 'authored content', kind: 'removed' },
     ])
     expect(plan.skipped).toEqual([])
 
@@ -149,7 +149,7 @@ describe('boundary re-scan to rollback', () => {
     expect(recorded).toEqual([{ turn: 4, path: file }])
     const plan = planRollback(fold.snapshots(), 4, fold.surfaceTail())
     expect(plan.restored).toEqual([
-      { path: file, action: 'restore', content: 'written before the restart', kind: 'updated' },
+      { path: file, action: 'recover', content: 'written before the restart', kind: 'removed' },
     ])
   })
 
@@ -182,7 +182,7 @@ describe('boundary re-scan to rollback', () => {
     // Rolling back to before turn 2 restores it: the deletion is turn 2's doing.
     const plan = planRollback(fold.snapshots(), 2, fold.surfaceTail())
     expect(plan.restored).toEqual([
-      { path: file, action: 'restore', content: 'important', kind: 'updated' },
+      { path: file, action: 'recover', content: 'important', kind: 'removed' },
     ])
 
     // And rolling back past the creation still deletes what turn 1 created.

@@ -35,7 +35,7 @@ export interface CheckpointRecord {
   sessionId: string
   turn: number
   path: string
-  operation: 'create' | 'update'
+  operation: 'create' | 'update' | 'remove'
   /** File content BEFORE this turn's first touch; null only for a created file. */
   before: string | null
   /**
@@ -50,7 +50,7 @@ export interface CheckpointRecord {
   after?: string
 }
 
-export type CheckpointMap = Map<number, Map<string, { operation: 'create' | 'update'; before: string | null }>>
+export type CheckpointMap = Map<number, Map<string, { operation: 'create' | 'update' | 'remove'; before: string | null }>>
 
 /** Sidecar layout version, encoded in the storage directory name. */
 const FORMAT_VERSION = 2
@@ -84,7 +84,7 @@ function validRecord(value: unknown, sessionId: string): value is CheckpointReco
   return r.sessionId === sessionId
     && Number.isSafeInteger(r.turn)
     && typeof r.path === 'string'
-    && (r.operation === 'create' || r.operation === 'update')
+    && (r.operation === 'create' || r.operation === 'update' || r.operation === 'remove')
     && (r.before === null || typeof r.before === 'string')
     && (r.after === undefined || typeof r.after === 'string')
 }

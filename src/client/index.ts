@@ -65,12 +65,12 @@ const zh = {
   'dialog.aria': '回退确认',
   'dialog.warning': '此操作不可撤销，将恢复本轮及之后受影响的工作区文件并截断模型上下文。',
   'dialog.analyzing': '正在分析受影响文件…',
-  'dialog.noFiles': '本轮及之后无文件变更。',
   'dialog.openInEditor': '在编辑器中打开',
   'dialog.cancel': '取消',
   'dialog.confirm': '确认回退',
   'dialog.busy': '回退中…',
   'tag.restore': '恢复',
+  'tag.recover': '找回',
   'tag.delete': '删除',
   'tag.skip': '跳过',
   'hero.title': '已回退到对话发起前',
@@ -83,12 +83,12 @@ const en: Record<keyof typeof zh, string> = {
   'dialog.aria': 'Rollback confirmation',
   'dialog.warning': 'This action is irreversible. It will restore workspace files affected by this turn and later, and truncate the model context.',
   'dialog.analyzing': 'Analyzing affected files…',
-  'dialog.noFiles': 'No file changes in this turn and later.',
   'dialog.openInEditor': 'Open in editor',
   'dialog.cancel': 'Cancel',
   'dialog.confirm': 'Roll back',
   'dialog.busy': 'Rolling back…',
   'tag.restore': 'restore',
+  'tag.recover': 'recover',
   'tag.delete': 'delete',
   'tag.skip': 'skip',
   'hero.title': 'Rolled back to the start',
@@ -100,7 +100,7 @@ type RollbackKey = keyof typeof zh
 /** One affected file in the preview dialog, normalized to an internal action. */
 interface PreviewFile {
   path: string
-  action: 'restore' | 'delete' | 'skip'
+  action: 'restore' | 'recover' | 'delete' | 'skip'
 }
 
 /** Parse the host `/rollback preview <n>` tagged-line text into entries. */
@@ -108,12 +108,13 @@ function parsePreview(text: string | undefined): PreviewFile[] {
   if (text === undefined || text === null) return []
   const out: PreviewFile[] = []
   for (const line of text.split('\n')) {
-    const m = /^\s*\[(恢复|删除|跳过|restore|delete|skip)\]\s+(.+)$/ui.exec(line)
+    const m = /^\s*\[(恢复|找回|删除|跳过|restore|recover|delete|skip)\]\s+(.+)$/ui.exec(line)
     if (m === null) continue
     const raw = m[1]!.toLowerCase()
     const action = raw === 'restore' || raw === '恢复' ? 'restore' as const
-      : raw === 'delete' || raw === '删除' ? 'delete' as const
-      : 'skip' as const
+      : raw === 'recover' || raw === '找回' ? 'recover' as const
+        : raw === 'delete' || raw === '删除' ? 'delete' as const
+          : 'skip' as const
     out.push({ action, path: m[2]!.trim() })
   }
   return out
@@ -218,6 +219,7 @@ const CSS =
   '.rbk-row:hover{background:color-mix(in srgb,var(--dsw-alias-label-primary) 10%,transparent);}' +
   '.rbk-tag{flex:none;font-size:11px;padding:1px 6px;border-radius:5px;}' +
   '.rbk-tag-restore{background:color-mix(in srgb,var(--dsw-alias-state-success-primary, #3fb27f) 22%,transparent);color:var(--dsw-alias-state-success-primary, #3fb27f);}' +
+  '.rbk-tag-recover{background:color-mix(in srgb,var(--dsw-static-blue-500, #3b82f6) 22%,transparent);color:var(--dsw-static-blue-500, #3b82f6);}' +
   '.rbk-tag-delete{background:color-mix(in srgb,var(--dsw-alias-state-error-primary, #e5484d) 22%,transparent);color:var(--dsw-alias-state-error-primary, #e5484d);}' +
   '.rbk-tag-skip{background:color-mix(in srgb,var(--dsw-alias-label-secondary) 18%,transparent);color:var(--dsw-alias-label-secondary);}' +
   '.rbk-path{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}' +
@@ -716,9 +718,10 @@ function RollbackDriver({ preview, execute, openFile, useSession, inputActions, 
           files === null && error === null
             ? React.createElement('div', { className: 'rbk-empty' }, t('dialog.analyzing'))
             : null,
-          files !== null && files.length === 0
-            ? React.createElement('div', { className: 'rbk-empty' }, t('dialog.noFiles'))
-            : null,
+          // No "no file changes" placeholder: the plugin cannot see everything (a
+          // file a shell command wrote outside the tools' reach is invisible to it),
+          // so an empty list must not read as a promise that the workspace is
+          // untouched. The dialogue says only what it knows.
           files !== null && files.length > 0
             ? files.map(f => React.createElement('button', {
                 key: f.path, type: 'button', className: 'rbk-row', title: t('dialog.openInEditor'),

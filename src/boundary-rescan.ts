@@ -223,7 +223,10 @@ export class BoundaryRescan {
         return
       }
       case 'missing': {
-        this.deps.record(sessionId, turn, { path, operation: 'update', before: action.before, after: '' })
+        // Recorded as a removal, not an update: the rollback has to bring the file
+        // BACK, which the user should see as its own category rather than as a
+        // rewrite of a file that is still there.
+        this.deps.record(sessionId, turn, { path, operation: 'remove', before: action.before, after: '' })
         registry.set(path, { ...state, lastKnown: action.before, size: null, mtimeMs: null, missing: true })
         return
       }

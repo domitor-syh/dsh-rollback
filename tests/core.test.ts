@@ -27,7 +27,7 @@ describe('sliding window', () => {
 })
 
 describe('capture.recordChange', () => {
-  const mk = (path: string, operation: 'create' | 'update', before: string | null, after: string): FsMutation =>
+  const mk = (path: string, operation: 'create' | 'update' | 'remove', before: string | null, after: string): FsMutation =>
     ({ path, operation, before, after })
 
   it('first touch records before/kind/basis', () => {
@@ -54,6 +54,21 @@ describe('capture.recordChange', () => {
   it('an update with no contextual basis is not restorable', () => {
     const cp = recordChange(emptyCheckpoint(1), mk('/bin.dat', 'update', null, 'x'))
     expect(cp.changes['/bin.dat']).toMatchObject({ kind: 'updated', basisKnown: false })
+  })
+
+  it('a removal is its own kind, with the last known content as the basis', () => {
+    // Only the boundary re-scan can produce this: a file the plugin was watching was
+    // found gone. It must stay distinguishable from a rewrite, because the rollback
+    // brings the file BACK rather than putting old content into a file that exists.
+    const cp = recordChange(emptyCheckpoint(1), mk('/gone.txt', 'remove', 'last known', ''))
+    expect(cp.changes['/gone.txt']).toEqual({
+      path: '/gone.txt', kind: 'removed', before: 'last known', after: '', basisKnown: true,
+    })
+  })
+
+  it('a removal with no known content is not restorable', () => {
+    const cp = recordChange(emptyCheckpoint(1), mk('/gone.txt', 'remove', null, ''))
+    expect(cp.changes['/gone.txt']).toMatchObject({ kind: 'removed', basisKnown: false })
   })
 })
 
@@ -212,6 +227,26 @@ describe('planRollback', () => {
     const a1 = cp(2, 3, { '/new': { path: '/new', operation: 'create', before: null, after: 'x' } })
     const plan = planRollback([a1], 2, 5)
     expect(plan.restored).toEqual([{ path: '/new', action: 'delete', content: null, kind: 'created' }])
+  })
+
+  it('recovers a file that was deleted, distinctly from restoring one that was rewritten', () => {
+    // Same bytes written, different story: 恢复 puts old content into a file that is
+    // still there, 找回 brings a file back. Only the recorded kind can tell them
+    // apart, so the plan has to carry it through.
+    const gone = cp(3, 5, { '/gone': { path: '/gone', operation: 'remove', before: 'was here', after: '' } })
+    const edited = cp(3, 5, { '/edited': { path: '/edited', operation: 'update', before: 'old', after: 'new' } })
+    const plan = planRollback([gone, edited], 3, 6)
+    expect(plan.restored).toEqual([
+      { path: '/gone', action: 'recover', content: 'was here', kind: 'removed' },
+      { path: '/edited', action: 'restore', content: 'old', kind: 'updated' },
+    ])
+  })
+
+  it('skips a removal whose content was never known', () => {
+    const gone = cp(3, 5, { '/gone': { path: '/gone', operation: 'remove', before: null, after: '' } })
+    const plan = planRollback([gone], 3, 6)
+    expect(plan.restored).toEqual([])
+    expect(plan.skipped).toEqual([{ path: '/gone', reason: 'basis-unknown' }])
   })
 
   it('rolls back to an earlier turn without touching earlier work', () => {

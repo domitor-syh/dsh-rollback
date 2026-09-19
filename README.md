@@ -81,9 +81,10 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
   - 标记在 `/rollback` 执行时**当场**写入日志，被回退区间随即从模型历史中消失。
   - 标记内容是一段自动生成的检查点说明，并指示模型不要提及它；再次回退到同一点时，新标记的替换范围覆盖旧标记，只保留一条。
 - **界面隐藏**：客户端按标记的替换起点，把被回退区间内的聊天座位隐藏（`display:none`）；隐藏由日志里的持久标记驱动，刷新/重启后保持。
+- **回退标签分四类**：`恢复`（文件还在，写回旧内容 · 绿）、`找回`（文件已被删除，重新放回 · 蓝）、`删除`（撤销该区间新建的文件 · 红）、`跳过`（无法恢复）。前三者的区别由记录里的 kind 决定（`updated` / `removed` / `created`），所以"写回内容"和"把文件找回来"在数据上就是两件事。空列表**不再**显示"无文件变更"——插件看不见 shell 直接写出的文件，这种话它保证不了。
 - **欢迎页**：把整段对话回退掉之后，由 driver 往对话区注入宿主元素，再用 React portal 把欢迎页渲染进去。
 - **客户端传输**：复用已出厂 `ctx.remote.commands.execute` 调 `/rollback …`。
-- **回归测试**：`tests/truncation-plan.test.ts`（10）+ `tests/core.test.ts`（28）+ `tests/root-write.test.ts`（14）+ `tests/root-write-fallback.test.ts`（15）+ `tests/literal-edit.test.ts`（12）+ `tests/dir-cleanup.test.ts`（12）+ `tests/empty-dirs.test.ts`（5）+ `tests/boundary-scan.test.ts`（10）+ `tests/boundary-rescan.test.ts`（10）+ `tests/boundary-pipeline.test.ts`（4）。
+- **回归测试**：`tests/core.test.ts`（32）+ `tests/truncation-plan.test.ts`（10）+ `tests/root-write.test.ts`（14）+ `tests/root-write-fallback.test.ts`（15）+ `tests/literal-edit.test.ts`（12）+ `tests/dir-cleanup.test.ts`（15）+ `tests/empty-dirs.test.ts`（5）+ `tests/boundary-scan.test.ts`（10）+ `tests/boundary-rescan.test.ts`（13）+ `tests/boundary-pipeline.test.ts`（5）。
 
 ## 已知限制（Known Limitations）
 

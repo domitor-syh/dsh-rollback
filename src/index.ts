@@ -36,13 +36,18 @@ const FILE_TOOL_HINT =
 function planText(plan: RollbackPlan, header: string): string {
   const lines: string[] = [header]
   for (const file of plan.restored) {
-    const tag = file.action === 'delete' ? '[删除]' : '[恢复]'
+    // 恢复 = the file is still there and its old content goes back; 找回 = the file
+    // was deleted and is brought back; 删除 = a file this span created goes away.
+    const tag = file.action === 'delete' ? '[删除]' : file.action === 'recover' ? '[找回]' : '[恢复]'
     lines.push(`  ${tag} ${file.path}`)
   }
   for (const file of plan.skipped) {
     lines.push(`  [跳过] ${file.path}（${file.reason}）`)
   }
-  if (plan.restored.length === 0 && plan.skipped.length === 0) lines.push('  （无文件变更）')
+  // No "no file changes" line: the plugin cannot see everything (a file written by
+  // a shell command it never watched is invisible), so claiming this span changed
+  // no files would be a claim it cannot back up — and it would read as a promise
+  // that the workspace is untouched.
   lines.push(`  对话截断：${plan.truncation === null ? '否' : '将截断'}`)
   return lines.join('\n')
 }
@@ -104,7 +109,7 @@ export function apply(ctx: Context): void {
               type: 'object', additionalProperties: false,
               properties: {
                 path: { type: 'string', required: true },
-                action: { type: 'string', required: true, enum: ['restore', 'delete'] },
+                action: { type: 'string', required: true, enum: ['restore', 'recover', 'delete'] },
               },
             },
           },

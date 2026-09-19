@@ -58,9 +58,11 @@ function mutationOf(exec: MutationActor, value: unknown): FsMutation | null {
 /** Human/machine one-line summary of a rollback plan. */
 export function summarize(plan: RollbackPlan, options: { removedDirs?: readonly string[] } = {}): string {
   const restored = plan.restored.filter(f => f.action === 'restore').length
+  const recovered = plan.restored.filter(f => f.action === 'recover').length
   const deleted = plan.restored.filter(f => f.action === 'delete').length
   const parts: string[] = []
   if (restored > 0) parts.push(`${restored} 个文件恢复`)
+  if (recovered > 0) parts.push(`${recovered} 个文件找回`)
   if (deleted > 0) parts.push(`${deleted} 个新建文件删除`)
   const removedDirs = options.removedDirs ?? []
   if (removedDirs.length > 0) parts.push(`${removedDirs.length} 个空目录删除`)

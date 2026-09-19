@@ -5,7 +5,7 @@
  * @module @domitor-syh/dsh-rollback/core/capture
  */
 
-import type { FileChange, FsMutation, TurnCheckpoint } from './model.ts'
+import type { ChangeKind, FileChange, FsMutation, TurnCheckpoint } from './model.ts'
 
 /**
  * Apply a surface position to a checkpoint. Recorded once per turn: the first
@@ -31,9 +31,12 @@ export function surfacePos(cp: TurnCheckpoint, surfaceSeq: number | null): TurnC
 export function recordChange(cp: TurnCheckpoint, mutation: FsMutation): TurnCheckpoint {
   const existing = cp.changes[mutation.path]
   if (existing === undefined) {
+    const kind: ChangeKind = mutation.operation === 'create'
+      ? 'created'
+      : mutation.operation === 'remove' ? 'removed' : 'updated'
     const change: FileChange = {
       path: mutation.path,
-      kind: mutation.operation === 'create' ? 'created' : 'updated',
+      kind,
       before: mutation.before,
       after: mutation.after,
       basisKnown: mutation.before !== null || mutation.operation === 'create',

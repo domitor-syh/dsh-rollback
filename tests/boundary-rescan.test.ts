@@ -41,7 +41,7 @@ describe('BoundaryRescan', () => {
     await unlink(file)
 
     await scanner.scan('s1', 5)
-    expect(records).toEqual([{ turn: 5, mutation: { path: file, operation: 'update', before: 'content', after: '' } }])
+    expect(records).toEqual([{ turn: 5, mutation: { path: file, operation: 'remove', before: 'content', after: '' } }])
   })
 
   it('records a disappearance once, not at every following boundary', async () => {
@@ -90,7 +90,7 @@ describe('BoundaryRescan', () => {
     await unlink(file)
 
     await scanner.scan('s1', 9)
-    expect(records).toEqual([{ turn: 9, mutation: { path: file, operation: 'update', before: 'durable content', after: '' } }])
+    expect(records).toEqual([{ turn: 9, mutation: { path: file, operation: 'remove', before: 'durable content', after: '' } }])
   })
 
   it('learns the content of a path it has never read, then notices a later change', async () => {

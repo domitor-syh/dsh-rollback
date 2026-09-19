@@ -7,7 +7,7 @@
  */
 
 /** How a file entered the current turn's working set. */
-export type ChangeKind = 'created' | 'updated'
+export type ChangeKind = 'created' | 'updated' | 'removed'
 
 /**
  * One file's net effect within a single turn.
@@ -20,7 +20,13 @@ export type ChangeKind = 'created' | 'updated'
 export interface FileChange {
   /** Filesystem-seam display path. */
   readonly path: string
-  /** created = absent at turn start; updated = present and modified. */
+  /**
+   * created = absent at turn start; updated = present and modified; removed =
+   * the file the plugin was watching was GONE when it looked. The third case
+   * cannot come from a file tool (none of them deletes), only from the boundary
+   * re-scan noticing a shell command's work — and it is what separates
+   * "put the old content back" from "bring the file back at all".
+   */
   readonly kind: ChangeKind
   /** Content before the turn. `null` only for a `created` file. */
   readonly before: string | null
@@ -54,12 +60,17 @@ export function emptyCheckpoint(turn: number): TurnCheckpoint {
   return { turn, startSeq: null, endSeq: null, changes: {} }
 }
 
-/** One fs write/edit outcome feeding {@link recordChange}. */
+/** One fs write/edit outcome — or one boundary re-scan finding — feeding {@link recordChange}. */
 export interface FsMutation {
   /** Filesystem-seam display path. */
   readonly path: string
-  /** The write tool's operation (`create` vs `update`); edits are `update`. */
-  readonly operation: 'create' | 'update'
+  /**
+   * `create`/`update` are the write tool's own operations (edits are `update`).
+   * `remove` is not a tool operation at all: the boundary re-scan records it when
+   * a file the plugin was watching is found GONE, which is the only way a
+   * disappearance is ever observed.
+   */
+  readonly operation: 'create' | 'update' | 'remove'
   /** Pre-mutation content, or null when the file did not exist / no basis. */
   readonly before: string | null
   /** Post-mutation content. */

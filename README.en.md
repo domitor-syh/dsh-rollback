@@ -81,9 +81,10 @@ Key implementation points:
   - The marker enters the log the moment `/rollback` runs, so the rolled-back range leaves the model's history immediately.
   - Its content is an automatically generated checkpoint notice that tells the model not to acknowledge it; rolling back to the same point again lets the newer marker's range cover the older one, leaving a single marker.
 - **UI hiding**: the client hides the chat seats inside the rolled-back range (`display: none`), driven by the durable marker in the log, so the hiding survives a refresh or restart.
+- **Four rollback tags**: `restore` (the file is still there; old content goes back · green), `recover` (the file was deleted; it is brought back · blue), `delete` (undo a file this span created · red), and `skip` (cannot be restored). The first three are distinguished by the recorded kind (`updated` / `removed` / `created`), so writing content back and bringing a file back are two different things in the data itself. An empty list no longer claims there were no file changes: the plugin cannot see files a shell command wrote directly, so it does not make that promise.
 - **Welcome hero**: once a rollback has emptied the whole conversation, the driver injects a host element into the transcript and portals the hero into it.
 - **Client transport**: reuses the shipped `ctx.remote.commands.execute` to call `/rollback …`.
-- **Regression tests**: `tests/truncation-plan.test.ts` (10), `tests/core.test.ts` (28), `tests/root-write.test.ts` (14), `tests/root-write-fallback.test.ts` (15), `tests/literal-edit.test.ts` (12), `tests/dir-cleanup.test.ts` (12), `tests/empty-dirs.test.ts` (5), `tests/boundary-scan.test.ts` (10), `tests/boundary-rescan.test.ts` (10), and `tests/boundary-pipeline.test.ts` (4).
+- **Regression tests**: `tests/core.test.ts` (32), `tests/truncation-plan.test.ts` (10), `tests/root-write.test.ts` (14), `tests/root-write-fallback.test.ts` (15), `tests/literal-edit.test.ts` (12), `tests/dir-cleanup.test.ts` (15), `tests/empty-dirs.test.ts` (5), `tests/boundary-scan.test.ts` (10), `tests/boundary-rescan.test.ts` (13), and `tests/boundary-pipeline.test.ts` (5).
 
 ## Known limitations
 

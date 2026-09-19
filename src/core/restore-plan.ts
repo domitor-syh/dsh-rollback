@@ -8,16 +8,21 @@
  * @module @domitor-syh/dsh-rollback/core/restore-plan
  */
 
-import type { FileChange, TurnCheckpoint } from './model.ts'
+import type { ChangeKind, FileChange, TurnCheckpoint } from './model.ts'
 
 /** One file the rollback must act on. */
 export interface RestoredFile {
   readonly path: string
-  /** `restore` rewrites the pre-turn content; `delete` removes a new file. */
-  readonly action: 'restore' | 'delete'
-  /** Pre-turn content when `action === 'restore'`, else null. */
+  /**
+   * `restore` rewrites the pre-turn content of a file that still exists;
+   * `recover` writes that content back to a file that was DELETED (a shell
+   * command's work, caught by the boundary re-scan); `delete` removes a file the
+   * rolled-back span created.
+   */
+  readonly action: 'restore' | 'recover' | 'delete'
+  /** Pre-turn content when the action writes one, else null. */
   readonly content: string | null
-  readonly kind: 'created' | 'updated'
+  readonly kind: ChangeKind
 }
 
 /** A file the rollback cannot act on. */
@@ -84,7 +89,15 @@ export function planRollback(
     if (change.kind === 'created') {
       restored.push({ path: change.path, action: 'delete', content: null, kind: 'created' })
     } else if (change.basisKnown && change.before !== null) {
-      restored.push({ path: change.path, action: 'restore', content: change.before, kind: 'updated' })
+      restored.push({
+        path: change.path,
+        // A file that vanished is brought back; one that was rewritten has its old
+        // content put back. Both write the same bytes, but they are different
+        // stories to the user, and only the record knows which one happened.
+        action: change.kind === 'removed' ? 'recover' : 'restore',
+        content: change.before,
+        kind: change.kind,
+      })
     } else {
       skipped.push({ path: change.path, reason: 'basis-unknown' })
     }
