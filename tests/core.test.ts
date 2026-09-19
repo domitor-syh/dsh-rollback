@@ -141,6 +141,46 @@ describe('SessionFold', () => {
     expect(f.surfaceTail()).toBe(100)
   })
 
+  describe('dropFromExcept', () => {
+    /** A fold holding one change per turn: `/a` in turn 2, `/b` in turn 3. */
+    function seeded(): SessionFold {
+      const f = new SessionFold(10)
+      f.fold({ kind: 'turn-start', turn: 2, seq: 1 })
+      f.fold({ kind: 'surface', seq: 1 })
+      f.fold({ kind: 'fs-mutation', mutation: { path: '/a', operation: 'update', before: 'a0', after: 'a1' } })
+      f.fold({ kind: 'turn-end', turn: 2, seq: 1 })
+      f.fold({ kind: 'turn-start', turn: 3, seq: 2 })
+      f.fold({ kind: 'surface', seq: 2 })
+      f.fold({ kind: 'fs-mutation', mutation: { path: '/b', operation: 'create', before: null, after: 'b' } })
+      f.fold({ kind: 'turn-end', turn: 3, seq: 2 })
+      return f
+    }
+
+    it('keeps only the skipped paths from the undone turns', () => {
+      // A rollback that skipped `/a` (say the file was locked) must leave its record
+      // behind, or that file leaves rollback coverage for good — while `/b`, which the
+      // rollback DID undo, must not be re-applied by a later rollback.
+      const f = seeded()
+      f.dropFromExcept(2, new Set(['/a']))
+      expect(f.snapshots().map(c => c.turn)).toEqual([2])
+      expect(Object.keys(f.snapshots()[0]!.changes)).toEqual(['/a'])
+    })
+
+    it('behaves exactly like dropFrom when nothing was skipped', () => {
+      const f = seeded()
+      f.dropFromExcept(2, new Set())
+      expect(f.snapshots()).toEqual([])
+    })
+
+    it('leaves earlier turns untouched', () => {
+      const f = seeded()
+      f.dropFromExcept(3, new Set(['/b']))
+      expect(f.snapshots().map(c => c.turn)).toEqual([2, 3])
+      expect(Object.keys(f.snapshots()[0]!.changes)).toEqual(['/a'])
+      expect(Object.keys(f.snapshots()[1]!.changes)).toEqual(['/b'])
+    })
+  })
+
   describe('mutationInto', () => {
     const change = (path: string, before: string, after: string): FsMutation =>
       ({ path, operation: 'update', before, after })

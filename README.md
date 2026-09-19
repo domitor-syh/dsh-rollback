@@ -87,10 +87,12 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 - **运行中一律禁止回退**：只要有一轮处于打开状态就整体拒绝（`src/core/rollback-guard.ts`），无论目标是哪一轮。agent loop 持有表层位置并持续追加，在它下面截断会把"这一轮正在写的历史"遮蔽掉、而它更晚的输出还在；命令也不会打断运行，所以**拒绝本身**才是让两者不交错的原因。运行中的轮次**本来就没有按钮**（页脚节点要等该轮 `turn/end` 才存在，动作条要等助手消息收尾），所以这里只有一条规则、没有第二套禁用机制。
 - **欢迎页**：把整段对话回退掉之后，由 driver 往对话区注入宿主元素，再用 React portal 把欢迎页渲染进去。
 - **客户端传输**：复用已出厂 `ctx.remote.commands.execute` 调 `/rollback …`。
-- **回归测试**：`tests/core.test.ts`（32）+ `tests/truncation-plan.test.ts`（10）+ `tests/root-write.test.ts`（14）+ `tests/root-write-fallback.test.ts`（15）+ `tests/literal-edit.test.ts`（12）+ `tests/dir-cleanup.test.ts`（15）+ `tests/empty-dirs.test.ts`（5）+ `tests/boundary-scan.test.ts`（10）+ `tests/boundary-rescan.test.ts`（13）+ `tests/boundary-pipeline.test.ts`（5）+ `tests/rollback-guard.test.ts`（2）+ `tests/turn-entry.test.ts`（3）。
+- **回归测试**：`tests/core.test.ts`（35）+ `tests/truncation-plan.test.ts`（10）+ `tests/root-write.test.ts`（14）+ `tests/root-write-fallback.test.ts`（15）+ `tests/literal-edit.test.ts`（12）+ `tests/dir-cleanup.test.ts`（15）+ `tests/empty-dirs.test.ts`（5）+ `tests/boundary-scan.test.ts`（10）+ `tests/boundary-rescan.test.ts`（13）+ `tests/boundary-pipeline.test.ts`（5）+ `tests/rollback-guard.test.ts`（10）+ `tests/turn-entry.test.ts`（3）。
 
 ## 已知限制（Known Limitations）
 
+- **无法恢复的文件会被跳过，而不是中止整次回退**：某个文件恢复不了（前置内容从未记录，或文件系统拒绝：被占用、无权限、沙箱不允许恢复工作区外的路径）时，插件**照做能做的**、**对话照样截断**，并在结果里列出跳过项。这是刻意的取舍——之前"任何文件失败就整次中止"会导致：文件已部分恢复、对话没截断、而卡住的原因往往不会自己消失 → 反复失败 → 用户被彻底卡住。跳过项在**确认前**的预览里就标着「跳过」，所以是知情选择；而且**被跳过路径的记录会保留**，下次回退会再试一次（文件锁释放后就能恢复）✓
+- **超出保留范围的回退目标会被拒绝**：检查点是 10 轮滑动窗口，更早的状态无法重建。GUI 里超出范围的按钮**置灰**（不额外加提示——置灰本身就是说明），命令返回报错并给出可回退范围——此前它会**静默按最旧的保留记录恢复**（错的状态、无提示）✗
 - **聊天轨迹仍保留已回退的消息**：DSH 的聊天轨迹按 append-origin 事件渲染，而日志本身 append-only、无法改写；表层 `replace` 只作用于**模型上下文**。插件在界面层把被回退区间隐藏（由日志里的持久标记驱动，刷新/重启后保持）。
 - **模型会读到一行检查点文字**：轮次之间写不出"模型不可见"的标记（那需要一个已开启的 step），所以模型会读到那段检查点说明，约 60 token；说明里已明确要求模型把已有内容当作既定背景、继续后面的对话，并**不要在意、不要提及这个检查点**。
 - **检查点为进程内存态 + 20 轮 sidecar**：折叠状态随会话对象存于内存（`WeakMap`）；重启后由 sidecar（`storages/dsh-rollback/checkpoints-v2/`）重建，保留最近 20 轮（`KEEP_TURNS`），更早的记录在加载时被剪枝。

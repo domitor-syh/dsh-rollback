@@ -20,6 +20,7 @@ import * as React from 'react'
 import { createPortal } from 'react-dom'
 import { FishLogo, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import { footerEntryNeeded } from '../core/turn-entry.ts'
+import { oldestTurnOf } from '../core/rollback-guard.ts'
 
 /** Required services: slots, the `commands` Remote, the conversation node registry, and locale. */
 export const inject = ['slots', 'remote', 'remote.commands', 'conversationEvents', 'locale', 'workspaces']
@@ -28,7 +29,7 @@ export const inject = ['slots', 'remote', 'remote.commands', 'conversationEvents
 const DEBUG = false
 /** Bundle revision — always reported once at apply, so a stale cached bundle is
  * identifiable in the console instead of looking like "the fix did nothing". */
-const BUNDLE_REV = 13
+const BUNDLE_REV = 15
 function log(...parts: unknown[]): void {
   if (DEBUG) console.info('[rollback]', ...parts)
 }
@@ -590,16 +591,18 @@ function RollbackAction({ messageId, useSession, t }: any): React.ReactElement |
     return null
   }
   const snapshot = useSession((s: any) => s)
+  const oldest = useRollbackOldest()
   const open = snapshot?.running === true
   const turn = React.useMemo(() => turnForMessageId(snapshot, messageId), [snapshot, messageId])
-  const disabled = open || turn === undefined
+  const blocked = turn !== undefined && oldest !== null && turn < oldest
+  const disabled = open || turn === undefined || blocked
   const label = open ? t('action.running') : t('action.label')
   const button = React.createElement('button', {
     type: 'button',
     className: 'rbk-act',
     'aria-label': label,
     disabled,
-    onClick: () => { if (turn !== undefined && openRollbackDialog !== null) openRollbackDialog(turn) },
+    onClick: () => { if (!disabled && turn !== undefined && openRollbackDialog !== null) openRollbackDialog(turn) },
   }, React.createElement(ReplyIcon))
   return React.createElement(Tooltip, { label, side: 'bottom' }, button)
 }
@@ -632,6 +635,40 @@ function selectFooterAction(owner: any): { turn: number } | null {
 }
 
 /**
+ * The oldest turn the host can still roll back to, published by the driver.
+ *
+ * `null` means "not known yet" and blocks nothing: guessing a range (say, "the newest
+ * turn minus ten") would grey out turns that are perfectly rollback-able, a silent
+ * loss of function — the failure mode this plugin keeps having to design against.
+ * `Infinity` means the host reported no rollback-able turn at all.
+ */
+let rollbackOldest: number | null = null
+const rollbackRangeListeners = new Set<() => void>()
+
+/** Publish the rollback range to the action components. */
+function publishRollbackOldest(oldest: number | null): void {
+  rollbackOldest = oldest
+  for (const listener of [...rollbackRangeListeners]) {
+    try {
+      listener()
+    } catch (e) {
+      warnOnce('range-listener', 'a rollback-range listener threw', e)
+    }
+  }
+}
+
+/** Read the published rollback range, re-rendering whenever the driver publishes. */
+function useRollbackOldest(): number | null {
+  const [, bump] = React.useState(0)
+  React.useEffect(() => {
+    const listener = (): void => { bump(n => n + 1) }
+    rollbackRangeListeners.add(listener)
+    return () => { rollbackRangeListeners.delete(listener) }
+  }, [])
+  return rollbackOldest
+}
+
+/**
  * The same rollback action, rendered in the turn FOOTER for turns the assistant
  * action strip cannot serve.
  *
@@ -647,16 +684,22 @@ function RollbackTurnAction({ turn: location, matched, useSession, t }: any): Re
     return null
   }
   const turnNo = matched?.turn ?? turnNoOf(location)
+  const oldest = useRollbackOldest()
   if (turnNo === undefined) {
     warnOnce('footer-action-turn', 'turn footer action could not resolve its turn', location)
     return null
   }
-  log('turn-footer action rendered', { turn: turnNo })
+  const blocked = oldest !== null && turnNo < oldest
+  log('turn-footer action rendered', { turn: turnNo, blocked })
+  // Disabled says it: the greyed style is the whole message. A tooltip here would not
+  // render anyway (a disabled button takes no hover) and a second wording to keep in
+  // sync is exactly the kind of redundant surface this codebase keeps pruning.
   const button = React.createElement('button', {
     type: 'button',
     className: 'rbk-act',
     'aria-label': t('action.label'),
-    onClick: () => { if (openRollbackDialog !== null) openRollbackDialog(turnNo) },
+    disabled: blocked,
+    onClick: () => { if (!blocked && openRollbackDialog !== null) openRollbackDialog(turnNo) },
   }, React.createElement(ReplyIcon))
   return React.createElement(Tooltip, { label: t('action.label'), side: 'bottom' }, button)
 }
@@ -664,6 +707,8 @@ function RollbackTurnAction({ turn: location, matched, useSession, t }: any): Re
 interface DriverProps {
   preview: (turn: number) => Promise<PreviewFile[]>
   execute: (turn: number) => Promise<void>
+  /** Raw `/rollback list` output, for the range the action entries may offer. */
+  list: () => Promise<string>
   openFile: (path: string) => Promise<void>
   useSession: <T>(selector: (snapshot: any) => T) => T
   t: (key: RollbackKey) => string
@@ -677,7 +722,7 @@ interface DriverProps {
  * confirmation dialog, opened from the assistant action through the module
  * bridge. Renders nothing into its own dock seat.
  */
-function RollbackDriver({ preview, execute, openFile, useSession, inputActions, restoreImages, t }: DriverProps): React.ReactElement | null {
+function RollbackDriver({ preview, execute, list, openFile, useSession, inputActions, restoreImages, t }: DriverProps): React.ReactElement | null {
   if (typeof useSession !== 'function') {
     warnOnce('useSession', 'props lack useSession', Object.keys({ useSession }))
     return null
@@ -705,6 +750,14 @@ function RollbackDriver({ preview, execute, openFile, useSession, inputActions, 
   React.useEffect(() => {
     openRollbackDialog = openDialog
     snapshotRef.current = snapshot
+    // Learn which turns the host can still roll back to, so entries for turns whose
+    // checkpoints were evicted grey out instead of opening a dialog that would plan
+    // from the wrong (oldest retained) records. Published once per session; a
+    // rollback reloads the page, which re-runs this.
+    list().then(
+      text => { publishRollbackOldest(oldestTurnOf(text)) },
+      (e: unknown) => { warnOnce('rollback-list', 'could not read the rollback range', e) },
+    )
     let raf = 0
     const ensure = () => {
       try { syncHides(snapshotRef.current) } catch (e) { warnOnce('sync-hides', 'syncHides threw', e) }
@@ -802,7 +855,7 @@ function RollbackDriver({ preview, execute, openFile, useSession, inputActions, 
         ),
         React.createElement('div', { className: 'rbk-foot' },
           React.createElement('button', { type: 'button', className: 'rbk-cancel', disabled: busy, onClick: () => setDialogTurn(null) }, t('dialog.cancel')),
-          React.createElement('button', { type: 'button', className: 'rbk-confirm', disabled: busy, onClick: confirm }, busy ? t('dialog.busy') : t('dialog.confirm')),
+          React.createElement('button', { type: 'button', className: 'rbk-confirm', disabled: busy || files === null || error !== null, onClick: confirm }, busy ? t('dialog.busy') : t('dialog.confirm')),
         ),
       ),
     ),
@@ -949,6 +1002,7 @@ export function apply(ctx: any): void {
         execute: async (turn: number) => {
           await extCommand(ctx, sessionId, '/rollback ' + turn)
         },
+        list: async () => (await extCommand(ctx, sessionId, '/rollback list')).text ?? '',
         openFile: (path: string) => ctx.workspaces.openPath(path),
         restoreImages: async (images: { name: string; mediaType: string; attachment: any }[]): Promise<string[]> => {
           const conversation = ctx.get?.('conversation')

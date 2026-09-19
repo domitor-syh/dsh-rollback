@@ -18,7 +18,7 @@ import type { FsMutation } from './core/model.ts'
 import { fsMutationFrom, SessionFold } from './core/session-fold.ts'
 import { planRollback, type RestoredFile, type RollbackPlan, type SkippedFile } from './core/restore-plan.ts'
 import { turnStartTimeMs } from './core/dir-cleanup.ts'
-import { rollbackRefusal } from './core/rollback-guard.ts'
+import { rollbackRefusal, windowRefusal } from './core/rollback-guard.ts'
 import { BoundaryRescan } from './boundary-rescan.ts'
 import { cleanupEmptyDirs } from './empty-dirs.ts'
 import {
@@ -69,7 +69,7 @@ export function summarize(plan: RollbackPlan, options: { removedDirs?: readonly 
   if (removedDirs.length > 0) parts.push(`${removedDirs.length} 个空目录删除`)
   if (plan.skipped.length > 0) {
     const detail = plan.skipped.map(s => `${s.path}（${s.reason}）`).join('；')
-    parts.push(`${plan.skipped.length} 个文件无法恢复：${detail}`)
+    parts.push(`${plan.skipped.length} 个文件无法恢复，已保持现状（记录保留，下次回退会再试）：${detail}`)
   }
   const filePart = parts.length > 0 ? parts.join('，') : '无文件变更'
   const truncatePart = plan.truncation === null ? '无对话可截断' : '已截断对话'
@@ -377,6 +377,11 @@ export class RollbackService {
     const fold = this.foldFor(session)
     const sessionId = typeof session.id === 'string' ? session.id : ''
     if (sessionId !== '') await this.rescan.settled(sessionId)
+    // The same range check `execute` makes: a preview that quietly reported the oldest
+    // retained records as if they were this target's state would be worse than no
+    // preview at all.
+    const outOfRange = windowRefusal(fromTurn, fold.snapshots().map(checkpoint => checkpoint.turn))
+    if (outOfRange !== null) throw new Error(outOfRange)
     const plan = planRollback(fold.snapshots(), fromTurn, fold.surfaceTail())
     // The fold's in-memory surface tail can lag behind the durable session
     // surface (e.g. restored/image turns). The authoritative truncation — and
@@ -400,6 +405,10 @@ export class RollbackService {
     // NO rollback while a turn is running, whatever the target: see rollbackRefusal.
     const refusal = rollbackRefusal(fold.inProgressTurn())
     if (refusal !== null) throw new Error(refusal)
+    // A target older than the retained window cannot be reconstructed: planning
+    // anyway would silently restore from the oldest retained records instead.
+    const outOfRange = windowRefusal(fromTurn, fold.snapshots().map(checkpoint => checkpoint.turn))
+    if (outOfRange !== null) throw new Error(outOfRange)
     // A scan triggered by the turn's own end may still be reading files; planning
     // without waiting would miss exactly the change this rollback is meant to undo.
     const settlingId = typeof session.id === 'string' ? session.id : ''
@@ -450,13 +459,15 @@ export class RollbackService {
       }
     }
 
-    // ATOMIC: files and conversation roll back together. If any file could not
-    // be restored, abort the WHOLE rollback — no truncation, no marker — so the
-    // user never ends up with a half-rolled-back state.
-    if (skipped.length > 0) {
-      const detail = skipped.map(s => `${s.path}（${s.reason}）`).join('；')
-      throw new Error(`回退失败，请重试：${detail}`)
-    }
+    // SKIP AND CONTINUE, not all-or-nothing. A file this rollback cannot put back —
+// its pre-turn content was never recorded, or the filesystem refused the write —
+// must not be able to strand the user: nothing would be truncated, the files that
+// DID succeed would already be changed, and the blocking cause (a file lock, a
+// permission, a sandbox fence) is often permanent, so every retry would fail the
+// same way. The rollback therefore does what it can, truncates the conversation as
+// asked, and reports exactly what it left alone. The preview already listed the
+// unrestorable paths as 跳过 before the user confirmed, so this is a known cost
+// rather than a surprise.
 
     // 2) Remove the directories this rollback emptied.
     //
@@ -523,8 +534,10 @@ export class RollbackService {
       }
     }
 
-    // 4) Drop the now-undone checkpoints and reset the in-flight state.
-    fold.dropFrom(fromTurn)
+    // 4) Drop the now-undone checkpoints and reset the in-flight state — except the
+    // entries for paths this rollback could not undo, which stay so a later rollback
+    // can try them again once the cause (a lock, a permission) is gone.
+    fold.dropFromExcept(fromTurn, new Set(skipped.map(entry => entry.path)))
     // The re-scan registry describes the PRE-rollback state of files this rollback
     // just rewrote, so it starts learning again; comparing against the old picture
     // would invent a change for every file the rollback touched.

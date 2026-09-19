@@ -9,7 +9,7 @@
  * @module @domitor-syh/dsh-rollback/core/session-fold
  */
 
-import { emptyCheckpoint, type FsMutation, type TurnCheckpoint } from './model.ts'
+import { emptyCheckpoint, type FileChange, type FsMutation, type TurnCheckpoint } from './model.ts'
 import { recordChange, surfacePos } from './capture.ts'
 import { SlidingWindow } from './sliding-window.ts'
 
@@ -135,9 +135,42 @@ export class SessionFold {
    * while keeping earlier checkpoints intact.
    */
   dropFrom(fromTurn: number): void {
-    const kept = this.checkpoints.snapshot().filter(cp => cp.turn < fromTurn)
+    this.replaceWindow(fromTurn, null)
+  }
+
+  /**
+   * Drop the undone checkpoints EXCEPT the entries for paths that could not be undone.
+   *
+   * A rollback that had to skip a file — its pre-turn content was never recorded, or
+   * the filesystem refused the write — still truncates the conversation and reports
+   * the skip. If the records describing that file were dropped with everything else,
+   * the file would leave rollback coverage for good. Keeping just those entries lets a
+   * later rollback try again, which is the difference between "a file lock cost you
+   * one restore" and "a file lock cost you the file".
+   * @param fromTurn - the turn the rollback targeted.
+   * @param keepPaths - paths whose changes were NOT undone.
+   */
+  dropFromExcept(fromTurn: number, keepPaths: ReadonlySet<string>): void {
+    this.replaceWindow(fromTurn, keepPaths)
+  }
+
+  /** Rebuild the retained window, optionally keeping only the named paths' changes. */
+  private replaceWindow(fromTurn: number, keepPaths: ReadonlySet<string> | null): void {
+    const kept: TurnCheckpoint[] = []
+    for (const checkpoint of this.checkpoints.snapshot()) {
+      if (checkpoint.turn < fromTurn) {
+        kept.push(checkpoint)
+        continue
+      }
+      if (keepPaths === null) continue
+      const changes: Record<string, FileChange> = {}
+      for (const [path, change] of Object.entries(checkpoint.changes)) {
+        if (keepPaths.has(path)) changes[path] = change
+      }
+      if (Object.keys(changes).length > 0) kept.push({ ...checkpoint, changes })
+    }
     this.checkpoints.clear()
-    for (const cp of kept) this.checkpoints.push(cp)
+    for (const checkpoint of kept) this.checkpoints.push(checkpoint)
     this.current = null
   }
 
