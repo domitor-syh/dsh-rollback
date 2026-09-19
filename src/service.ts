@@ -18,6 +18,7 @@ import type { FsMutation } from './core/model.ts'
 import { fsMutationFrom, SessionFold } from './core/session-fold.ts'
 import { planRollback, type RestoredFile, type RollbackPlan, type SkippedFile } from './core/restore-plan.ts'
 import { turnStartTimeMs } from './core/dir-cleanup.ts'
+import { isReplacedSeq, replacedSurfaceRanges } from './core/log-replay.ts'
 import { rollbackRefusal, windowRefusal } from './core/rollback-guard.ts'
 import { BoundaryRescan } from './boundary-rescan.ts'
 import { cleanupEmptyDirs } from './empty-dirs.ts'
@@ -276,8 +277,15 @@ export class RollbackService {
     // still notices a shell command that removes one of those files.
     if (typeof session.id === 'string' && session.id !== '') this.rescan.prime(session.id)
     const durable = loadCheckpoints(String(session.id))
+    // The log is append-only: it still holds every turn a rollback replaced. Replaying
+    // those would put undone turns back into the window — offering turns the
+    // transcript no longer shows, naming files from them, and (worst) letting a
+    // "created file" recorded there delete a file the user has since recreated. The
+    // markers in the log say exactly which ranges are gone.
+    const replaced = replacedSurfaceRanges(session.events as never)
     const calls = new Map<string, { name: string; argsRaw: string }>()
     for (const event of session.events) {
+      if (isReplacedSeq(event.seq, replaced)) continue
       switch (event.type) {
         case 'tool/call': {
           calls.set(event.data.callId, { name: event.data.name, argsRaw: event.data.arguments })
