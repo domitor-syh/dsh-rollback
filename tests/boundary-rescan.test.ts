@@ -109,6 +109,26 @@ describe('BoundaryRescan', () => {
     expect(records).toEqual([{ turn: 4, mutation: { path: file, operation: 'update', before: 'first', after: 'second' } }])
   })
 
+  it('treats a tool that never reported its content as unknown, not as empty', async () => {
+    // The `str_replace_editor` shape: the plugin watched the path but only knows the
+    // before-state. Learning "empty" here would record a phantom rewrite whose
+    // restore content is an empty string.
+    const file = join(root, 'rendered.txt')
+    await writeFile(file, 'real content', 'utf8')
+    const { scanner, records } = makeScanner()
+    scanner.observe('s1', file, null)
+
+    await scanner.scan('s1', 3)
+    expect(records).toEqual([])
+
+    await writeFile(file, 'changed later', 'utf8')
+    await scanner.scan('s1', 4)
+    expect(records).toEqual([{
+      turn: 4,
+      mutation: { path: file, operation: 'update', before: 'real content', after: 'changed later' },
+    }])
+  })
+
   it('reports a file that vanished before it was ever read, and records nothing', async () => {
     // Recording it would abort the whole rollback (restore counts such a path as
     // skipped), so the scan tells the user instead.

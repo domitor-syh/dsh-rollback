@@ -191,4 +191,42 @@ describe('boundary re-scan to rollback', () => {
       { path: file, action: 'delete', content: null, kind: 'created' },
     ])
   })
+
+  it('never mistakes a pre-read capture for an emptied file', async () => {
+    // `str_replace_editor` returns rendered text, so its capture reads the file
+    // beforehand and its after-state is a placeholder. Adopting that placeholder as
+    // real content would make the next boundary see a "rewrite" whose restore
+    // content is an empty string — and the rollback would blank the file.
+    const sessionId = 'pipeline-preread'
+    const file = join(workspace, 'rendered.txt')
+    const { fold, scanner, recorded } = wire(sessionId)
+
+    fold.fold({ kind: 'turn-start', turn: 1, seq: 0 })
+    fold.fold({ kind: 'surface', seq: 1 })
+    await writeFile(file, 'still full of content', 'utf8')
+    scanner.observe(sessionId, file, null)
+    fold.fold({ kind: 'fs-mutation', mutation: { path: file, operation: 'update', before: 'older content', after: '' } })
+    appendCheckpoint({ sessionId, turn: 1, path: file, operation: 'update', before: 'older content' })
+    fold.fold({ kind: 'turn-end', turn: 1, seq: 1 })
+
+    // The next turn ends: the file is untouched, so nothing may be recorded.
+    fold.fold({ kind: 'turn-start', turn: 2, seq: 2 })
+    fold.fold({ kind: 'surface', seq: 3 })
+    await scanner.scan(sessionId, 2)
+    fold.fold({ kind: 'turn-end', turn: 2, seq: 3 })
+
+    expect(recorded).toEqual([])
+    expect(fold.snapshots().find(checkpoint => checkpoint.turn === 2)?.changes[file]).toBeUndefined()
+
+    // The content IS learned, so a later real change is caught against it.
+    await writeFile(file, 'clobbered', 'utf8')
+    fold.fold({ kind: 'turn-start', turn: 3, seq: 4 })
+    fold.fold({ kind: 'surface', seq: 5 })
+    await scanner.scan(sessionId, 3)
+    fold.fold({ kind: 'turn-end', turn: 3, seq: 5 })
+    expect(recorded).toEqual([{ turn: 3, path: file }])
+    expect(planRollback(fold.snapshots(), 3, fold.surfaceTail()).restored).toEqual([
+      { path: file, action: 'restore', content: 'still full of content', kind: 'updated' },
+    ])
+  })
 })

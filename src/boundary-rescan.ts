@@ -62,13 +62,21 @@ export class BoundaryRescan {
   constructor(private readonly deps: BoundaryRescanDeps) {}
 
   /**
-   * Note content a file tool just left behind, so the next boundary compares
-   * against it instead of against the previous generation.
+   * Note what a file tool just left behind, so the next boundary compares against it
+   * instead of against the previous generation.
+   *
+   * `content` is null when the tool never reported it — the `str_replace_editor`
+   * tool returns only rendered text, so its capture is a pre-read and knows the
+   * BEFORE state alone. Passing its empty placeholder as real content would tell the
+   * registry the file is now empty, and the next boundary would record a phantom
+   * rewrite whose restore content is an empty string: a rollback would blank the
+   * file. An unknown content instead makes the next check read the file and adopt
+   * what it finds, recording nothing.
    * @param sessionId - the session.
    * @param path - the display path the tool reported.
-   * @param content - the content the tool wrote.
+   * @param content - the content the tool left behind, or null when it never said.
    */
-  observe(sessionId: string, path: string, content: string): void {
+  observe(sessionId: string, path: string, content: string | null): void {
     const tracked = this.registryFor(sessionId)
     tracked.set(path, { lastKnown: content, size: null, mtimeMs: null, missing: false })
   }

@@ -202,41 +202,51 @@ export class RollbackService {
       if (session === undefined) return
       const sessionObj = session as Session
 
-      let mutation = mutationOf(
+      // A tool that reports its own outcome carries the content it left behind; the
+      // pre-read fallback (`str_replace_editor`, whose result value is rendered
+      // text) knows only the BEFORE state, so its `after` is a placeholder, not an
+      // observation.
+      const reported = mutationOf(
         exec as unknown as MutationActor,
         (result as { value?: unknown }).value,
       )
-      if (mutation === null && pending !== undefined) {
-        mutation = {
-          path: pending.path,
-          operation: pending.kind === 'created' ? 'create' : 'update',
-          before: pending.before,
-          after: '',
-        }
-      }
+      const mutation = reported ?? (pending === undefined
+        ? null
+        : {
+            path: pending.path,
+            operation: pending.kind === 'created' ? 'create' : 'update',
+            before: pending.before,
+            after: '',
+          })
       if (mutation === null) return
 
       const fold = this.foldFor(sessionObj)
       fold.fold({ kind: 'fs-mutation', mutation })
       // The file tools are the plugin's only window onto the workspace; every path
-      // they touch becomes one the boundary re-scan watches from now on.
-      if (typeof sessionObj.id === 'string' && sessionObj.id !== '') {
-        this.rescan.observe(sessionObj.id, mutation.path, mutation.after)
+      // they touch becomes one the boundary re-scan watches from now on. A path
+      // whose content the tool never reported is watched with an unknown content, so
+      // the next check reads it and records nothing rather than treating the
+      // placeholder as an emptied file.
+      const sessionId = typeof sessionObj.id === 'string' ? sessionObj.id : ''
+      if (sessionId !== '') {
+        this.rescan.observe(sessionId, mutation.path, reported === null ? null : reported.after)
       }
 
       // Persist the pre-turn content so a later restart can still restore it
       // (the log only keeps 3-line diff hunks, not whole files), and the content
       // this touch left behind so a restart can still restore a file a later shell
-      // command removes.
+      // command removes. The after-state is written only when the tool reported it:
+      // a placeholder would prime the restarted watch list with a content the plugin
+      // never saw.
       const turn = fold.inProgressTurn()
-      if (turn !== null && typeof sessionObj.id === 'string') {
+      if (turn !== null && sessionId !== '') {
         appendCheckpoint({
-          sessionId: sessionObj.id,
+          sessionId,
           turn,
           path: mutation.path,
           operation: mutation.operation,
           before: mutation.before,
-          after: mutation.after,
+          ...(reported === null ? {} : { after: reported.after }),
         })
       }
     })
