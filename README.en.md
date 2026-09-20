@@ -2,9 +2,7 @@
 
 # dsh-rollback · TRAE-style rollback plugin
 
-<img src="./docs/page-display.jpeg" alt="
-dsh-rollback interface
-" width="780">
+<img src="./docs/page-display.jpeg" alt="dsh-rollback interface" width="780">
 
 > 🌐 语言 / Language: [中文](./README.md) · **English**
 
