@@ -2,7 +2,7 @@
 
 # dsh-rollback · TRAE 式「回退」插件
 
-<img src="./docs/page-display.jpeg" alt="dsh-rollback 界面预览" width="780">
+<img src="./docs/page-display.jpeg" alt="dsh-rollback 界面预览" width="100%">
 
 > 🌐 语言 / Language: **中文** · [English](./README.en.md)
 
