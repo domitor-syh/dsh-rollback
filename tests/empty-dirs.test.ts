@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { cleanupEmptyDirs } from '../src/empty-dirs.ts'
 
@@ -35,8 +35,9 @@ describe('cleanupEmptyDirs', () => {
 
     const report = await cleanupEmptyDirs([file], spanStart)
     expect(report.failed).toEqual([])
-    // `root` predates the span, so the walk stops there.
-    expect(report.removed.map(p => p.replace(root, ''))).toEqual(['\\outer\\inner', '\\outer'])
+    // `root` predates the span, so the walk stops there. (`relative` keeps the
+    // expectation separator-agnostic — CI runs this on Linux too.)
+    expect(report.removed.map(p => relative(root, p))).toEqual([join('outer', 'inner'), 'outer'])
     expect(await readdir(root)).toEqual([])
   })
 
