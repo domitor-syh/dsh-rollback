@@ -135,6 +135,12 @@ const RPC_HIDE_KEY = 'dsh-rollback.hidden-command-ids'
 /** `conversationContextKey(kind, id)` = `${kind.length}:${kind}${id}`; "command" is 7 chars. */
 const COMMAND_KIND = 'command'
 const COMMAND_KEY_PREFIX = COMMAND_KIND.length + ':' + COMMAND_KIND
+/**
+ * Longest text a hidden row may have. Conversation content is long; a command receipt is
+ * not. This guard exists because a text-based matcher once hid assistant messages, and
+ * the mutation observer then hid another one on every re-render.
+ */
+const MAX_RECEIPT_CHARS = 500
 const hiddenRpcIds: Set<string> = (() => {
   try { return new Set<string>(JSON.parse(localStorage.getItem(RPC_HIDE_KEY) ?? '[]') as string[]) }
   catch { return new Set<string>() }
