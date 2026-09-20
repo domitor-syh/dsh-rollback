@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  findingTurn,
   planBoundaryAction,
   unchangedByStat,
   type ObservedFile,
@@ -74,5 +75,21 @@ describe('planBoundaryAction', () => {
     // Recording it would be worse than useless: restore reports such a path as
     // skipped, and a skipped file aborts the whole rollback.
     expect(planBoundaryAction(tracked(null), null)).toEqual({ kind: 'unrestorable' })
+  })
+})
+
+describe('findingTurn', () => {
+  it('stays on the scanned turn when that turn also confirmed the file', () => {
+    expect(findingTurn(9, 9)).toBe(9)
+  })
+
+  it('moves to the turn after the last confirmation otherwise', () => {
+    expect(findingTurn(5, 9)).toBe(6)
+    expect(findingTurn(1, 2)).toBe(2)
+  })
+
+  it('falls back to the scanned turn when nothing was ever confirmed', () => {
+    expect(findingTurn(null, 7)).toBe(7)
+    expect(findingTurn(undefined, 7)).toBe(7)
   })
 })

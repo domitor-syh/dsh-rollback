@@ -111,9 +111,10 @@ export function appendCheckpoint(record: CheckpointRecord): void {
  * @param sessionId - the session whose sidecar to read.
  * @returns path to the most recently observed content.
  */
-export function loadKnownContent(sessionId: string): Map<string, string> {
+export function loadKnownContent(sessionId: string, skipTurns?: ReadonlySet<number>): Map<string, string> {
   const known = new Map<string, string>()
   for (const row of readRecords(sessionId)) {
+    if (skipTurns?.has(row.turn) === true) continue
     if (typeof row.after === 'string' && row.after !== '') known.set(row.path, row.after)
   }
   return known
@@ -151,7 +152,7 @@ function readRecords(sessionId: string): CheckpointRecord[] {
  * retention window are pruned and the file is rewritten; corrupt lines are
  * skipped and reported.
  */
-export function loadCheckpoints(sessionId: string): CheckpointMap {
+export function loadCheckpoints(sessionId: string, skipTurns?: ReadonlySet<number>): CheckpointMap {
   const file = sessionFile(sessionId)
   const out: CheckpointMap = new Map()
   if (!existsSync(file)) return out
@@ -174,9 +175,14 @@ export function loadCheckpoints(sessionId: string): CheckpointMap {
   }
 
   const cutoff = maxTurn - KEEP_TURNS + 1
+  // A record of a turn a rollback already removed is dropped for the same reason and
+  // at the same time: those turns' file changes were undone, so their paths must not
+  // stay in the watch list (see `deadTurnsOf`).
+  const dropped = (record: CheckpointRecord): boolean =>
+    record.turn < cutoff || skipTurns?.has(record.turn) === true
   let pruned = 0
   for (const record of rows) {
-    if (record.turn < cutoff) { pruned += 1; continue }
+    if (dropped(record)) { pruned += 1; continue }
     let byPath = out.get(record.turn)
     if (byPath === undefined) { byPath = new Map(); out.set(record.turn, byPath) }
     if (!byPath.has(record.path)) byPath.set(record.path, { operation: record.operation, before: record.before })
@@ -186,7 +192,7 @@ export function loadCheckpoints(sessionId: string): CheckpointMap {
   // self-healing. Best-effort: a rewrite failure keeps the in-memory result.
   if (corrupt > 0 || pruned > 0) {
     try {
-      const kept = rows.filter(record => record.turn >= cutoff)
+      const kept = rows.filter(record => !dropped(record))
       writeFileSync(file, kept.map(record => JSON.stringify(record)).join('\n') + (kept.length > 0 ? '\n' : ''), 'utf8')
     } catch {
       /* leave the file untouched; future loads will retry */
@@ -196,7 +202,22 @@ export function loadCheckpoints(sessionId: string): CheckpointMap {
     console.warn(`[dsh-rollback] checkpoints: skipped ${corrupt} corrupt line(s) for session ${sessionId}`)
   }
   if (pruned > 0) {
-    console.warn(`[dsh-rollback] checkpoints: pruned ${pruned} stale record(s) for session ${sessionId}`)
+    console.warn(`[dsh-rollback] checkpoints: dropped ${pruned} record(s) (stale or from rolled-back turns) for session ${sessionId}`)
   }
   return out
+}
+export function loadWatched(
+  sessionId: string,
+  skipTurns?: ReadonlySet<number>,
+): Map<string, { content: string | null; turn: number | null }> {
+  const watched = new Map<string, { content: string | null; turn: number | null }>()
+  for (const row of readRecords(sessionId)) {
+    if (skipTurns?.has(row.turn) === true) continue
+    if (row.operation === 'remove') continue
+    const previous = watched.get(row.path)
+    if (previous !== undefined && previous.turn !== null && previous.turn > row.turn) continue
+    const content = typeof row.after === 'string' && row.after !== '' ? row.after : null
+    watched.set(row.path, { content, turn: row.turn })
+  }
+  return watched
 }

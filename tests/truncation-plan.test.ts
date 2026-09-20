@@ -114,6 +114,21 @@ describe('planTruncationMarker', () => {
     expect(ROLLBACK_CHECKPOINT_TEXT.length).toBeGreaterThan(0)
   })
 
+  it('keeps the checkpoint notice inside its token budget', () => {
+    // The marker replaces history the model no longer sees, and it STAYS in the
+    // model's context for the rest of the session: a later rollback replaces it,
+    // nothing else removes it. So its length is paid on every subsequent request,
+    // which is why it was tightened from 331 characters. This budget is the guard
+    // against it quietly growing back — the four facts it must carry are (1) it is
+    // machine-generated, (2) earlier messages were removed, (3) files were reverted
+    // with them, and (4) continue from what remains without mentioning it.
+    expect(ROLLBACK_CHECKPOINT_TEXT.length).toBeLessThanOrEqual(150)
+    expect(ROLLBACK_CHECKPOINT_TEXT).toContain('Automated checkpoint')
+    expect(ROLLBACK_CHECKPOINT_TEXT).toContain('removed')
+    expect(ROLLBACK_CHECKPOINT_TEXT).toMatch(/files restored/i)
+    expect(ROLLBACK_CHECKPOINT_TEXT).toMatch(/don't mention/i)
+  })
+
   it('never rides an assistant/message or any step-scoped shape', () => {
     // Regression guard: the marker MUST stay a `user/message` carrying a surface
     // replacement. An empty-content `assistant/message` is the model-invisible

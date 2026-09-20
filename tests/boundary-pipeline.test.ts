@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { BoundaryRescan } from '../src/boundary-rescan.ts'
 import { planRollback } from '../src/core/restore-plan.ts'
 import { SessionFold } from '../src/core/session-fold.ts'
-import { appendCheckpoint, loadCheckpoints, loadKnownContent } from '../src/store.ts'
+import { appendCheckpoint, loadCheckpoints, loadWatched } from '../src/store.ts'
 
 /**
  * The whole point of the boundary re-scan, end to end across the modules an actual
@@ -41,7 +41,7 @@ describe('boundary re-scan to rollback', () => {
         for (const byPath of loadCheckpoints(id).values()) for (const path of byPath.keys()) paths.add(path)
         return [...paths]
       },
-      knownContent: id => loadKnownContent(id),
+      knownContent: id => loadWatched(id),
       record: (id, turn, mutation) => {
         // Collected rather than asserted here: the scanner swallows a failing path by
         // design, so an assertion in this callback would vanish into a warning.

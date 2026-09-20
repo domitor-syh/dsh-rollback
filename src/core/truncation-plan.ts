@@ -54,9 +54,20 @@ export interface SessionView {
  * unexplained user turn appeared nor act on it. The file sentence is the one
  * fact a rollback adds beyond compaction — the workspace was reverted too, so
  * the model must not keep reasoning about content its own edits had produced.
+ *
+ * Everything here is load-bearing, and nothing else is: the four facts are (1)
+ * this is machine-generated, not something the user said, (2) the messages after
+ * this point are gone, so stop reasoning about them, (3) the workspace files were
+ * reverted with them, so their later edits are not on disk, and (4) continue from
+ * what remains and do not mention the checkpoint. The marker stays in the model's
+ * context for the REST OF THE SESSION — a later rollback replaces it, nothing else
+ * removes it — so every word is paid on every subsequent request. That is why the
+ * wording is this terse: it is roughly a third of the prose it replaced, with the
+ * same four facts and no new ambiguity. `tests/truncation-plan.test.ts` pins a
+ * character budget so it cannot quietly grow back.
  */
 export const ROLLBACK_CHECKPOINT_TEXT =
-  'This is an automatically generated checkpoint: the conversation was rewound to this point, the messages after it were removed, and workspace files were changed back to their state at that time. Treat what remains as the established context and continue directly from the messages that follow, without acknowledging this checkpoint.'
+  'Automated checkpoint: earlier messages removed, files restored to that point. Continue from what remains; don\'t mention this checkpoint.'
 
 /**
  * Provenance stamped on the marker, so the client recognizes its own node.

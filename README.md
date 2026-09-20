@@ -2,8 +2,6 @@
 
 # dsh-rollback · TRAE 式「回退」插件
 
-[![Awesome DSH Plugin](https://awesome-dsh-plugin.com/badge.svg)](https://awesome-dsh-plugin.com) [![listed plugins](https://img.shields.io/endpoint?url=https://awesome-dsh-plugin.com/count.json)](https://awesome-dsh-plugin.com) [![npm](https://img.shields.io/npm/v/@domitor-syh/dsh-rollback)](https://www.npmjs.com/package/@domitor-syh/dsh-rollback) [![downloads](https://img.shields.io/npm/dt/@domitor-syh/dsh-rollback)](https://www.npmjs.com/package/@domitor-syh/dsh-rollback) [![MIT License](https://img.shields.io/badge/license-MIT-green)](./LICENSE) [![CI](https://img.shields.io/github/actions/workflow/status/domitor-syh/dsh-rollback/test.yml?branch=main)](https://github.com/domitor-syh/dsh-rollback/actions/workflows/test.yml)
-
 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）Web 端提供一个 TRAE 式「回退到本轮对话发起前」的插件：按轮次建立检查点，一键把【工作区文件】和【模型上下文】同时回退到某一轮发起之前，保持同一会话 id。
 
 ## 是什么
@@ -96,7 +94,7 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 - **无法恢复的文件会被跳过，而不是中止整次回退**：某个文件恢复不了（前置内容从未记录，或文件系统拒绝：被占用、无权限、沙箱不允许恢复工作区外的路径）时，插件**照做能做的**、**对话照样截断**，并在结果里列出跳过项。这是刻意的取舍——之前"任何文件失败就整次中止"会导致：文件已部分恢复、对话没截断、而卡住的原因往往不会自己消失 → 反复失败 → 用户被彻底卡住。跳过项在**确认前**的预览里就标着「跳过」，所以是知情选择；而且**被跳过路径的记录会保留**，下次回退会再试一次（文件锁释放后就能恢复）✓
 - **超出保留范围的回退目标会被拒绝**：检查点是 10 轮滑动窗口，更早的状态无法重建。GUI 里超出范围的按钮**置灰**（不额外加提示——置灰本身就是说明），命令返回报错并给出可回退范围——此前它会**静默按最旧的保留记录恢复**（错的状态、无提示）✗
 - **聊天轨迹仍保留已回退的消息**：DSH 的聊天轨迹按 append-origin 事件渲染，而日志本身 append-only、无法改写；表层 `replace` 只作用于**模型上下文**。插件在界面层把被回退区间隐藏（由日志里的持久标记驱动，刷新/重启后保持）。
-- **模型会读到一行检查点文字**：轮次之间写不出"模型不可见"的标记（那需要一个已开启的 step），所以模型会读到那段检查点说明，约 60 token；说明里已明确要求模型把已有内容当作既定背景、继续后面的对话，并**不要在意、不要提及这个检查点**。
+- **模型会读到一行检查点文字**：轮次之间写不出"模型不可见"的标记（那需要一个已开启的 step），所以模型会读到那段检查点说明，约 **34 token**（136 字符；压缩前是 331 字符 / 约 83 token）。这段文字**会一直留在模型上下文里直到本次会话结束**（只有下一次回退会替换它），所以每个后续请求都要付一次——因此措辞写到最紧，同时保住四件事：① 它是机器生成的、不是用户说的；② 此后的消息已移除；③ 工作区文件同时被还原；④ 从剩下的内容继续、**不要在意也不要提及这个检查点**。`tests/truncation-plan.test.ts` 用一条字符预算断言钉住它，防止以后又长回去。
 - **检查点为进程内存态 + 20 轮 sidecar**：折叠状态随会话对象存于内存（`WeakMap`）；重启后由 sidecar（`storages/dsh-rollback/checkpoints-v2/`）重建，保留最近 20 轮（`KEEP_TURNS`），更早的记录在加载时被剪枝。
 - **新建文件删除与空目录清理走本地文件系统**：文件系统抽象层没有删除原语，删除通过 `processPath` + Node `unlink`、空目录清理通过 Node `rmdir` 完成，仅对本地后端可靠。
 - **回退不可撤销**：执行即替换历史，不提供 redo 链。

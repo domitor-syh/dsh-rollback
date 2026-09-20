@@ -65,3 +65,34 @@ export function replacedSurfaceRanges(events: readonly ReplayEvent[]): ReplacedR
 export function isReplacedSeq(seq: number, ranges: readonly ReplacedRange[]): boolean {
   return ranges.some(range => seq >= range.start && seq <= range.end)
 }
+
+/**
+ * The turn numbers a rollback already removed.
+ *
+ * A turn whose `turn/start` sits inside a replaced range is gone: its history is not in
+ * the model's context and, more importantly, its FILE changes were undone. Nothing
+ * about it may be resurrected — not its checkpoints, and not its paths.
+ *
+ * That last part is why this exists. The boundary re-scan keeps re-checking the paths
+ * the file tools once touched, and it learned about them from the durable sidecar,
+ * which still holds records for turns a rollback removed. Watching those paths means
+ * noticing that their files are missing — because the rollback correctly deleted them —
+ * and recording that as a change of the CURRENT turn, so the next rollback "brings
+ * back" files an earlier rollback had already removed. Measured on a real session: six
+ * Desktop files deleted at turn 26 and again at turn 28 for exactly this reason, and
+ * then restored by a later rollback.
+ * @param events - the session log, in any order.
+ * @returns the turn numbers that no longer exist.
+ */
+export function deadTurnsOf(events: readonly ReplayEvent[]): Set<number> {
+  const ranges = replacedSurfaceRanges(events)
+  const dead = new Set<number>()
+  if (ranges.length === 0) return dead
+  for (const event of events) {
+    if (event.type !== 'turn/start') continue
+    if (!isReplacedSeq(event.seq, ranges)) continue
+    const turn = (event.data as { turn?: unknown } | undefined)?.turn
+    if (typeof turn === 'number' && Number.isSafeInteger(turn)) dead.add(turn)
+  }
+  return dead
+}

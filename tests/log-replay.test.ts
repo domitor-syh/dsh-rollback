@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { isReplacedSeq, replacedSurfaceRanges, type ReplayEvent } from '../src/core/log-replay.ts'
+import { deadTurnsOf, isReplacedSeq, replacedSurfaceRanges, type ReplayEvent } from '../src/core/log-replay.ts'
 
 /** A rollback marker event, as the log carries it. */
 function marker(seq: number, start: number, end: number) {
@@ -81,5 +81,34 @@ describe('replaying a log that has rollback markers', () => {
       { type: 'turn/start', seq: 50, data: { turn: 2 } },
     ]
     expect(replayedTurns(events)).toEqual([1, 2])
+  })
+})
+
+describe('deadTurnsOf', () => {
+  it('names the turns a rollback removed, and only those', () => {
+    const events: ReplayEvent[] = [
+      { type: 'turn/start', seq: 10, data: { turn: 1 } },
+      { type: 'turn/start', seq: 60, data: { turn: 2 } },
+      { type: 'turn/start', seq: 90, data: { turn: 3 } },
+      marker(200, 10, 160),
+      { type: 'turn/start', seq: 230, data: { turn: 4 } },
+    ]
+    expect([...deadTurnsOf(events)].sort((a, b) => a - b)).toEqual([1, 2, 3])
+  })
+
+  it('is empty when nothing was ever rolled back', () => {
+    // The whole point of the empty case: with no markers, every sidecar record still
+    // describes real state, so nothing may be dropped and nothing may stop being
+    // watched.
+    expect(deadTurnsOf([{ type: 'turn/start', seq: 10, data: { turn: 1 } }]).size).toBe(0)
+    expect(deadTurnsOf([]).size).toBe(0)
+  })
+
+  it('ignores a turn/start with no usable turn number', () => {
+    const events: ReplayEvent[] = [
+      { type: 'turn/start', seq: 20 },
+      marker(200, 10, 160),
+    ]
+    expect(deadTurnsOf(events).size).toBe(0)
   })
 })

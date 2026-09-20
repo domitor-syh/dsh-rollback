@@ -18,7 +18,7 @@ import type { FsMutation } from './core/model.ts'
 import { fsMutationFrom, SessionFold } from './core/session-fold.ts'
 import { planRollback, type RestoredFile, type RollbackPlan, type SkippedFile } from './core/restore-plan.ts'
 import { turnStartTimeMs } from './core/dir-cleanup.ts'
-import { isReplacedSeq, replacedSurfaceRanges } from './core/log-replay.ts'
+import { deadTurnsOf, isReplacedSeq, replacedSurfaceRanges } from './core/log-replay.ts'
 import { rollbackRefusal, windowRefusal } from './core/rollback-guard.ts'
 import { BoundaryRescan } from './boundary-rescan.ts'
 import { cleanupEmptyDirs } from './empty-dirs.ts'
@@ -28,7 +28,7 @@ import {
   type SessionView,
   type TruncationMarkerPlan,
 } from './core/truncation-plan.ts'
-import { appendCheckpoint, loadCheckpoints, loadKnownContent } from './store.ts'
+import { appendCheckpoint, loadCheckpoints, loadWatched } from './store.ts'
 
 /** Retained checkpoint window: "仅支持回退至最近 10 轮会话内" (sliding window). */
 export const ROLLBACK_WINDOW = 10
@@ -95,10 +95,17 @@ function viewOf(session: Session): SessionView {
  * @param sessionId - the session.
  * @returns distinct display paths, in no particular order.
  */
-function watchablePaths(sessionId: string): string[] {
+function watchablePaths(sessionId: string, skipTurns?: ReadonlySet<number>): string[] {
   const paths = new Set<string>()
-  for (const byPath of loadCheckpoints(sessionId).values()) {
-    for (const path of byPath.keys()) paths.add(path)
+  for (const byPath of loadCheckpoints(sessionId, skipTurns).values()) {
+    for (const [path, record] of byPath) {
+      // Only a create/update record proves a file is real state worth watching. A
+      // `remove` record is a FINDING, and a finding about a path whose only real
+      // records belong to turns a rollback already removed is itself the zombie: the
+      // file is missing because that rollback correctly deleted it, so watching it
+      // would keep producing the very findings this filter exists to stop.
+      if (record.operation !== 'remove') paths.add(path)
+    }
   }
   return [...paths]
 }
@@ -110,6 +117,15 @@ export class RollbackService {
   private readonly pendingBefore = new Map<string, { path: string; kind: 'created' | 'updated'; before: string | null }>()
   /** Watchdog for files the file tools touched, re-checked at message boundaries. */
   private readonly rescan: BoundaryRescan
+  /**
+   * Turns the log proves a rollback already removed, per session.
+   *
+   * Their sidecar records describe state that no longer exists — their file changes
+   * were undone — so both the watch list and the known-content map must ignore them.
+   * Without this, files an earlier rollback correctly deleted come back as "missing"
+   * findings on the CURRENT turn and a later rollback resurrects them.
+   */
+  private readonly deadTurns = new Map<string, ReadonlySet<number>>()
 
   constructor(private readonly ctx: Context) {
     // The re-scan needs the session's policy to resolve a path, and the fold to
@@ -122,8 +138,8 @@ export class RollbackService {
         const target = await this.ctx.fs.resolve(path, { cwd: policy.workspaceRoot })
         return this.ctx.fs.processPath(target)
       },
-      watchedPaths: sessionId => watchablePaths(sessionId),
-      knownContent: sessionId => loadKnownContent(sessionId),
+      watchedPaths: sessionId => watchablePaths(sessionId, this.deadTurns.get(sessionId)),
+      knownContent: sessionId => loadWatched(sessionId, this.deadTurns.get(sessionId)),
       record: (sessionId, turn, mutation) => {
         const session = this.ctx.sessions.get(sessionId)
         if (session === undefined) return
@@ -273,16 +289,23 @@ export class RollbackService {
   private seedFromLog(session: Session): void {
     if (this.folds.has(session)) return
     const fold = this.foldFor(session)
-    // Keep watching whatever the sidecar already knows, so a restarted process
-    // still notices a shell command that removes one of those files.
-    if (typeof session.id === 'string' && session.id !== '') this.rescan.prime(session.id)
-    const durable = loadCheckpoints(String(session.id))
     // The log is append-only: it still holds every turn a rollback replaced. Replaying
     // those would put undone turns back into the window — offering turns the
     // transcript no longer shows, naming files from them, and (worst) letting a
     // "created file" recorded there delete a file the user has since recreated. The
     // markers in the log say exactly which ranges are gone.
     const replaced = replacedSurfaceRanges(session.events as never)
+    // ...and those same turns decide which durable records no longer describe
+    // anything real. They must be dropped BEFORE the watch list is primed from the
+    // sidecar: a path whose only records belong to removed turns is a file an earlier
+    // rollback already deleted, and watching it would turn "it is missing" into a
+    // finding on the CURRENT turn — resurrecting it on the next rollback.
+    const sessionKey = typeof session.id === 'string' ? session.id : ''
+    if (sessionKey !== '') this.deadTurns.set(sessionKey, deadTurnsOf(session.events as never))
+    // Keep watching whatever the sidecar still knows — minus those removed turns — so
+    // a restarted process notices a shell command that removes one of those files.
+    if (sessionKey !== '') this.rescan.prime(sessionKey)
+    const durable = loadCheckpoints(String(session.id), this.deadTurns.get(sessionKey))
     const calls = new Map<string, { name: string; argsRaw: string }>()
     for (const event of session.events) {
       if (isReplacedSeq(event.seq, replaced)) continue

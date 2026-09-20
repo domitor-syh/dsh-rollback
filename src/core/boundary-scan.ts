@@ -30,6 +30,11 @@ export interface TrackedFile {
   readonly mtimeMs: number | null
   /** Whether the previous check already found the file absent. */
   readonly missing: boolean
+  /**
+   * The turn in which this plugin last CONFIRMED the file existed -- a change can only
+   * have started after that moment, which is what findingTurn attributes from.
+   */
+  readonly lastSeenTurn?: number | null
 }
 
 /** One file's observed state, or null when it does not exist. */
@@ -66,6 +71,30 @@ export function unchangedByStat(tracked: TrackedFile, size: number, mtimeMs: num
   return !tracked.missing && tracked.size === size && tracked.mtimeMs === mtimeMs
 }
 
+/**
+ * The turn a finding belongs to.
+ *
+ * The scan runs at a turn's END, so that is the first moment the plugin learns a watched
+ * file changed or vanished -- but "first noticed" is not "when it happened", and a
+ * finding attributed to the noticing turn claims that turn did it. A rollback acts on
+ * exactly that claim, so getting it wrong invents file changes in turns that made none:
+ * rolling back an ordinary conversation turn offered files that had disappeared many
+ * turns earlier, because noticing was all that happened in that turn.
+ *
+ * The honest attribution is the turn AFTER the last moment the file was confirmed to
+ * exist, since the change happened somewhere in between. When that confirmation came in
+ * the very turn being scanned, the change did happen inside it -- the case the re-scan
+ * exists for, a shell command deleting a file the same turn wrote -- and it stays
+ * attributed to that turn so rolling it back restores the file.
+ * @param lastSeenTurn - the turn that last confirmed the file existed, or null when this
+ *   plugin has never confirmed it.
+ * @param scannedTurn - the turn whose end the scan is running at.
+ * @returns the turn the finding must be recorded against.
+ */
+export function findingTurn(lastSeenTurn: number | null | undefined, scannedTurn: number): number {
+  if (lastSeenTurn == null) return scannedTurn
+  return lastSeenTurn === scannedTurn ? scannedTurn : lastSeenTurn + 1
+}
 /**
  * Decide what a re-check found.
  * @param tracked - what the plugin recorded at the last look.

@@ -19,7 +19,7 @@ afterEach(async () => {
  * A scanner over one session, against real files: display paths ARE host paths here,
  * so resolution is the identity function.
  */
-function makeScanner(options: { watched?: readonly string[]; known?: Map<string, string> } = {}) {
+function makeScanner(options: { watched?: readonly string[]; known?: Map<string, { content: string | null; turn: number | null }> } = {}) {
   const records: { turn: number; mutation: FsMutation }[] = []
   const warnings: string[] = []
   const scanner = new BoundaryRescan({
@@ -84,13 +84,15 @@ describe('BoundaryRescan', () => {
     await writeFile(file, 'durable content', 'utf8')
     const { scanner, records } = makeScanner({
       watched: [file],
-      known: new Map([[file, 'durable content']]),
+      known: new Map([[file, { content: 'durable content', turn: 5 }]]),
     })
     scanner.prime('s1')
     await unlink(file)
 
     await scanner.scan('s1', 9)
-    expect(records).toEqual([{ turn: 9, mutation: { path: file, operation: 'remove', before: 'durable content', after: '' } }])
+    // The sidecar last confirmed the file at turn 5, so the change happened after it:
+    // attributing it to turn 9 (the turn that merely noticed) is what this fixes.
+    expect(records).toEqual([{ turn: 6, mutation: { path: file, operation: 'remove', before: 'durable content', after: '' } }])
   })
 
   it('learns the content of a path it has never read, then notices a later change', async () => {

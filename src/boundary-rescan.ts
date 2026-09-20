@@ -12,7 +12,7 @@
  */
 
 import { readFile, stat } from 'node:fs/promises'
-import { planBoundaryAction, unchangedByStat, type ObservedFile, type TrackedFile } from './core/boundary-scan.ts'
+import { findingTurn, planBoundaryAction, unchangedByStat, type ObservedFile, type TrackedFile } from './core/boundary-scan.ts'
 import type { FsMutation } from './core/model.ts'
 
 /** What the scanner needs from the plugin. */
@@ -26,8 +26,11 @@ export interface BoundaryRescanDeps {
   hostPathOf(sessionId: string, path: string): Promise<string | undefined>
   /** Paths the durable sidecar already holds for one session. */
   watchedPaths(sessionId: string): readonly string[]
-  /** The last content the durable sidecar knows for each of those paths. */
-  knownContent(sessionId: string): Map<string, string>
+  /**
+   * The last content the durable sidecar knows for each watched path, with the turn it
+   * came from -- the turn that last confirmed the file existed.
+   */
+  knownContent(sessionId: string): Map<string, { content: string | null; turn: number | null }>
   /**
    * Record one finding against the turn its boundary opened.
    * @param sessionId - the session.
@@ -76,9 +79,11 @@ export class BoundaryRescan {
    * @param path - the display path the tool reported.
    * @param content - the content the tool left behind, or null when it never said.
    */
-  observe(sessionId: string, path: string, content: string | null): void {
+  observe(sessionId: string, path: string, content: string | null, turn: number | null = null): void {
     const tracked = this.registryFor(sessionId)
-    tracked.set(path, { lastKnown: content, size: null, mtimeMs: null, missing: false })
+    // The turn is recorded too: a tool write confirms the file existed in that turn,
+    // which is what a later finding has to be attributed from.
+    tracked.set(path, { lastKnown: content, size: null, mtimeMs: null, missing: false, lastSeenTurn: turn })
   }
 
   /**
@@ -152,7 +157,8 @@ export class BoundaryRescan {
     for (const path of this.deps.watchedPaths(sessionId)) {
       // A path the sidecar records without content (records written before that
       // field existed) is still worth watching: the first check adopts its content.
-      primed.set(path, { lastKnown: known.get(path) ?? null, size: null, mtimeMs: null, missing: false })
+      const entry = known.get(path)
+      primed.set(path, { lastKnown: entry?.content ?? null, size: null, mtimeMs: null, missing: false, lastSeenTurn: entry?.turn ?? null })
     }
     this.watched.set(sessionId, primed)
   }
@@ -171,7 +177,8 @@ export class BoundaryRescan {
     const tracked = this.watched.get(sessionId)
     if (tracked === undefined) return
     for (const path of [...tracked.keys()]) {
-      tracked.set(path, { lastKnown: null, size: null, mtimeMs: null, missing: false })
+      const previous = tracked.get(path)
+      tracked.set(path, { lastKnown: null, size: null, mtimeMs: null, missing: false, lastSeenTurn: previous?.lastSeenTurn ?? null })
     }
   }
 
@@ -210,23 +217,27 @@ export class BoundaryRescan {
       case 'none': {
         // Identical content (a touched mtime) still refreshes the fingerprint so the
         // next boundary can take the stat-only fast path.
-        if (fingerprint !== null) registry.set(path, { ...state, size: fingerprint.size, mtimeMs: fingerprint.mtimeMs, missing: false })
+        if (fingerprint !== null) registry.set(path, { ...state, size: fingerprint.size, mtimeMs: fingerprint.mtimeMs, missing: false, lastSeenTurn: turn })
         return
       }
       case 'adopt': {
-        registry.set(path, { lastKnown: action.observed.content, size: action.observed.size, mtimeMs: action.observed.mtimeMs, missing: false })
+        registry.set(path, { lastKnown: action.observed.content, size: action.observed.size, mtimeMs: action.observed.mtimeMs, missing: false, lastSeenTurn: turn })
         return
       }
       case 'changed': {
-        this.deps.record(sessionId, turn, { path, operation: 'update', before: action.before, after: action.after })
-        registry.set(path, { lastKnown: action.after, size: action.observed.size, mtimeMs: action.observed.mtimeMs, missing: false })
+        // Attributed to the turn the change belongs to, not necessarily the one being
+        // scanned: see findingTurn.
+        const anchor = findingTurn(state.lastSeenTurn, turn)
+        this.deps.record(sessionId, anchor, { path, operation: 'update', before: action.before, after: action.after })
+        registry.set(path, { lastKnown: action.after, size: action.observed.size, mtimeMs: action.observed.mtimeMs, missing: false, lastSeenTurn: turn })
         return
       }
       case 'missing': {
         // Recorded as a removal, not an update: the rollback has to bring the file
         // BACK, which the user should see as its own category rather than as a
         // rewrite of a file that is still there.
-        this.deps.record(sessionId, turn, { path, operation: 'remove', before: action.before, after: '' })
+        const removeAnchor = findingTurn(state.lastSeenTurn, turn)
+        this.deps.record(sessionId, removeAnchor, { path, operation: 'remove', before: action.before, after: '' })
         registry.set(path, { ...state, lastKnown: action.before, size: null, mtimeMs: null, missing: true })
         return
       }
