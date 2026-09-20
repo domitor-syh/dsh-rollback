@@ -153,34 +153,24 @@ function trackRpcId(commandId: unknown): void {
   requestAnimationFrame(() => { syncHiddenRpcRows() })
 }
 
-/**
- * Whether a chat row is a rollback command receipt the plugin produced itself.
- *
- * Kind-based hiding cannot cover these: the automatic range query and the dialog
- * preview are plain command receipts. Matching the RENDERED TEXT keeps the fix
- * independent of the harness's flow-kind names, and leaves a rollback the user typed
- * themselves (`/rollback <turn>`) visible, because that is real work, not noise.
- * @param el - a chat-flow row element.
- * @returns true when the row should be hidden.
- */
-function isRollbackNoiseRow(el: HTMLElement): boolean {
-  // Deliberately loose: the receipt renders the command name and its args, and the exact
-  // spacing and leading slash are the shell's business, not ours. A row is noise when it
-  // names this plugin's command together with one of the two sub-commands the client
-  // dispatches on its own: the mount-time range query and the dialog preview.
-  const text = (el.textContent ?? '').toLowerCase()
-  return text.includes('rollback') && (text.includes('list') || text.includes('preview'))
-}
 
 /** display:none the seats of button-dispatched command executions (removes the flex gap entirely). */
 function syncHiddenRpcRows(): void {
+  const ids = [...hiddenRpcIds]
   for (const el of document.querySelectorAll<HTMLElement>('[data-chat-flow-key]')) {
     const key = el.getAttribute('data-chat-flow-key') ?? ''
-    if (key.startsWith(COMMAND_KEY_PREFIX) && hiddenRpcIds.has(key.slice(COMMAND_KEY_PREFIX.length))) {
-      el.style.display = 'none'
-      continue
+    if (key === '') continue
+    // Hard guard, learned the expensive way: a text-based matcher once hid assistant
+    // MESSAGES (their prose mentions rollback, list and preview), and the mutation
+    // observer then hid another one on every re-render. Conversation content is long;
+    // a command receipt is not. Nothing above this size is ever touched.
+    const text = el.textContent ?? ''
+    if (text.length > MAX_RECEIPT_CHARS) continue
+    // Identity, not content: only receipts THIS client dispatched are hidden, so a
+    // rollback the user typed stays readable, and no message can ever match.
+    for (const id of ids) {
+      if (id !== '' && key.endsWith(id)) { el.style.display = 'none'; break }
     }
-    if (isRollbackNoiseRow(el)) el.style.display = 'none'
   }
 }
 
