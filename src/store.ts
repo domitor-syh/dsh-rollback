@@ -100,25 +100,7 @@ export function appendCheckpoint(record: CheckpointRecord): void {
   }
 }
 
-/**
- * The last content this plugin observed for each path of one session.
- *
- * Read from the sidecar's `after` fields, newest record winning, so a restarted
- * process can still restore a file that an unseen shell command removed after the
- * plugin last looked at it. Paths whose records predate that field, or whose only
- * observation never recorded content, are absent — the caller then has to read the
- * file to learn it.
- * @param sessionId - the session whose sidecar to read.
- * @returns path to the most recently observed content.
- */
-export function loadKnownContent(sessionId: string, skipTurns?: ReadonlySet<number>): Map<string, string> {
-  const known = new Map<string, string>()
-  for (const row of readRecords(sessionId)) {
-    if (skipTurns?.has(row.turn) === true) continue
-    if (typeof row.after === 'string' && row.after !== '') known.set(row.path, row.after)
-  }
-  return known
-}
+
 
 /**
  * Every structurally valid record in one session's sidecar, in file order.
