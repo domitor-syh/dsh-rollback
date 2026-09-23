@@ -1,5 +1,22 @@
 # 更新日志
 
+## 0.3.0
+
+### 适配 DSH 0.1.5-rc.2
+- **对话节点注册表换了去处**：0.1.5 不再提供 `conversationEvents` 服务，同一个角色改由 `uiConversation.events` 承担。插件改为按序动态查找（`ctx.get`）：有 `uiConversation.events` 就用它，否则回落旧服务。**这两者都不能写进 `inject`**——cordis 把数组当"必需集合"，写出对方版本没有的名字会让整个插件永久停在 pending，表现为"装了什么也没发生"。
+- **聊天数据改走 `useChat` 钩子**：0.1.5 把 `chat` 从会话快照里拿掉，改由会话级插槽的 `useChat` 标准钩子下发。插件优先用钩子，取不到再回落 `snapshot.chat`（0.1.1 的路线）——回退按钮能否定位轮次、隐藏与欢迎页判定能不能读到日志，全看这一处。
+- **"在编辑器中打开"改走右侧栏**：`workspaces.openPath` 在 0.1.5 已删除，改为 `ctx.sidebarRight.openResource(fileAddressFor(sessionId, cwd, path))`（官方文件链接、文件树点开走的就是这条路）；`sidebarRight` 动态获取，旧版仍回落到 `workspaces.openPath`。资源地址的构造是从官方实现逐字抄进插件的：`@deepseek-ai/dsh-util-workspace-path` 不是客户端模块（既没有 `dsh.client`，也不在前端平台种子里），`require` 它会让整个客户端半边在加载时就失败。
+- **输入框附件动词改名**：`addImages` → `addAttachments`、`pruneImages` → `pruneAttachments`（`setDraft` 不变）。两个名字都做特性检测。
+- **回退后的图片重新挂回输入框，改用新接口实现**：`conversation.resolveImage` 与 `conversation.createDraftImages` 在 0.1.5 已删除；现在用 `uiConversation.imageUrl(sessionId, ref)` 取回该图片的字节，包成浏览器 `File`，再由 `conversation.createDrafts(sessionId, files)` 登记为草稿附件——和官方"选文件 / 粘贴图片"是同一条路，字节会随下一次提问一起发出。输入框正忙而拒绝登记时，按官方做法释放刚建好的草稿（旧的 `resolveImage` + `createDraftImages` 路线原样保留给 0.1.1）。图片清单还会在回退**发起前**先读一次：回退成功后再读会与客户端自己的表层替换赛跑，晚一步就什么都恢复不了——而这个功能存在的意义正是"图片要回来"。
+- **折叠行不再参与 DOM 扫描**：0.1.5 用 `hidden="until-found"` 折叠行（官方自己的行扫描也写 `:not([hidden])`）。插件所有 `[data-chat-flow-key]` 扫描都加上 `:not([hidden])`，不再把用户看不见的行算进"屏幕上还有什么"。
+- **回退标记的表层替换改用新字段名**：0.1.5 把 `SurfaceOp` 的区间两端从 `start`/`end` 改名为 `startSeq`/`endSeq`，而校验是**按 key 集合精确匹配**的（`isReplaceOp`），旧拼写被直接拒绝（`carries an invalid replace surfaceOp`）——标记写不进日志，回退的对话截断整个失效。现在按 0.1.5 的拼写写，且**只**在框架按形状拒绝时才用旧拼写重试一次（拒绝发生在 `log.push` 与持久化观察者之前，重试不会留下半个事件），这样旧版主机也照旧可用；读回时**两种拼写都认**，升级前写下的旧标记照样能算出被替换的区间，不会把已回退的轮次当成幽灵重新放出来。
+- **首轮回退不再被 0.1.5 的"表层 0 号节点"规则拒绝**（本次修复的阻断性 bug）：0.1.5 新增一条保护——`replace` 的影子区间**起点若落在表层 0 号节点**且该节点是系统提示词，只有"恰好只替换这一个节点的 `system/message`"才被允许，否则整条事件被拒（`surface replace: node 0 holds the system prompt and may be rewritten only by a system/message over exactly that node`，`dsh-session/lib/index.js:379-383`）。而 0.1.5 的系统提示词是在**第 1 轮的 step 内部**才写下的，序号落在第 1 轮区间里、节点位置却正好是 0 号——于是回退第 1 轮时标记把系统提示词一起圈进区间，写入被拒，表现为"文件已恢复、对话截断没写成"。现在规划器按**类型**认出 0 号节点上的系统提示词，把区间起点后移一个节点（系统提示词因此始终留在模型可见历史里，这正是框架保护它的目的）；客户端从 `surfaceOp` 读到的是**收窄后的起点**，可见范围判定照旧。收窄后若已无节点可替换（区间里只剩系统提示词），标记改为**不带替换的纯追加**：文案照旧进入模型上下文，表层一个节点都不少、也不隐藏任何内容。
+
+### 兼容与可观测性
+- **0.1.1-rc.2 继续支持**：以上每一处都是"有则用新路线、无则回落旧路线"，同一个 bundle 同时服务两个版本。插件自身使用的名字在两个版本里都没有变，未作改动：字典命名空间是它自己的 `rollback`，插槽名是 `conversation.*`（0.1.5 只是把这些插槽的定义搬到了新包 `dsh-client-ui-chat` 里），定位"回到底部"按钮用的是渲染出来的文案「回到底部 / Back to bottom」（0.1.5 里来自 `chat.toBottom`，值未变）。
+- **清单更新**：版本 0.3.0，`dsh.engines.dsh` 改为 `>=0.1.5-rc.2 <0.2.0`（旧范围在 npm 预发布语义下不承认 0.1.5-rc.2），`dsh.client.inject` 补齐 0.1.5 实际存在的客户端包并保留旧条目（加载器会静默跳过不存在的名字）。
+- **失败改为大声报出**：缺框架契约（节点注册表、`chat` 数据、图片重建接口、打开文件的两个入口）都会在控制台**点名**报出，而不是表现为"插件什么也没做"；页面加载时照旧打印一条 `client bundle rev`，用于确认浏览器跑的是不是新包。
+
 ## 0.2.2
 
 ### 修复

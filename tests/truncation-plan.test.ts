@@ -1,10 +1,13 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   planTruncationMarker,
+  replaceSurfaceOpCandidates,
   ROLLBACK_CHECKPOINT_TEXT,
   ROLLBACK_MARKER_SOURCE,
   shadowedSurfaceFrom,
+  systemPromptNodeSeq,
   turnStartSeqFor,
+  withReplaceSurfaceOpFallback,
   type SessionView,
 } from '../src/core/truncation-plan.ts'
 
@@ -41,6 +44,36 @@ function planned(fixture: SessionView, fromTurn: number): NonNullable<ReturnType
   const plan = planTruncationMarker(fixture, { fromTurn, messageId: 'rollback-truncation-x' })
   if (plan === null) throw new Error(`expected a plan for turn ${fromTurn}`)
   return plan
+}
+
+/**
+ * The real 0.1.5 shape of a first turn, where the SYSTEM PROMPT is surface node 0.
+ *
+ * The loop opens the turn and its step FIRST and commits the system prompt from
+ * inside that step (`dsh-agent-loop/lib/index.js:1023`, after `turn/start`), so
+ * the prompt's seq already lies inside turn 1's range while its node sits at
+ * surface index 0 — exactly the position 0.1.5 protects
+ * (`dsh-session/lib/index.js:379-381`). Turn 2 appends a second system node at
+ * seq 9: later system nodes carry no protection and a range may shadow them.
+ */
+function systemPromptFirstTurn(): { entries: { type: string; data?: unknown }[]; nodes: number[] } {
+  const entries: { type: string; data?: unknown }[] = [
+    { type: 'turn/start', data: { turn: 1 } },                                                            // 0
+    { type: 'step/start', data: { turn: 1, step: 1 } },                                                   // 1
+    { type: 'system/message', data: { turn: 1, step: 1 } },                                               // 2 ← surface node 0
+    { type: 'user/message', data: { message: { role: 'user', content: [{ type: 'text', text: 't1' }] } } }, // 3
+    { type: 'assistant/message', data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'a1' }] } } }, // 4
+    { type: 'step/end', data: { turn: 1, step: 1 } },                                                     // 5
+    { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },                               // 6
+    { type: 'turn/start', data: { turn: 2 } },                                                            // 7
+    { type: 'step/start', data: { turn: 2, step: 1 } },                                                   // 8
+    { type: 'system/message', data: { turn: 2, step: 1 } },                                               // 9 (unprotected)
+    { type: 'user/message', data: { message: { role: 'user', content: [{ type: 'text', text: 't2' }] } } }, // 10
+    { type: 'assistant/message', data: { turn: 2, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'a2' }] } } }, // 11
+    { type: 'step/end', data: { turn: 2, step: 1 } },                                                     // 12
+    { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } },                               // 13
+  ]
+  return { entries, nodes: [2, 3, 4, 9, 10, 11] }
 }
 
 describe('turnStartSeqFor', () => {
@@ -97,7 +130,7 @@ describe('planTruncationMarker', () => {
   it('replaces exactly the targeted range with one plugin user message', () => {
     const { entries, nodes } = threeTurns()
     const plan = planned(view(entries, nodes), 2)
-    expect(plan.surfaceOp).toEqual({ op: 'replace', start: nodes[2]!, end: nodes[5]! })
+    expect(plan.range).toEqual({ start: nodes[2]!, end: nodes[5]! })
     expect(plan.sourceEventSeqs).toEqual([nodes[2]!, nodes[3]!, nodes[4]!, nodes[5]!])
     expect(plan.shadowed).toEqual([nodes[2]!, nodes[3]!, nodes[4]!, nodes[5]!])
   })
@@ -146,7 +179,7 @@ describe('planTruncationMarker', () => {
   it('replaces only the range from the targeted turn on, leaving earlier turns alone', () => {
     const { entries, nodes } = threeTurns()
     const plan = planned(view(entries, nodes), 3)
-    expect(plan.surfaceOp).toEqual({ op: 'replace', start: nodes[4]!, end: nodes[5]! })
+    expect(plan.range).toEqual({ start: nodes[4]!, end: nodes[5]! })
     expect(plan.shadowed).not.toContain(nodes[0])
     expect(plan.shadowed).not.toContain(nodes[2])
   })
@@ -155,5 +188,176 @@ describe('planTruncationMarker', () => {
     const { entries } = threeTurns()
     expect(planTruncationMarker(view(entries, []), { fromTurn: 2, messageId: 'id' })).toBeNull()
     expect(planTruncationMarker(view(entries, []), { fromTurn: 9, messageId: 'id' })).toBeNull()
+  })
+})
+
+describe('the protected system-prompt node (0.1.5 node 0)', () => {
+  const degenerate = (): SessionView =>
+    // A first turn whose ONLY surface node is the system prompt: the turn opened,
+    // committed the prompt, and produced nothing else the surface holds.
+    view(
+      [
+        { type: 'turn/start', data: { turn: 1 } },                              // 0
+        { type: 'step/start', data: { turn: 1, step: 1 } },                     // 1
+        { type: 'system/message', data: { turn: 1, step: 1 } },                 // 2 ← surface node 0
+        { type: 'step/end', data: { turn: 1, step: 1 } },                       // 3
+        { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } }, // 4
+      ],
+      [2],
+    )
+
+  it('identifies the system-prompt node by TYPE at surface index 0, and only there', () => {
+    const { entries, nodes } = systemPromptFirstTurn()
+    expect(systemPromptNodeSeq(view(entries, nodes))).toBe(2)
+    expect(systemPromptNodeSeq(degenerate())).toBe(2)
+    // A build that keeps the prompt out of history has no protected node — and a
+    // node whose event the log does not carry is not one either: the framework
+    // makes the same lookup and likewise declines to protect it.
+    const { entries: plain, nodes: plainNodes } = threeTurns()
+    expect(systemPromptNodeSeq(view(plain, plainNodes))).toBeNull()
+    expect(systemPromptNodeSeq(view(plain, []))).toBeNull()
+    expect(systemPromptNodeSeq(view(plain, [999]))).toBeNull()
+  })
+
+  it('excludes the system-prompt node from a first-turn rollback range', () => {
+    const { entries, nodes } = systemPromptFirstTurn()
+    const fixture = view(entries, nodes)
+    // The premise of the bug: the prompt's node is inside turn 1's range, at the
+    // very index 0.1.5 refuses to let a `user/message` shadow.
+    expect(turnStartSeqFor(fixture, 1)).toBe(0)
+    expect(systemPromptNodeSeq(fixture)).toBe(nodes[0])
+    expect(shadowedSurfaceFrom(fixture, 1)).toEqual([3, 4, 9, 10, 11])
+
+    const plan = planned(fixture, 1)
+    expect(plan.range).toEqual({ start: 3, end: 11 })
+    expect(plan.shadowed).toEqual([3, 4, 9, 10, 11])
+    expect(plan.shadowed).not.toContain(2)
+    expect(plan.sourceEventSeqs).not.toContain(2)
+    // The system prompt is skippable BY POSITION, not by type: the later system
+    // node at seq 9 is inside the range and stays there.
+    expect(plan.shadowed).toContain(9)
+    // The client hides `[surfaceOp.startSeq, markerSeq)`, so the op must declare
+    // the CLAMPED start — seq 2 stays outside it, and the prompt stays visible.
+    expect(replaceSurfaceOpCandidates(plan.range!)).toEqual([
+      { op: 'replace', startSeq: 3, endSeq: 11 },
+      { op: 'replace', start: 3, end: 11 },
+    ])
+  })
+
+  it('leaves a non-first-turn rollback exactly as it was', () => {
+    const { entries, nodes } = systemPromptFirstTurn()
+    const fixture = view(entries, nodes)
+    expect(shadowedSurfaceFrom(fixture, 2)).toEqual([9, 10, 11])
+    const plan = planned(fixture, 2)
+    expect(plan.range).toEqual({ start: 9, end: 11 })
+    expect(plan.shadowed).toEqual([9, 10, 11])
+    expect(plan.sourceEventSeqs).toEqual([9, 10, 11])
+  })
+
+  it('does not clamp a range that starts on a node which is not the system prompt', () => {
+    // `systemPrompt` not kept in history: node 0 is the user's own first message.
+    // Clamping it away would leave a rolled-back turn in the model's context, so
+    // the protection must be conditional on what node 0 actually holds.
+    const { entries, nodes } = threeTurns()
+    expect(systemPromptNodeSeq(view(entries, nodes))).toBeNull()
+    expect(shadowedSurfaceFrom(view(entries, nodes), 1)).toEqual(nodes)
+    const plan = planned(view(entries, nodes), 1)
+    expect(plan.range).toEqual({ start: nodes[0]!, end: nodes[nodes.length - 1]! })
+    expect(plan.shadowed).toEqual(nodes)
+  })
+
+  it('plans a marker WITHOUT a replace op when the clamp leaves nothing to replace', () => {
+    const fixture = degenerate()
+    expect(shadowedSurfaceFrom(fixture, 1)).toEqual([])
+    const plan = planTruncationMarker(fixture, { fromTurn: 1, messageId: 'rollback-truncation-x' })
+    // Not null: the files really were restored, so the model must still be told —
+    // and an empty `replace` cannot be spelled at all (`replacementRange` demands
+    // both ends be current surface nodes), while a surface-eligible event with no
+    // `surfaceOp` is refused outright (`dsh-session/lib/index.js:276`). The
+    // marker is therefore appended with no replacement.
+    expect(plan).not.toBeNull()
+    expect(plan!.range).toBeNull()
+    expect(plan!.shadowed).toEqual([])
+    expect(plan!.sourceEventSeqs).toEqual([])
+    // …and it is still the marker both halves of the plugin recognize.
+    expect(plan!.data.id).toBe('rollback-truncation-x')
+    expect(plan!.data.role).toBe('user')
+    expect(plan!.data.source).toEqual(ROLLBACK_MARKER_SOURCE)
+    expect(plan!.data.content).toEqual([{ type: 'text', text: ROLLBACK_CHECKPOINT_TEXT }])
+  })
+
+  it('still writes no marker at all when the surface holds nothing from the turn', () => {
+    // The other empty outcome, and NOT the degenerate one: there was never a range
+    // to clamp, so nothing is appended (the summary reports 无对话可截断).
+    const { entries, nodes } = threeTurns()
+    const silent = view(
+      [...entries, { type: 'turn/start', data: { turn: 4 } }, { type: 'turn/end', data: { turn: 4 } }],
+      nodes,
+    )
+    expect(planTruncationMarker(silent, { fromTurn: 4, messageId: 'id' })).toBeNull()
+    expect(planTruncationMarker(view(entries, []), { fromTurn: 1, messageId: 'id' })).toBeNull()
+  })
+})
+
+describe('replaceSurfaceOpCandidates', () => {
+  it('offers the 0.1.5 spelling first, then the legacy one', () => {
+    expect(replaceSurfaceOpCandidates({ start: 140, end: 795 })).toEqual([
+      { op: 'replace', startSeq: 140, endSeq: 795 },
+      { op: 'replace', start: 140, end: 795 },
+    ])
+  })
+
+  it('carries exactly the three keys the validator demands', () => {
+    // 0.1.5's `isReplaceOp` checks the KEY COUNT as well as the names
+    // (`dsh-session/lib/index.js:262-264`), so a helpful extra field — or both
+    // spellings on one op — is rejected just as hard as a missing one. This pins
+    // the exact shape; a merged op would pass `toEqual` on the pairs alone.
+    const [preferred, legacy] = replaceSurfaceOpCandidates({ start: 1, end: 2 })
+    expect(Object.keys(preferred!).sort()).toEqual(['endSeq', 'op', 'startSeq'])
+    expect(Object.keys(legacy!).sort()).toEqual(['end', 'op', 'start'])
+  })
+})
+
+describe('withReplaceSurfaceOpFallback', () => {
+  /** The refusal 0.1.5 raises for a replace op whose keys it does not recognize. */
+  const shapeRefusal = () => new Error('session event "user/message" carries an invalid replace surfaceOp')
+
+  it('writes the 0.1.5 spelling and never tries the legacy one', () => {
+    const attempt = vi.fn(() => 'logged')
+    expect(withReplaceSurfaceOpFallback({ start: 140, end: 795 }, attempt)).toBe('logged')
+    expect(attempt).toHaveBeenCalledTimes(1)
+    expect(attempt).toHaveBeenCalledWith({ op: 'replace', startSeq: 140, endSeq: 795 })
+  })
+
+  it('retries once with the legacy spelling when the shape is refused', () => {
+    // An older host: the modern keys are the invalid ones there. The retry is safe
+    // because a refused append persists nothing — Session.append validates before
+    // `this.log.push` and before the observers persistence buffers from.
+    const attempt = vi.fn((op: unknown) => {
+      if ('startSeq' in (op as object)) throw shapeRefusal()
+      return 'logged'
+    })
+    expect(withReplaceSurfaceOpFallback({ start: 140, end: 795 }, attempt)).toBe('logged')
+    expect(attempt).toHaveBeenCalledTimes(2)
+    expect(attempt).toHaveBeenLastCalledWith({ op: 'replace', start: 140, end: 795 })
+  })
+
+  it('does not retry a real failure, and reports it unchanged', () => {
+    // A shadowed node missing from the surface fails identically under both
+    // spellings, so a retry would only bury this diagnostic under a second one.
+    const real = new Error('surface replace: start seq 140 not found in surface')
+    const attempt = vi.fn(() => { throw real })
+    expect(() => withReplaceSurfaceOpFallback({ start: 140, end: 795 }, attempt)).toThrow(real)
+    expect(attempt).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports the second failure when neither spelling is accepted', () => {
+    const legacyFailure = new Error('sourceEventSeqs must include every shadowed surface node; missing 795')
+    const attempt = vi.fn((op: unknown) => {
+      if ('startSeq' in (op as object)) throw shapeRefusal()
+      throw legacyFailure
+    })
+    expect(() => withReplaceSurfaceOpFallback({ start: 140, end: 795 }, attempt)).toThrow(legacyFailure)
+    expect(attempt).toHaveBeenCalledTimes(2)
   })
 })

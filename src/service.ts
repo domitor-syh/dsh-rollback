@@ -25,6 +25,7 @@ import { cleanupEmptyDirs } from './empty-dirs.ts'
 import {
   planTruncationMarker,
   shadowedSurfaceFrom,
+  withReplaceSurfaceOpFallback,
   type SessionView,
   type TruncationMarkerPlan,
 } from './core/truncation-plan.ts'
@@ -82,9 +83,62 @@ function markerMessageId(): string {
   return `rollback-truncation-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 }
 
-/** The session as the pure truncation planner sees it. */
+/**
+ * The session as the pure truncation planner sees it.
+ *
+ * The bare cast is NOT enough, and this is the same defect class as the one
+ * {@link eventsOf} fixes: `SessionView.events` has no counterpart on a 0.1.5
+ * session (its log is private), so handing the pure planner the session itself
+ * gives it `undefined` and `turnStartSeqFor`'s `for (const event of view.events)`
+ * throws `TypeError: view.events is not iterable` — on the plugin's OWN
+ * `/rollback preview` and `/rollback` paths. The view is therefore built rather
+ * than asserted: events through the accessor the installed build ships, surface
+ * read live.
+ * @param session - the session to view.
+ * @returns the structural view the pure planner consumes.
+ */
 function viewOf(session: Session): SessionView {
-  return session as unknown as SessionView
+  return { events: eventsOf(session), surface: (session as unknown as SessionView).surface }
+}
+
+/**
+ * Append the rollback marker, spelling its surface op the way the INSTALLED
+ * framework accepts.
+ *
+ * 0.1.5 renamed the op's range ends to `startSeq`/`endSeq` and validates the key
+ * set exactly, so the older `start`/`end` spelling the plugin used to write is
+ * refused with `carries an invalid replace surfaceOp` — the marker never landed,
+ * and with it the whole point of a rollback. `withReplaceSurfaceOpFallback` tries
+ * the modern spelling and retries with the legacy one only on that refusal, which
+ * persists nothing (see its doc for the `log.push`-comes-after-validation
+ * evidence). This is the one place the union is narrowed to the framework's own
+ * `SurfaceOp`; the shape itself is decided and tested in the core.
+ *
+ * A plan with NO range (`plan.range === null`) is the degenerate outcome of the
+ * system-prompt clamp: the rollback's only shadowed node was the protected system
+ * prompt, so there is nothing to replace. It is appended as a plain surface
+ * append — `'append'` is a `SurfaceOp` on every supported build, and the two
+ * remaining spellings are both impossible: a `replace` over node 0 is what the
+ * framework refuses, and omitting the marker entirely is refused too
+ * (`session event "user/message" is surface-eligible and requires a surfaceOp
+ * marker`, `dsh-session/lib/index.js:276`). No `sourceEventSeqs` rides this
+ * append: the framework demands a non-empty list when the key is present
+ * (`:289`), and an append shadows nothing to cite.
+ * @param session - the session to append to.
+ * @param plan - the planned marker.
+ * @returns the logged marker event, for the surface tail to follow.
+ * @throws whatever the append threw, when neither spelling is accepted.
+ */
+function appendRollbackMarker(session: Session, plan: TruncationMarkerPlan): { readonly seq: number } {
+  const range = plan.range
+  if (range === null) {
+    return session.append('user/message', plan.data as never, { surfaceOp: 'append' as never })
+  }
+  return withReplaceSurfaceOpFallback(range, surfaceOp =>
+    session.append('user/message', plan.data as never, {
+      surfaceOp: surfaceOp as never,
+      sourceEventSeqs: [...plan.sourceEventSeqs],
+    }))
 }
 
 /**
@@ -95,6 +149,32 @@ function viewOf(session: Session): SessionView {
  * @param sessionId - the session.
  * @returns distinct display paths, in no particular order.
  */
+/**
+ * The session's event log, through the accessor this framework build ships.
+ *
+ * 0.1.5 made the log private and exposes `snapshotEvents()`; <=0.1.1 handed the
+ * array out as `session.events`. This is not cosmetic: reading a missing
+ * accessor throws, and this code runs inside the `session/created` observer, so
+ * the throw made the HOST's own session resume fail — every affected session
+ * rendered an empty transcript ("resume failed for session … TypeError: events is
+ * not iterable"), which is a far worse outcome than any bug in this plugin's own
+ * features. Hence a total function: an unreadable log degrades to "no events".
+ * @param session - the session whose log to read.
+ * @returns the events, oldest first; empty when they cannot be read.
+ */
+function eventsOf(session: any): readonly any[] {
+  try {
+    if (typeof session?.snapshotEvents === 'function') {
+      const events = session.snapshotEvents()
+      return Array.isArray(events) ? events : []
+    }
+    if (Array.isArray(session?.events)) return session.events
+  } catch {
+    /* an unreadable log is treated as empty; the caller records nothing */
+  }
+  return []
+}
+
 function watchablePaths(sessionId: string, skipTurns?: ReadonlySet<number>): string[] {
   const paths = new Set<string>()
   for (const byPath of loadCheckpoints(sessionId, skipTurns).values()) {
@@ -162,118 +242,160 @@ export class RollbackService {
       warn: message => console.warn(message),
     })
 
+    // Plugin failures are CONTAINED here, never propagated: this observer runs
+    // inside the host's own session lifecycle, where a throw from the plugin is not
+    // a plugin outage but a host one. Both shapes of failure are covered — the
+    // synchronous throw by the catch below, and the fire-and-forget re-scan (whose
+    // rejection would surface as an unhandled rejection and take the whole process
+    // with it) by each call's own `.catch`. Loud, never fatal.
     ctx.on('session/event', (_session, event) => {
-      const session = _session as Session
-      const fold = this.foldFor(session)
-      switch (event.type) {
-        case 'turn/start':
-          fold.fold({ kind: 'turn-start', turn: event.data.turn, seq: event.seq })
-          break
-        case 'turn/end': {
-          // The turn's own end is the boundary that matters most: a shell command
-          // that ran during this turn must be noticed BEFORE the user rolls back.
-          // Waiting for their next message would catch the deletion a turn too late,
-          // and not at all if they rolled back first. The turn number is read before
-          // the fold closes the turn.
-          const endedSessionId = typeof session.id === 'string' ? session.id : ''
-          if (endedSessionId !== '') void this.rescan.scan(endedSessionId, event.data.turn)
-          fold.fold({ kind: 'turn-end', turn: event.data.turn, seq: event.seq })
-          break
-        }
-        case 'user/message':
-        case 'assistant/message':
-        case 'tool/result':
-          // Only append-origin surface events advance a live turn's span.
-          if (event.surfaceOp === 'append') fold.fold({ kind: 'surface', seq: event.seq })
-          // A user message is also a boundary, catching anything that changed between
-          // the last turn's end and this message (a shell command the user ran
-          // themselves, for instance). The turn is read NOW — the scan itself is
-          // asynchronous — and nothing is awaited on the message path.
-          if (event.type === 'user/message') {
-            const openedTurn = fold.inProgressTurn()
-            const sessionId = typeof session.id === 'string' ? session.id : ''
-            if (openedTurn !== null && sessionId !== '') void this.rescan.scan(sessionId, openedTurn)
+      try {
+        const session = _session as Session
+        const fold = this.foldFor(session)
+        switch (event.type) {
+          case 'turn/start':
+            fold.fold({ kind: 'turn-start', turn: event.data.turn, seq: event.seq })
+            break
+          case 'turn/end': {
+            // The turn's own end is the boundary that matters most: a shell command
+            // that ran during this turn must be noticed BEFORE the user rolls back.
+            // Waiting for their next message would catch the deletion a turn too late,
+            // and not at all if they rolled back first. The turn number is read before
+            // the fold closes the turn.
+            const endedSessionId = typeof session.id === 'string' ? session.id : ''
+            if (endedSessionId !== '') {
+              this.rescan.scan(endedSessionId, event.data.turn).catch(error => {
+                console.warn('[dsh-rollback] boundary re-scan failed; the host keeps working:', error)
+              })
+            }
+            fold.fold({ kind: 'turn-end', turn: event.data.turn, seq: event.seq })
+            break
           }
-          break
-        default:
-          break
+          case 'user/message':
+          case 'assistant/message':
+          case 'tool/result':
+            // Only append-origin surface events advance a live turn's span.
+            if (event.surfaceOp === 'append') fold.fold({ kind: 'surface', seq: event.seq })
+            // A user message is also a boundary, catching anything that changed between
+            // the last turn's end and this message (a shell command the user ran
+            // themselves, for instance). The turn is read NOW — the scan itself is
+            // asynchronous — and nothing is awaited on the message path.
+            if (event.type === 'user/message') {
+              const openedTurn = fold.inProgressTurn()
+              const sessionId = typeof session.id === 'string' ? session.id : ''
+              if (openedTurn !== null && sessionId !== '') {
+                this.rescan.scan(sessionId, openedTurn).catch(error => {
+                  console.warn('[dsh-rollback] boundary re-scan failed; the host keeps working:', error)
+                })
+              }
+            }
+            break
+          default:
+            break
+        }
+      } catch (error) {
+        console.warn('[dsh-rollback] session/event observer failed; the host keeps working:', error)
       }
     })
 
     // Copy-before-Write for `str_replace_editor`: its canonical value is a
     // rendered string, not {path, before, after}, so read the target BEFORE the
     // tool runs. `write`/`edit` are captured from their result value instead.
+    //
+    // Only the plugin's own read is contained; `next()` is deliberately OUTSIDE the
+    // try. `next()` is the host's continuation — catching it would swallow a real
+    // tool failure and hand the host an apparent success, which is a semantics
+    // change, not a defensive one.
     ctx.on('tools/pre-execute', async (exec, next) => {
       if ((exec as { name?: string }).name !== 'str_replace_editor') return next()
       try {
         await this.captureBefore(exec as Parameters<RollbackService['captureBefore']>[0])
-      } catch {
-        /* a capture read must never block or fail the tool */
+      } catch (error) {
+        // Still never blocks or fails the tool — but no longer silently: a capture
+        // read that stopped working is exactly the kind of thing this must say out
+        // loud, or rollback coverage would decay unobserved.
+        console.warn('[dsh-rollback] tools/pre-execute observer failed; the host keeps working:', error)
       }
       return next()
     })
 
+    // Containment, not a behaviour change: this runs inside the host's tool-result
+    // notification path, so a plugin throw here would surface as a host failure.
     ctx.on('tools/result', (exec, result) => {
-      const callId = (exec as { callId?: string }).callId ?? ''
-      const pending = this.pendingBefore.get(callId)
-      this.pendingBefore.delete(callId)
-      if (result.isError as boolean) return
-      const session = (exec as { agent?: { session?: object } }).agent?.session
-      if (session === undefined) return
-      const sessionObj = session as Session
+      try {
+        const callId = (exec as { callId?: string }).callId ?? ''
+        const pending = this.pendingBefore.get(callId)
+        this.pendingBefore.delete(callId)
+        if (result.isError as boolean) return
+        const session = (exec as { agent?: { session?: object } }).agent?.session
+        if (session === undefined) return
+        const sessionObj = session as Session
 
-      // A tool that reports its own outcome carries the content it left behind; the
-      // pre-read fallback (`str_replace_editor`, whose result value is rendered
-      // text) knows only the BEFORE state, so its `after` is a placeholder, not an
-      // observation.
-      const reported = mutationOf(
-        exec as unknown as MutationActor,
-        (result as { value?: unknown }).value,
-      )
-      const mutation = reported ?? (pending === undefined
-        ? null
-        : {
-            path: pending.path,
-            operation: pending.kind === 'created' ? 'create' : 'update',
-            before: pending.before,
-            after: '',
+        // A tool that reports its own outcome carries the content it left behind; the
+        // pre-read fallback (`str_replace_editor`, whose result value is rendered
+        // text) knows only the BEFORE state, so its `after` is a placeholder, not an
+        // observation.
+        const reported = mutationOf(
+          exec as unknown as MutationActor,
+          (result as { value?: unknown }).value,
+        )
+        const mutation = reported ?? (pending === undefined
+          ? null
+          : {
+              path: pending.path,
+              operation: pending.kind === 'created' ? 'create' : 'update',
+              before: pending.before,
+              after: '',
+            })
+        if (mutation === null) return
+
+        const fold = this.foldFor(sessionObj)
+        fold.fold({ kind: 'fs-mutation', mutation })
+        // The file tools are the plugin's only window onto the workspace; every path
+        // they touch becomes one the boundary re-scan watches from now on. A path
+        // whose content the tool never reported is watched with an unknown content, so
+        // the next check reads it and records nothing rather than treating the
+        // placeholder as an emptied file.
+        const sessionId = typeof sessionObj.id === 'string' ? sessionObj.id : ''
+        if (sessionId !== '') {
+          this.rescan.observe(sessionId, mutation.path, reported === null ? null : reported.after)
+        }
+
+        // Persist the pre-turn content so a later restart can still restore it
+        // (the log only keeps 3-line diff hunks, not whole files), and the content
+        // this touch left behind so a restart can still restore a file a later shell
+        // command removes. The after-state is written only when the tool reported it:
+        // a placeholder would prime the restarted watch list with a content the plugin
+        // never saw.
+        const turn = fold.inProgressTurn()
+        if (turn !== null && sessionId !== '') {
+          appendCheckpoint({
+            sessionId,
+            turn,
+            path: mutation.path,
+            operation: mutation.operation,
+            before: mutation.before,
+            ...(reported === null ? {} : { after: reported.after }),
           })
-      if (mutation === null) return
-
-      const fold = this.foldFor(sessionObj)
-      fold.fold({ kind: 'fs-mutation', mutation })
-      // The file tools are the plugin's only window onto the workspace; every path
-      // they touch becomes one the boundary re-scan watches from now on. A path
-      // whose content the tool never reported is watched with an unknown content, so
-      // the next check reads it and records nothing rather than treating the
-      // placeholder as an emptied file.
-      const sessionId = typeof sessionObj.id === 'string' ? sessionObj.id : ''
-      if (sessionId !== '') {
-        this.rescan.observe(sessionId, mutation.path, reported === null ? null : reported.after)
-      }
-
-      // Persist the pre-turn content so a later restart can still restore it
-      // (the log only keeps 3-line diff hunks, not whole files), and the content
-      // this touch left behind so a restart can still restore a file a later shell
-      // command removes. The after-state is written only when the tool reported it:
-      // a placeholder would prime the restarted watch list with a content the plugin
-      // never saw.
-      const turn = fold.inProgressTurn()
-      if (turn !== null && sessionId !== '') {
-        appendCheckpoint({
-          sessionId,
-          turn,
-          path: mutation.path,
-          operation: mutation.operation,
-          before: mutation.before,
-          ...(reported === null ? {} : { after: reported.after }),
-        })
+        }
+      } catch (error) {
+        console.warn('[dsh-rollback] tools/result observer failed; the host keeps working:', error)
       }
     })
 
     // Restored sessions never republish their seeded log on `session/event`,
     // so rebuild each pickup's fold by replaying the stored log.
-    ctx.on('session/created', (session) => { this.seedFromLog(session as Session) })
+    //
+    // This one is the reason the guard exists at all: it runs while the HOST is
+    // resuming a session, so an unguarded throw from the plugin made the resume
+    // itself fail and every affected conversation render an empty transcript.
+    ctx.on('session/created', (session) => {
+      try {
+        this.seedFromLog(session as Session)
+      } catch (error) {
+        console.warn('[dsh-rollback] session/created observer failed; the host keeps working:', error)
+      }
+    })
     for (const session of this.ctx.sessions.list()) this.seedFromLog(session as Session)
   }
 
@@ -294,20 +416,20 @@ export class RollbackService {
     // transcript no longer shows, naming files from them, and (worst) letting a
     // "created file" recorded there delete a file the user has since recreated. The
     // markers in the log say exactly which ranges are gone.
-    const replaced = replacedSurfaceRanges(session.events as never)
+    const replaced = replacedSurfaceRanges(eventsOf(session) as never)
     // ...and those same turns decide which durable records no longer describe
     // anything real. They must be dropped BEFORE the watch list is primed from the
     // sidecar: a path whose only records belong to removed turns is a file an earlier
     // rollback already deleted, and watching it would turn "it is missing" into a
     // finding on the CURRENT turn — resurrecting it on the next rollback.
     const sessionKey = typeof session.id === 'string' ? session.id : ''
-    if (sessionKey !== '') this.deadTurns.set(sessionKey, deadTurnsOf(session.events as never))
+    if (sessionKey !== '') this.deadTurns.set(sessionKey, deadTurnsOf(eventsOf(session) as never))
     // Keep watching whatever the sidecar still knows — minus those removed turns — so
     // a restarted process notices a shell command that removes one of those files.
     if (sessionKey !== '') this.rescan.prime(sessionKey)
     const durable = loadCheckpoints(String(session.id), this.deadTurns.get(sessionKey))
     const calls = new Map<string, { name: string; argsRaw: string }>()
-    for (const event of session.events) {
+    for (const event of eventsOf(session)) {
       if (isReplacedSeq(event.seq, replaced)) continue
       switch (event.type) {
         case 'tool/call': {
@@ -417,7 +539,10 @@ export class RollbackService {
     // The fold's in-memory surface tail can lag behind the durable session
     // surface (e.g. restored/image turns). The authoritative truncation — and
     // exactly what `execute` shadows — is the session surface itself, so report
-    // THAT for the "对话截断" hint instead of the fold's stale tail.
+    // THAT for the "对话截断" hint instead of the fold's stale tail. Read through
+    // the same clamp `execute` plans with, so the preview cannot promise a range
+    // the marker will not be allowed to replace (the system-prompt node is never
+    // in it; see `planTruncationMarker`).
     const shadowed = shadowedSurfaceFrom(viewOf(session), fromTurn)
     return {
       ...plan,
@@ -512,7 +637,7 @@ export class RollbackService {
     // directory an earlier turn created.
     const removedDirs: string[] = []
     if (deletedHostPaths.length > 0) {
-      const spanStartMs = turnStartTimeMs(session.events as never, fromTurn)
+      const spanStartMs = turnStartTimeMs(eventsOf(session) as never, fromTurn)
       if (spanStartMs === undefined) {
         // No opening time in the log: the creation-time test cannot be made, and this
         // pass fails closed by doing nothing.
@@ -549,13 +674,13 @@ export class RollbackService {
       fromTurn,
       messageId: markerMessageId(),
     })
-    const truncated = markerPlan !== null
+    // A degenerate plan (no range) still lands a marker — the checkpoint text
+    // reaches the model — but replaces nothing, so only a plan WITH a range is a
+    // truncation.
+    const truncated = markerPlan !== null && markerPlan.range !== null
     if (markerPlan !== null) {
       try {
-        const marker = session.append('user/message', markerPlan.data as never, {
-          surfaceOp: markerPlan.surfaceOp,
-          sourceEventSeqs: [...markerPlan.sourceEventSeqs],
-        })
+        const marker = appendRollbackMarker(session, markerPlan)
         fold.setTail(marker.seq)
       } catch (error) {
         // The files are already restored, so this cannot be rolled back silently:
@@ -585,7 +710,7 @@ export class RollbackService {
         fromTurn,
         restored,
         skipped,
-        truncation: markerPlan === null ? null : { start: markerPlan.surfaceOp.start, end: markerPlan.surfaceOp.end },
+        truncation: markerPlan?.range ?? null,
       }, { removedDirs }),
     }
   }

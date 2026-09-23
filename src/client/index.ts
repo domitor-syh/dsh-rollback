@@ -22,14 +22,24 @@ import { FishLogo, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import { footerEntryNeeded } from '../core/turn-entry.ts'
 import { oldestTurnOf } from '../core/rollback-guard.ts'
 
-/** Required services: slots, the `commands` Remote, the conversation node registry, and locale. */
-export const inject = ['slots', 'remote', 'remote.commands', 'conversationEvents', 'locale', 'workspaces']
+/**
+ * Required services: slots, the `commands` Remote, locale, and workspaces.
+ *
+ * The conversation node registry is deliberately NOT named here. 0.1.5 moved it
+ * to `uiConversation.events` and no longer provides `conversationEvents` at all,
+ * and cordis reads a plain array as a REQUIRED set: a name no service ever
+ * provides parks this fiber in "pending" forever, so `apply()` never runs and the
+ * plugin is invisible with no error anywhere — the exact silence this file keeps
+ * having to design against. The registry is therefore acquired dynamically and
+ * the result is audited (see `registerMarkerDefinition`, `auditContracts`).
+ */
+export const inject = ['slots', 'remote', 'remote.commands', 'locale', 'workspaces']
 
 /** Console diagnostics; set to true to debug the client logic. */
 const DEBUG = false
 /** Bundle revision — always reported once at apply, so a stale cached bundle is
  * identifiable in the console instead of looking like "the fix did nothing". */
-const BUNDLE_REV = 15
+const BUNDLE_REV = 18
 function log(...parts: unknown[]): void {
   if (DEBUG) console.info('[rollback]', ...parts)
 }
@@ -48,6 +58,19 @@ function warnOnce(key: string, ...parts: unknown[]): void {
   if (seen[key] === true) return
   seen[key] = true
   console.warn('[rollback]', ...parts)
+}
+
+/**
+ * Report once per key a broken framework contract — the loud half of
+ * {@link warnOnce}, for conditions where the plugin cannot work at all.
+ * @param key - the once-per-key identity of this report.
+ * @param parts - the message and any values worth printing.
+ */
+function errorOnce(key: string, ...parts: unknown[]): void {
+  const seen = errorOnce as unknown as Record<string, boolean>
+  if (seen[key] === true) return
+  seen[key] = true
+  console.error('[rollback]', ...parts)
 }
 
 /** Extract a message from an unknown error. */
@@ -141,6 +164,30 @@ const COMMAND_KEY_PREFIX = COMMAND_KIND.length + ':' + COMMAND_KIND
  * the mutation observer then hid another one on every re-render.
  */
 const MAX_RECEIPT_CHARS = 500
+/**
+ * The qualifier that excludes rows the framework has folded away.
+ *
+ * 0.1.5 collapses rows with `hidden="until-found"` (ui-chat's `useSearchableHidden`)
+ * and its own row sweeps all say `:not([hidden])`. A folded row is not part of the
+ * visible transcript, so a sweep that counted it would answer "what is on screen"
+ * from rows the user cannot see — which is what the rollback passes and the
+ * welcome-hero decision read. The attribute is the plain `hidden` attribute, so on
+ * 0.1.1 (which folds nothing) the qualifier matches every row and both versions
+ * behave identically.
+ */
+const VISIBLE_ROW = ':not([hidden])'
+/** Every chat seat the plugin may act on. */
+const FLOW_ROW_SELECTOR = '[data-chat-flow-key]' + VISIBLE_ROW
+/** Every command receipt seat the plugin may act on. */
+/**
+ * Command receipts, INCLUDING rows DSH folded away with `hidden`.
+ *
+ * Deliberately unqualified: the plugin's own receipts must stay hidden even when the
+ * browser's find-in-page reveals the folded group they sit in. The emptiness decision
+ * is the opposite case — a folded row must not count as standing content — so it keeps
+ * the qualified {@link FLOW_ROW_SELECTOR}.
+ */
+const FLOW_COMMAND_ROW_SELECTOR = '[data-chat-flow-kind="command"][data-chat-flow-key]'
 const hiddenRpcIds: Set<string> = (() => {
   try { return new Set<string>(JSON.parse(localStorage.getItem(RPC_HIDE_KEY) ?? '[]') as string[]) }
   catch { return new Set<string>() }
@@ -163,7 +210,12 @@ function trackRpcId(commandId: unknown): void {
 /** display:none the seats of button-dispatched command executions (removes the flex gap entirely). */
 function syncHiddenRpcRows(): void {
   const ids = [...hiddenRpcIds]
-  for (const el of document.querySelectorAll<HTMLElement>('[data-chat-flow-key]')) {
+  // Kind AND identity, both read from the seat itself. A receipt is a `command`
+  // seat by definition, so restricting the sweep to that kind makes it
+  // impossible for this pass to hide conversation content even if `hiddenRpcIds`
+  // were polluted by a stale bundle or an id arrived short enough to be a suffix
+  // of another key: no content node is ever `data-chat-flow-kind="command"`.
+  for (const el of document.querySelectorAll<HTMLElement>(FLOW_COMMAND_ROW_SELECTOR)) {
     const key = el.getAttribute('data-chat-flow-key') ?? ''
     if (key === '') continue
     // Hard guard, learned the expensive way: a text-based matcher once hid assistant
@@ -189,7 +241,7 @@ function syncHiddenRpcRows(): void {
  */
 function markPendingCommandDispatch(): void {
   const seen = new Set<string>()
-  for (const el of document.querySelectorAll<HTMLElement>('[data-chat-flow-kind="command"][data-chat-flow-key]')) {
+  for (const el of document.querySelectorAll<HTMLElement>(FLOW_COMMAND_ROW_SELECTOR)) {
     const key = el.getAttribute('data-chat-flow-key') ?? ''
     if (key.startsWith(COMMAND_KEY_PREFIX)) seen.add(key.slice(COMMAND_KEY_PREFIX.length))
   }
@@ -200,7 +252,7 @@ function markPendingCommandDispatch(): void {
 function syncPendingRpcRow(): void {
   if (pendingCommandSeen === null) return
   let caught = false
-  for (const el of document.querySelectorAll<HTMLElement>('[data-chat-flow-kind="command"][data-chat-flow-key]')) {
+  for (const el of document.querySelectorAll<HTMLElement>(FLOW_COMMAND_ROW_SELECTOR)) {
     const key = el.getAttribute('data-chat-flow-key') ?? ''
     if (!key.startsWith(COMMAND_KEY_PREFIX)) continue
     const id = key.slice(COMMAND_KEY_PREFIX.length)
@@ -212,6 +264,195 @@ function syncPendingRpcRow(): void {
     pendingCommandSeen = null
     try { localStorage.setItem(RPC_HIDE_KEY, JSON.stringify([...hiddenRpcIds])) } catch { /* session-only */ }
   }
+}
+
+/**
+ * Opening one affected file in the editor, across both DSH generations.
+ *
+ * 0.1.5 deleted `IWorkspaces.openPath`, so the first-party way in is the right
+ * Sidebar's navigation controller: `ctx.sidebarRight.openResource(address)`, with
+ * the address built by `fileAddressFor` — the exact shape `dsh-client-ui-chat` and
+ * `dsh-client-ui-sidebar-files` call it with. `sidebarRight` is resolved through
+ * `ctx.get` and never named in `inject`, for the reason spelled out on the inject
+ * comment above: on a build that lacks it, a plain-array entry would park this
+ * fiber forever.
+ *
+ * The address builder is COPIED here rather than imported. `fileAddressFor` lives in
+ * `@deepseek-ai/dsh-util-workspace-path`, which is not a client module: it declares
+ * no `dsh.client`, ships no browser bundle, and is not one of the frontend's
+ * platform seed words (`react`, `cordis`, `dsh-client-store`,
+ * `dsh-client-ui-slots`, `dsh-client-ui-primitives`, `dsh-client-ui-dockkit`) — the
+ * first-party client bundles inline its source instead of requiring it. A `require`
+ * of it would miss the module table and take the whole client half down at load.
+ */
+const FILE_ADDRESS_PREFIX = 'dsh-resource://file/'
+/** Component-encode one id or path segment, keeping `:` literal for drive letters. */
+function encodeAddressSegment(segment: string): string {
+  return encodeURIComponent(segment).replace(/%3A/gi, ':')
+}
+/** Encode a `/`-separated path segment by segment. */
+function encodeAddressPath(path: string): string {
+  return path.split('/').map(encodeAddressSegment).join('/')
+}
+/** Build the address of a file read through one session. */
+function sessionFileAddress(sessionId: string, path: string): string {
+  const normalized = path.replace(/\\/g, '/').replace(/^(?:\.\/)+/, '')
+  return `${FILE_ADDRESS_PREFIX}session/${encodeAddressSegment(sessionId)}/${encodeAddressPath(normalized)}`
+}
+/** Whether a path uses a Windows drive or UNC prefix. */
+function isWindowsStylePath(value: string): boolean {
+  return /^[A-Za-z]:[/\\]/.test(value) || value.startsWith('\\\\')
+}
+/** Whether a path is absolute in either spelling the host accepts. */
+function isAbsoluteWorkspacePath(path: string): boolean {
+  return path.startsWith('/') || isWindowsStylePath(path)
+}
+/**
+ * The `dsh-resource://file/…` address for a path as this plugin holds it: a
+ * workspace-relative path, or an absolute path inside the session's workspace,
+ * becomes a relative session address; anything else keeps its absolute spelling.
+ * @param sessionId - the session the path is read in.
+ * @param cwd - that session's workspace root, when known.
+ * @param path - absolute or workspace-relative path, in either separator spelling.
+ */
+function fileAddressFor(sessionId: string, cwd: string | undefined, path: string): string {
+  const normalized = path.replace(/\\/g, '/')
+  if (!isAbsoluteWorkspacePath(normalized)) return sessionFileAddress(sessionId, normalized)
+  const root = cwd === undefined ? '' : cwd.replace(/\\/g, '/').replace(/\/+$/, '')
+  if (root !== '' && normalized === root) return sessionFileAddress(sessionId, '')
+  if (root !== '' && normalized.startsWith(`${root}/`)) return sessionFileAddress(sessionId, normalized.slice(root.length + 1))
+  return sessionFileAddress(sessionId, normalized)
+}
+
+/**
+ * The session's workspace root, from the sessions list the way first-party code
+ * reads it. `undefined` is a legal answer (the address builder then keeps an
+ * absolute path absolute), so an unreadable list degrades instead of throwing.
+ * @param ctx - a context able to resolve services.
+ * @param sessionId - the session whose root is wanted.
+ */
+function sessionCwdOf(ctx: any, sessionId: string): string | undefined {
+  try {
+    const row = ctx?.get?.('sessions')?.list?.getSnapshot?.()?.byId?.[sessionId]
+    return typeof row?.cwd === 'string' && row.cwd !== '' ? row.cwd : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Open one path in the editor: the 0.1.5 right-Sidebar route first, the 0.1.1
+ * `workspaces.openPath` route when this build still has it, else a one-time
+ * warning.
+ *
+ * `openResource` is the primary because it is the only route 0.1.5 ships. It can
+ * legitimately refuse (no session surface mounted, or no registered tab type
+ * claims the address), and on a build that still ships `openPath` that refusal
+ * must not leave the click with no effect — so the legacy opener is tried as a
+ * fallback rather than merely skipped. A build with neither is reported once.
+ * @param ctx - the plugin's own context.
+ * @param sessionId - the session the file belongs to.
+ * @param path - the affected file's path, as the preview reported it.
+ */
+async function openFileInEditor(ctx: any, sessionId: string, path: string): Promise<void> {
+  const sidebarRight = ctx?.get?.('sidebarRight')
+  const workspaces = ctx?.get?.('workspaces')
+  const modern = sidebarRight !== undefined && typeof sidebarRight.openResource === 'function' ? sidebarRight : undefined
+  const legacy = workspaces !== undefined && typeof workspaces.openPath === 'function' ? workspaces : undefined
+  if (modern === undefined && legacy === undefined) {
+    warnOnce(
+      'open-editor',
+      'no way to open a file in the editor is available: neither ctx.sidebarRight.openResource (0.1.5) nor ctx.workspaces.openPath (0.1.1) exists',
+    )
+    return
+  }
+  if (modern !== undefined) {
+    try {
+      modern.openResource(fileAddressFor(sessionId, sessionCwdOf(ctx, sessionId), path))
+      return
+    } catch (error) {
+      if (legacy === undefined) {
+        warnOnce('open-resource', 'could not open the file in the right sidebar', path, msg(error))
+        return
+      }
+      warnOnce('open-resource-legacy', 'the right sidebar refused the file address; falling back to workspaces.openPath', path, msg(error))
+    }
+  }
+  try {
+    await legacy!.openPath(path)
+  } catch (error) {
+    warnOnce('open-path', 'workspaces.openPath failed', path, msg(error))
+  }
+}
+
+/**
+ * Rebuild draft attachments for the images a rolled-back turn had, so the composer
+ * holds them again.
+ *
+ * Two generations of the same idea:
+ *
+ * - **0.1.5**: durable bytes are read with `uiConversation.imageUrl(sessionId, ref)`
+ *   (the same loader the transcript images use; it hands back an object URL over
+ *   the stored bytes), turned into a browser `File`, and registered as runtime
+ *   draft attachments with `conversation.createDrafts(sessionId, files)`. That is
+ *   exactly how first-party code attaches a picked or pasted file, and it is what
+ *   makes the bytes ride the next prompt instead of a client-side preview.
+ *   `resolveImage` and `createDraftImages` are gone in 0.1.5, hence the split.
+ * - **0.1.1**: `conversation.resolveImage` + `conversation.createDraftImages`, kept
+ *   verbatim so the older build behaves exactly as it did.
+ *
+ * The two are alternatives, not a chain, and neither is guessed: a build whose
+ * verbs cannot be found is reported once instead of quietly restoring nothing.
+ * A single image that fails (an unreadable attachment, an unsupported type, a
+ * browser that refuses the fetch) is skipped and the rest still restore.
+ * @param ctx - the plugin's own context.
+ * @param sessionId - the session the images belong to.
+ * @param images - the rolled-back turn's image blocks, in order.
+ * @returns the created draft attachment ids, in order, or an empty list.
+ */
+async function restoreDraftImages(
+  ctx: any,
+  sessionId: string,
+  images: { name: string; mediaType: string; attachment: any }[],
+): Promise<string[]> {
+  const conversation = ctx?.get?.('conversation')
+  const uiConversation = ctx?.get?.('uiConversation')
+  if (conversation !== undefined && typeof conversation.createDrafts === 'function'
+    && uiConversation !== undefined && typeof uiConversation.imageUrl === 'function') {
+    const ids: string[] = []
+    for (const img of images) {
+      try {
+        const url: string = await uiConversation.imageUrl(sessionId, img.attachment)
+        const resp = await fetch(url)
+        const blob = await resp.blob()
+        const file = new File([blob], img.name || 'image', { type: img.mediaType || 'image/png' })
+        const drafts = conversation.createDrafts(sessionId, [file])
+        const id = drafts?.[0]?.id
+        if (typeof id === 'string' && id !== '') ids.push(id)
+      } catch { /* skip a failed image */ }
+    }
+    return ids
+  }
+  if (conversation !== undefined && typeof conversation.resolveImage === 'function'
+    && typeof conversation.createDraftImages === 'function') {
+    const ids: string[] = []
+    for (const img of images) {
+      try {
+        const url: string = await conversation.resolveImage(sessionId, img.attachment)
+        const resp = await fetch(url)
+        const blob = await resp.blob()
+        const file = new File([blob], img.name || 'image', { type: img.mediaType || 'image/png' })
+        const drafts = conversation.createDraftImages([file])
+        if (drafts !== null && drafts[0] !== undefined && drafts[0].id !== undefined) ids.push(drafts[0].id)
+      } catch { /* skip a failed image */ }
+    }
+    return ids
+  }
+  warnOnce(
+    'restore-images-api',
+    'no image-restore API is available: neither conversation.createDrafts + uiConversation.imageUrl (0.1.5) nor conversation.resolveImage + createDraftImages (0.1.1) exists, so rolled-back images cannot be re-attached',
+  )
+  return []
 }
 
 /** A `/rollback` command through the shipped Remote, unwrapping its envelope. */
@@ -276,10 +517,38 @@ function turnNoOf(loc: any): number | undefined {
   return typeof n === 'number' && Number.isSafeInteger(n) && n >= 1 ? n : undefined
 }
 
-/** Plain text of the turn-opening user prompt for one turn. */
-function findUserPrompt(snapshot: any, turn: number): string {
-  const order = snapshot?.chat?.order
-  const store = snapshot?.chat?.nodes
+/**
+ * The chat slice every read below works on, from whichever route this DSH
+ * version publishes it on.
+ *
+ * 0.1.5 removed `chat` from the session snapshot and instead hands the chat
+ * target to every session-scoped slot entry as the session kit hook `useChat`
+ * (the standard source `chat` that ui-chat provides). 0.1.1 had no such hook and
+ * carried the slice on the snapshot. Preferring the hook keeps 0.1.5 working and
+ * the fallback keeps 0.1.1 working — with neither, the caller passes undefined
+ * and every read no-ops, so the absence is what {@link auditContracts} and the
+ * driver's own check report.
+ *
+ * The hook is called only when the prop is a function: React forbids a changing
+ * hook order, and this prop is fixed for the whole life of a DSH version, so the
+ * branch is stable — while calling an absent prop would throw.
+ * @param useChat - the session kit hook from props, when this build has one.
+ * @param snapshot - the session snapshot, for the 0.1.1 route.
+ * @returns the chat snapshot, or undefined when this session has none yet.
+ */
+function useChatOrSnapshot(useChat: unknown, snapshot: any): any {
+  const live = typeof useChat === 'function' ? useChat((s: any) => s) : undefined
+  return live ?? snapshot?.chat
+}
+
+/**
+ * Plain text of the turn-opening user prompt for one turn.
+ * @param chat - the chat snapshot slice (see {@link useChatOrSnapshot}).
+ * @param turn - the 1-based turn whose opening prompt is wanted.
+ */
+function findUserPrompt(chat: any, turn: number): string {
+  const order = chat?.order
+  const store = chat?.nodes
   if (!Array.isArray(order) || typeof store?.get !== 'function') return ''
   for (const key of order) {
     const node = store.get(key)
@@ -294,10 +563,14 @@ function findUserPrompt(snapshot: any, turn: number): string {
   return ''
 }
 
-/** Image blocks of a turn-opening user prompt, for re-attaching to the composer. */
-function findUserImages(snapshot: any, turn: number): { name: string; mediaType: string; attachment: any }[] {
-  const order = snapshot?.chat?.order
-  const store = snapshot?.chat?.nodes
+/**
+ * Image blocks of a turn-opening user prompt, for re-attaching to the composer.
+ * @param chat - the chat snapshot slice (see {@link useChatOrSnapshot}).
+ * @param turn - the 1-based turn whose images are wanted.
+ */
+function findUserImages(chat: any, turn: number): { name: string; mediaType: string; attachment: any }[] {
+  const order = chat?.order
+  const store = chat?.nodes
   if (!Array.isArray(order) || typeof store?.get !== 'function') return []
   for (const key of order) {
     const node = store.get(key)
@@ -314,11 +587,16 @@ function findUserImages(snapshot: any, turn: number): { name: string; mediaType:
 /**
  * The turn a finalized assistant `messageId` belongs to, resolved from the chat
  * snapshot. `assistant-actions` fires once per settled turn with its closing
- * message, so this maps the end-of-turn anchor back to its 1-based turn.
+ * message, so this maps the end-of-turn anchor back to its 1-based turn — and an
+ * undefined result is what leaves the rollback button permanently disabled, so
+ * the chat slice has to come from the right route (see {@link useChatOrSnapshot}).
+ * @param chat - the chat snapshot slice.
+ * @param messageId - the closing assistant message's durable id.
+ * @returns the 1-based turn, or undefined when this build published no chat data.
  */
-function turnForMessageId(snapshot: any, messageId: string): number | undefined {
-  const order = snapshot?.chat?.order
-  const store = snapshot?.chat?.nodes
+function turnForMessageId(chat: any, messageId: string): number | undefined {
+  const order = chat?.order
+  const store = chat?.nodes
   if (!Array.isArray(order) || typeof store?.get !== 'function') return undefined
   for (const key of order) {
     const node = store.get(key)
@@ -355,22 +633,88 @@ function toBottomButtons(scrollport: HTMLElement | null): HTMLElement[] {
 }
 
 /**
+ * DSH's "load earlier" paging control, across the shipped locales. 0.1.5 renders
+ * it as the sole button of a `div.older` that is a direct child of the chat
+ * column (`t("chat.loadOlder")`:
+ * dsh-client-ui-chat/lib/client.js:2526-2533, labels at :2639 and :2745).
+ */
+const LOAD_EARLIER_LABELS = new Set(['加载更早', 'Load earlier'])
+
+/**
+ * The visible "load earlier" control of one chat column, or null.
+ *
+ * Identity, not position. An earlier version hid whatever button sat inside the
+ * column's first non-seat child — a guess about layout, and the same class of
+ * inference that once hid conversation rows. The control is recognized by its own
+ * label, and a button whose label cannot be read is never touched, so a layout
+ * change costs a stranded paging button instead of a hidden control the user
+ * needed.
+ * @param column - the chat flow column, when the page has one.
+ * @returns the paging button, or null when none could be identified.
+ */
+function loadEarlierButtonOf(column: HTMLElement | null): HTMLElement | null {
+  if (column === null) return null
+  for (const btn of column.querySelectorAll<HTMLElement>(':scope > div:not([data-chat-flow-key]) button')) {
+    if (LOAD_EARLIER_LABELS.has((btn.textContent ?? '').trim())) return btn
+  }
+  return null
+}
+
+/**
  * The surface cut a rollback-marker node records, or undefined when unreadable.
  *
  * This is the ONE place that knows the marker state's shape, which `start()`
  * writes as a FLAT `{ seq, truncatedFromSeq }` (the event's own seq plus the
- * `surfaceOp.start` it replaced from). Reading it through a stale path is how a
- * working rollback once became a silent no-op: the host truncated the
- * conversation, the client collected zero markers, and nothing was hidden. A
- * marker without a readable cut is therefore reported rather than skipped.
+ * shadowed range's first seq). Reading it through a stale path is how a working
+ * rollback once became a silent no-op: the host truncated the conversation, the
+ * client collected zero markers, and nothing was hidden. A marker without a
+ * readable cut is therefore reported rather than skipped — and skipping it is
+ * what keeps the account safe: an unresolvable marker hides nothing.
  * @param node - a chat node of kind `rollback-marker`.
  * @returns the cut seq, or undefined when the node carries no readable one.
  */
 function markerCutOf(node: any): number | undefined {
   const from = node?.data?.truncatedFromSeq
-  if (typeof from === 'number') return from
-  warnOnce('marker-shape', 'rollback marker node carries no readable cut seq', node?.data)
+  if (typeof from === 'number' && Number.isSafeInteger(from) && from >= 0) return from
+  errorOnce('marker-cut', 'rollback marker node carries no readable cut seq, so its range stays visible', {
+    dataKeys: node?.data === null || node?.data === undefined ? String(node?.data) : Object.keys(node.data as Record<string, unknown>).join(','),
+    truncatedFromSeq: node?.data?.truncatedFromSeq,
+  })
   return undefined
+}
+
+/**
+ * The first shadowed sequence one `replace` surface operation declared.
+ *
+ * 0.1.5 names the two ends `startSeq`/`endSeq`:
+ * `export type SurfaceOp = 'append' | { op: 'replace'; startSeq: SessionSeq; endSeq: SessionSeq }`
+ * (`dsh-session/lib/types/types.d.ts:429-433`), and the validator the CLIENT runs
+ * on every event it receives demands exactly those three keys
+ * (`dsh-session/lib/index.js:262-264`, reached from
+ * `dsh-api-session-controller/lib/types/client/session-wire-event.js:40`) — so a
+ * replace-shaped event the browser can see always carries `startSeq`, and a
+ * reader looking at `start` alone finds nothing on this build. This plugin's own
+ * host half still writes the earlier `start`/`end` spelling, so both are read: a
+ * marker must never be skipped, and a range must never be guessed from the wrong
+ * field.
+ * @param op - the event's surface operation, as the log carries it.
+ * @returns the shadowed range's first seq, or undefined when unreadable.
+ */
+function surfaceCutOf(op: any): number | undefined {
+  for (const candidate of [op?.startSeq, op?.start]) {
+    if (typeof candidate === 'number' && Number.isSafeInteger(candidate) && candidate >= 0) return candidate
+  }
+  return undefined
+}
+
+/** Report once a marker event whose shadowed-range start cannot be read. */
+function reportUnreadableCut(op: any): void {
+  if (surfaceCutOf(op) !== undefined) return
+  errorOnce(
+    'marker-cut-event',
+    'rollback marker event carries no readable shadowed-range start: neither surfaceOp.startSeq (0.1.5) nor surfaceOp.start (<=0.1.1) is a seq, so its range stays visible',
+    { surfaceOpKeys: op === null || typeof op !== 'object' ? String(op) : Object.keys(op as Record<string, unknown>).join(',') },
+  )
 }
 
 /**
@@ -378,11 +722,13 @@ function markerCutOf(node: any): number | undefined {
  *
  * A visible one of these must not hold the welcome hero back once every real
  * message is hidden: `turn-tail` is a per-turn action affordance, and `command`
- * is a slash-command receipt (this plugin hides its own receipts separately).
+ * is a slash-command receipt (this plugin hides its own receipts separately),
+ * and `system-prompt` is the official collapsed prompt-disclosure row: a rollback
+ * to the very first turn leaves exactly those two on an otherwise empty screen.
  * Anything NOT listed counts as content, so an unrecognized kind errs toward
  * keeping the hero away rather than showing it over a message.
  */
-const INFRASTRUCTURE_KINDS = new Set<string>(['turn-tail', 'command'])
+const INFRASTRUCTURE_KINDS = new Set<string>(['turn-tail', 'command', 'system-prompt'])
 
 /**
  * Whether the transcript is currently emptied by a rollback, as {@link syncHides}
@@ -393,34 +739,176 @@ const INFRASTRUCTURE_KINDS = new Set<string>(['turn-tail', 'command'])
  * marker node's own seat — which silently produced nothing whenever that seat was
  * missing, or nested inside a container the hide pass had collapsed. Hosting it
  * ourselves removes that dependency entirely.
+ *
+ * Only a pass that PROVED the emptiness sets it: the log count must be zero AND
+ * no content seat may still be visible (see {@link syncHides}), and every
+ * fail-closed path clears it. A hero standing over a visible transcript is the
+ * one thing this flag must never express.
  */
 const heroWanted = { visible: false }
+
+/**
+ * The attribute marking a seat THIS plugin's rollback passes hid, so those
+ * passes can hand every one of them back the moment they cannot prove what they
+ * are looking at.
+ *
+ * Hiding a row is a claim about durable state — "this row is inside a rollback's
+ * shadowed range". When the claim's inputs stop looking like the shape it was
+ * written against, the only safe answer is "hide nothing", and that also means
+ * restoring whatever an earlier, better-informed pass hid. Only the rollback
+ * passes use this attribute: the receipt sweeps hide by identity for a different
+ * reason and are never revealed here.
+ */
+const RBK_HIDDEN_ATTR = 'data-rbk-hidden'
+/** Seats the rollback passes hid, for the fail-closed restore. */
+const rollbackHiddenSeats = new Set<HTMLElement>()
+
+/** Hide one seat as a rollback side effect, remembering it for the restore. */
+function hideRollbackSeat(el: HTMLElement): void {
+  el.setAttribute(RBK_HIDDEN_ATTR, '')
+  el.style.display = 'none'
+  rollbackHiddenSeats.add(el)
+}
+
+/** Give back one seat — and only one this plugin hid. */
+function revealRollbackSeat(el: HTMLElement): void {
+  rollbackHiddenSeats.delete(el)
+  if (!el.hasAttribute(RBK_HIDDEN_ATTR)) return
+  el.removeAttribute(RBK_HIDDEN_ATTR)
+  el.style.display = ''
+}
+
+/**
+ * Give back every seat the rollback passes hid. The fail-closed direction: a
+ * pass that cannot establish what it is looking at must not leave a transcript
+ * it hid earlier on the strength of a reading it can no longer make.
+ */
+function revealAllRollbackSeats(): void {
+  for (const el of [...rollbackHiddenSeats]) {
+    if (!document.body.contains(el)) {
+      rollbackHiddenSeats.delete(el)
+      continue
+    }
+    revealRollbackSeat(el)
+  }
+}
+
+/** What a chat node actually looks like, for the one loud line a broken shape earns. */
+function nodeShapeOf(node: unknown): string {
+  if (node === null) return 'null'
+  if (node === undefined) return 'undefined'
+  if (typeof node !== 'object') return typeof node
+  const shape = node as { kind?: unknown }
+  return `kind=${String(shape.kind)} keys=[${Object.keys(node as Record<string, unknown>).join(',')}]`
+}
+
+/**
+ * Whether a node's own position provably sits inside a rollback's shadowed
+ * window.
+ *
+ * This is THE content-hiding predicate of this file: `from` is the first seq the
+ * replacement shadowed and `seq` is the marker event's own seq, so the window is
+ * exactly the range the rollback removed. Both the emptiness count and the hide
+ * pass call it, which is what makes them provably agree.
+ * @param markers - the readable marker windows, oldest first.
+ * @param seq - the node's anchor position.
+ * @returns whether this position was rolled back.
+ */
+function coveredByRollback(markers: { from: number; seq: number }[], seq: number): boolean {
+  return markers.some(m => seq >= m.from && seq < m.seq)
+}
+
+/**
+ * Refuse to hide anything, loudly.
+ *
+ * The one outcome this file must never produce is a blank transcript, and every
+ * hide below reads a framework shape. So when the shape is not the one the
+ * passes were written against, they hide NOTHING and give back what they hid
+ * before: a future framework change degrades to "no hiding at all", never to
+ * "hide the conversation".
+ * @param key - once-per-key identity of this report.
+ * @param what - the observation, in the caller's words.
+ * @param observed - the values that made the shape unrecognizable.
+ */
+function failClosedHides(key: string, what: string, observed: unknown): void {
+  heroWanted.visible = false
+  revealAllRollbackSeats()
+  errorOnce(key, 'hiding disabled for this pass: ' + what, observed)
+}
 
 /**
  * Visually hide every chat seat inside a rollback's shadowed range, and reset
  * bottom-follow over a short armed window after a NEW marker lands. Durable-log
  * side effect: hidden seats need no slot because DSH renders them from events
  * this plugin declared non-surface.
+ * @param chat - the chat snapshot slice, resolved by the caller
+ * (see {@link useChatOrSnapshot}); a build that publishes neither route passes
+ * undefined, and the missing contract is reported by the audit, not here.
  */
-function syncHides(snapshot: any): void {
-  const chat = snapshot?.chat
+function syncHides(chat: any): void {
   const order = chat?.order
   const store = chat?.nodes
-  if (!Array.isArray(order) || typeof store?.get !== 'function') return
+
+  // Fail closed on an unrecognized chat slice, before anything is hidden. The
+  // passes below are written against ONE shape — `order` is the array of visible
+  // node keys, `nodes.get(key)` answers for each of them, and every node carries
+  // `kind` plus a numeric `anchorSeq` (0.1.5:
+  // dsh-client-ui-chat/lib/types/client/contract/snapshot.d.ts:20-29 and
+  // chat-nodes.d.ts:3-20) — so a build that publishes anything else gets "no
+  // hiding at all" plus one loud line, not a computation on missing fields.
+  if (!Array.isArray(order)) {
+    failClosedHides('hides-order', 'the chat slice has no readable node order (order is not an array)', {
+      orderType: typeof order,
+      chatKeys: chat === null || chat === undefined ? 'no chat slice' : Object.keys(chat).join(','),
+    })
+    return
+  }
+  if (typeof store?.get !== 'function') {
+    failClosedHides('hides-store', 'the chat node store has no get(key) reader', {
+      storeType: typeof store,
+      storeKeys: store === null || store === undefined ? String(store) : Object.keys(store).join(','),
+    })
+    return
+  }
+
+  // Read every node ONCE, before any hiding. The emptiness count, the marker
+  // windows and the hide pass then provably see the same nodes, so no pass can
+  // hide a row another pass counted as standing content.
+  const nodes: { key: string; node: any }[] = []
+  for (const key of order) {
+    nodes.push({ key, node: typeof key === 'string' ? store.get(key) : undefined })
+  }
+  if (nodes.length > 0 && !nodes.some(entry => typeof entry.node?.anchorSeq === 'number')) {
+    // Either the store answers for none of its own keys, or the assembled nodes
+    // moved the position to another field: in both cases no range can be bounded
+    // and no emptiness can be established, so nothing may be hidden.
+    const sample = nodes.find(entry => entry.node !== undefined && entry.node !== null) ?? nodes[0]!
+    failClosedHides('hides-anchor', 'no chat node carries a numeric anchorSeq, so neither a rollback range nor an emptiness can be established', {
+      orderLength: nodes.length,
+      sampleKey: sample.key,
+      sampleNode: nodeShapeOf(sample.node),
+    })
+    return
+  }
 
   const seatByKey = new Map<string, HTMLElement>()
-  for (const el of document.querySelectorAll<HTMLElement>('[data-chat-flow-key]')) {
+  for (const el of document.querySelectorAll<HTMLElement>(FLOW_ROW_SELECTOR)) {
     const k = el.getAttribute('data-chat-flow-key')
     if (k !== null) seatByKey.set(k, el)
   }
 
   const markers: { from: number; seq: number }[] = []
-  for (const key of order) {
-    const node = store.get(key)
+  for (const { node } of nodes) {
     if (node?.kind !== 'rollback-marker') continue
     const from = markerCutOf(node)
-    const seq = typeof node?.data?.seq === 'number' ? node.data.seq : node?.anchorSeq
     if (from === undefined) continue
+    const seq = typeof node?.data?.seq === 'number' ? node.data.seq : node?.anchorSeq
+    // A marker whose own position is unreadable cannot bound a window: it hides
+    // nothing, which is the only safe reading of an unresolvable marker.
+    if (typeof seq !== 'number') {
+      errorOnce('marker-seq', 'rollback marker node carries no readable seq, so its range stays visible', nodeShapeOf(node))
+      continue
+    }
     markers.push({ from, seq })
   }
   // A session with no rollback marker must CLEAR the flag, not skip past it:
@@ -429,6 +917,7 @@ function syncHides(snapshot: any): void {
 // conversation opened afterwards — until a page reload reset the module.
   if (markers.length === 0) {
     heroWanted.visible = false
+    revealAllRollbackSeats()
     return
   }
 
@@ -436,8 +925,7 @@ function syncHides(snapshot: any): void {
   const latestSeq = latest.seq
 
   let hasContentAfter = false
-  for (const key of order) {
-    const node = store.get(key)
+  for (const { node } of nodes) {
     const seq = node?.anchorSeq
     if (typeof seq === 'number' && seq > latestSeq && node?.kind !== 'rollback-marker') { hasContentAfter = true; break }
   }
@@ -450,13 +938,12 @@ function syncHides(snapshot: any): void {
 // or is still standing content, and the transcript is empty when nothing is left
 // standing.
   let contentLeft = 0
-  for (const key of order) {
-    const node = store.get(key)
+  for (const { node } of nodes) {
     const seq = node?.anchorSeq
     if (typeof seq !== 'number') continue
     if (node?.kind === 'rollback-marker') continue
     if (INFRASTRUCTURE_KINDS.has(node?.kind)) continue
-    if (markers.some(m => seq >= m.from && seq < m.seq)) continue
+    if (coveredByRollback(markers, seq)) continue
     contentLeft += 1
   }
   const emptied = contentLeft === 0
@@ -466,8 +953,7 @@ function syncHides(snapshot: any): void {
   // seat never appeared is reported, since it still explains an empty page.
   let hidden = 0
   let markerSeats = 0
-  for (const key of order) {
-    const node = store.get(key)
+  for (const { key, node } of nodes) {
     if (node?.kind !== 'rollback-marker') continue
     const el = seatByKey.get(key)
     if (el === undefined) {
@@ -475,41 +961,67 @@ function syncHides(snapshot: any): void {
       continue
     }
     markerSeats += 1
-    el.style.display = 'none'
+    hideRollbackSeat(el)
     hidden += 1
   }
 
-  // Pass 3 — hide every seat a rollback covered, and — while the hero is up —
-  // every seat that is still visible. An emptied transcript has no content left
-  // by definition (Pass 1 proved it), so what remains are log-only rows that sit
-  // BEFORE the rollback point and were never in the model's context: permission
-  // switches (the host `/permission` command's receipt) and turn tails. Leaving
-  // one above the welcome page reads as a broken screen, and hiding it cannot
-  // desync the model, because the model never saw it. Those rows return with the
-  // transcript's content, since a rollback only removes the range it targeted.
-  for (const key of order) {
+  // Pass 3 — hide exactly the seats a rollback's range covers, and nothing else.
+  //
+  // `coveredByRollback` is the ONLY rule here that can hide content, and it is a
+  // proof about one row: this node's own seq sits inside a marker's shadowed
+  // window. An emptiness COUNT is not a proof about a row and therefore never
+  // hides one — a hidden message cannot be recovered by the user, while a
+  // stranded log-only row is cosmetic. So `emptied` adds only rows whose kind is
+  // in INFRASTRUCTURE_KINDS: permission receipts and turn tails sit before the
+  // rollback point, were never in the model's context, and must not strand above
+  // the welcome page. Every other kind is content and stays.
+  for (const { key, node } of nodes) {
     const el = seatByKey.get(key)
     if (el === undefined) continue
-    const node = store.get(key)
     const seq = node?.anchorSeq
     if (typeof seq !== 'number' || node?.kind === 'rollback-marker') continue
-    const hide = emptied || markers.some(m => seq >= m.from && seq < m.seq)
-    el.style.display = hide ? 'none' : ''
-    if (hide) hidden += 1
+    const strayInfrastructure = emptied && INFRASTRUCTURE_KINDS.has(node?.kind)
+    if (coveredByRollback(markers, seq) || strayInfrastructure) {
+      hideRollbackSeat(el)
+      hidden += 1
+    } else {
+      revealRollbackSeat(el)
+    }
   }
 
   // The hero stands in for an emptied transcript, and only for one a ROLLBACK
   // emptied — `markers` is non-empty here, since this pass returns early without
-  // one, and a session that never had content therefore never reaches it.
-  heroWanted.visible = emptied
+  // one, and a session that never had content therefore never reaches it. It also
+  // needs the DOM to agree: a content seat still visible after Pass 3 keeps the
+  // welcome page away, because "the log says empty" and "the screen is empty" are
+  // two different readings and the second one is the one the user sees. A seat
+  // whose kind cannot be read counts as content, so an unrecognized kind errs
+  // toward showing the transcript.
+  let contentSeatsVisible = 0
+  for (const { key, node } of nodes) {
+    if (node?.kind === 'rollback-marker') continue
+    if (INFRASTRUCTURE_KINDS.has(node?.kind)) continue
+    const el = seatByKey.get(key)
+    if (el === undefined || el.style.display === 'none') continue
+    contentSeatsVisible += 1
+  }
+  heroWanted.visible = emptied && contentSeatsVisible === 0
 
   const column = document.querySelector<HTMLElement>('[data-chat-flow=""]')
 
-  // An emptied transcript also stops offering "load more": there is no earlier
-  // range left to reach for.
-  if (emptied) {
-    const loadMoreBtn = column === null ? null : column.querySelector<HTMLElement>(':scope > div:not([data-chat-flow-key]) button')
-    if (loadMoreBtn !== null) loadMoreBtn.style.display = 'none'
+  // An emptied transcript also stops offering "load earlier": there is no earlier
+  // range left to reach for. Hiding is identity-gated — the control is the button
+  // DSH labels "加载更早" / "Load earlier", never merely "the first button inside
+  // the column", which is a guess about layout rather than a fact about the
+  // control. It is also gated on the PROVEN empty state (the hero's), not on the
+  // count: hiding a paging control is only true once nothing is left to page to.
+  if (heroWanted.visible) {
+    const loadEarlier = loadEarlierButtonOf(column)
+    if (loadEarlier === null) {
+      warnOnce('load-earlier', 'no readable "load earlier" control was found in the emptied transcript', { columnPresent: column !== null })
+    } else {
+      hideRollbackSeat(loadEarlier)
+    }
   }
 
   const sig = (emptied ? 'f' : 'p') + ':' + latestSeq + ':' + (hasContentAfter ? 'restart' : 'clean') + ':' + hidden
@@ -526,6 +1038,8 @@ function syncHides(snapshot: any): void {
       markerSeats,
       seatsInDom: seatByKey.size,
       contentLeft,
+      contentSeatsVisible,
+      emptied,
       hiddenSeats: hidden,
       hero: heroWanted.visible ? 'wanted' : 'no',
     })
@@ -559,6 +1073,13 @@ function syncHides(snapshot: any): void {
  * reliable: revealing the marker node's own seat depended on that seat existing
  * and on nothing above it having been collapsed, and a rollback that hid the
  * whole transcript could therefore show nothing at all.
+ *
+ * This pass can only ever ADD an element (and take it back): it never hides a
+ * seat, so a wrong input here cannot blank the transcript. Its one real risk is
+ * that the column belongs to React, which knows nothing about a foreign child —
+ * so the host is inserted only when the PROVEN empty state asks for it, always as
+ * the last child, and it is removed the moment the flag clears (including on
+ * driver unmount), which keeps React's own appends below it and the hero last.
  * @param ref - the driver's host slot.
  * @param setOn - React state setter; React bails out when the value is unchanged.
  */
@@ -601,16 +1122,17 @@ function syncHeroHost(ref: { current: HTMLElement | null }, setOn: (on: boolean)
 let openRollbackDialog: ((turn: number) => void) | null = null
 
 /** The rollback action rendered on each finalized assistant message's action strip. */
-function RollbackAction({ messageId, useSession, t }: any): React.ReactElement | null {
+function RollbackAction({ messageId, useSession, useChat, t }: any): React.ReactElement | null {
   if (typeof useSession !== 'function') {
     // Never silent: a missing button must always be traceable to a reason.
     warnOnce('action-session', 'assistant action lacks useSession')
     return null
   }
   const snapshot = useSession((s: any) => s)
+  const chat = useChatOrSnapshot(useChat, snapshot)
   const oldest = useRollbackOldest()
   const open = snapshot?.running === true
-  const turn = React.useMemo(() => turnForMessageId(snapshot, messageId), [snapshot, messageId])
+  const turn = React.useMemo(() => turnForMessageId(chat, messageId), [chat, messageId])
   const blocked = turn !== undefined && oldest !== null && turn < oldest
   const disabled = open || turn === undefined || blocked
   const label = open ? t('action.running') : t('action.label')
@@ -728,9 +1250,37 @@ interface DriverProps {
   list: () => Promise<string>
   openFile: (path: string) => Promise<void>
   useSession: <T>(selector: (snapshot: any) => T) => T
+  /**
+   * The session kit hook carrying the chat target (0.1.5). Absent on 0.1.1,
+   * where the same data sits on the session snapshot — see
+   * {@link useChatOrSnapshot}, which resolves both.
+   */
+  useChat?: (selector: (snapshot: any) => any) => any
   t: (key: RollbackKey) => string
-  inputActions?: { setDraft(text: string): void; addImages?(ids: readonly string[]): boolean; pruneImages?(ids: readonly string[]): void }
+  /**
+   * The session input action face. 0.1.5 renamed the attachment verbs
+   * (`addAttachments` / `pruneAttachments`) and kept `setDraft`; 0.1.1 published
+   * `addImages` / `pruneImages`. Both spellings stay optional here and are
+   * feature-detected at the call site, so one bundle serves both builds.
+   */
+  inputActions?: {
+    setDraft(text: string): void
+    addAttachments?(ids: readonly string[]): boolean
+    addImages?(ids: readonly string[]): boolean
+    pruneAttachments?(ids: readonly string[]): void
+    pruneImages?(ids: readonly string[]): void
+  }
+  /**
+   * Rebuild draft attachments for images a rolled-back turn had attached.
+   * @returns the draft attachment ids that were created, in the input order.
+   */
   restoreImages?: (images: { name: string; mediaType: string; attachment: any }[]) => Promise<string[]>
+  /**
+   * Release draft attachments the input refused (0.1.5's `addAttachments` returns
+   * false while a submission is in flight). Mirrors first-party code, which
+   * releases the descriptors it just created when the shell declines them.
+   */
+  releaseImages?: (ids: readonly string[]) => void
 }
 
 /**
@@ -739,14 +1289,25 @@ interface DriverProps {
  * confirmation dialog, opened from the assistant action through the module
  * bridge. Renders nothing into its own dock seat.
  */
-function RollbackDriver({ preview, execute, list, openFile, useSession, inputActions, restoreImages, t }: DriverProps): React.ReactElement | null {
+function RollbackDriver({ preview, execute, list, openFile, useSession, useChat, inputActions, restoreImages, releaseImages, t }: DriverProps): React.ReactElement | null {
   if (typeof useSession !== 'function') {
     warnOnce('useSession', 'props lack useSession', Object.keys({ useSession }))
     return null
   }
-  const snapshotRef = React.useRef<any>(null)
+  const chatRef = React.useRef<any>(undefined)
   const ensureRef = React.useRef<() => void>(() => {})
   const snapshot = useSession((s: any) => s)
+  // Both chat routes are resolved here, once per render: the hide pass and the
+  // post-rollback draft restore read the slice through `chatRef`, so they always
+  // see the newest of whichever route this build publishes it on.
+  const chat = useChatOrSnapshot(useChat, snapshot)
+  // The exact form of the contract break the start-up audit can only
+  // approximate: with no route at all, every read below is undefined, the hide
+  // pass no-ops and the button stays disabled for the whole session — reported
+  // once, so it cannot be mistaken for a button that is disabled by design.
+  if (typeof useChat !== 'function' && chat === undefined && snapshot !== undefined) {
+    errorOnce('chat-snapshot', 'framework contract mismatch: no chat snapshot — neither the session kit hook "useChat" nor snapshot.chat is available, so no turn can be resolved and the rollback button will never enable')
+  }
 
   const [dialogTurn, setDialogTurn] = React.useState<number | null>(null)
   const [files, setFiles] = React.useState<PreviewFile[] | null>(null)
@@ -766,7 +1327,7 @@ function RollbackDriver({ preview, execute, list, openFile, useSession, inputAct
   // Expose the opener to the assistant action; heartbeat + side-effect passes.
   React.useEffect(() => {
     openRollbackDialog = openDialog
-    snapshotRef.current = snapshot
+    chatRef.current = chat
     // Learn which turns the host can still roll back to, so entries for turns whose
     // checkpoints were evicted grey out instead of opening a dialog that would plan
     // from the wrong (oldest retained) records. Published once per session; a
@@ -777,7 +1338,16 @@ function RollbackDriver({ preview, execute, list, openFile, useSession, inputAct
     )
     let raf = 0
     const ensure = () => {
-      try { syncHides(snapshotRef.current) } catch (e) { warnOnce('sync-hides', 'syncHides threw', e) }
+      try {
+        syncHides(chatRef.current)
+      } catch (error) {
+        // A pass that died halfway may have hidden rows and left `heroWanted`
+        // standing on a reading it never finished. Both are undone here: an
+        // exception is not a proof, and a blank transcript is not a diagnosis.
+        heroWanted.visible = false
+        revealAllRollbackSeats()
+        warnOnce('sync-hides', 'syncHides threw', error)
+      }
       try { syncHiddenRpcRows() } catch (e) { warnOnce('sync-rpc-rows', 'syncHiddenRpcRows threw', e) }
       try { syncHeroHost(heroHostRef, setHeroOn) } catch (e) { warnOnce('sync-hero', 'syncHeroHost threw', e) }
     }
@@ -802,13 +1372,22 @@ function RollbackDriver({ preview, execute, list, openFile, useSession, inputAct
   }, [])
 
   React.useEffect(() => {
-    snapshotRef.current = snapshot
+    chatRef.current = chat
     ensureRef.current()
   })
 
   const confirm = () => {
     if (dialogTurn === null) return
     const turn = dialogTurn
+    // Read the turn's prompt and images from the LIVE snapshot before the host is
+    // asked to truncate it. The post-rollback read below is the normal route, but
+    // it races the client's own surface-replacement handling: once that lands the
+    // rolled-back nodes can already be gone, and the restore would silently have
+    // nothing to restore — the exact "images came back? no" outcome this feature
+    // exists to prevent. A pre-read cannot be worse: the values are identical
+    // whenever the later read still sees the nodes.
+    const promptBefore = findUserPrompt(chatRef.current, turn)
+    const imagesBefore = findUserImages(chatRef.current, turn)
     setBusy(true)
     setError(null)
     markPendingCommandDispatch()
@@ -820,16 +1399,37 @@ function RollbackDriver({ preview, execute, list, openFile, useSession, inputAct
         // same call, so the durable marker is already in the log: refresh now and
         // the hide rule below applies it.
         ensureRef.current()
-        const prompt = findUserPrompt(snapshotRef.current, turn)
-        const images = findUserImages(snapshotRef.current, turn)
+        const prompt = findUserPrompt(chatRef.current, turn) || promptBefore
+        const images = findUserImages(chatRef.current, turn)
+        const restored = images.length > 0 ? images : imagesBefore
         if (inputActions !== undefined) {
           inputActions.setDraft(prompt)
-          if (inputActions.pruneImages !== undefined) inputActions.pruneImages([])
+          // Drop whatever the composer still holds BEFORE the restored ids go in,
+          // so the rail ends up holding exactly the rolled-back turn's images.
+          // 0.1.5 renamed this verb; both spellings are the same "keep only these
+          // live ids" call, and an empty list therefore empties the rail.
+          if (inputActions.pruneAttachments !== undefined) inputActions.pruneAttachments([])
+          else if (inputActions.pruneImages !== undefined) inputActions.pruneImages([])
         }
-        if (images.length > 0 && restoreImages !== undefined && inputActions?.addImages !== undefined) {
-          restoreImages(images).then(ids => {
-            if (ids.length > 0) inputActions.addImages!(ids)
-          }).catch(() => {})
+        if (restored.length > 0 && restoreImages !== undefined && inputActions !== undefined) {
+          const add = inputActions.addAttachments !== undefined
+            ? (ids: readonly string[]) => inputActions.addAttachments!(ids)
+            : inputActions.addImages !== undefined
+              ? (ids: readonly string[]) => inputActions.addImages!(ids)
+              : undefined
+          if (add === undefined) {
+            warnOnce('input-add-attachments', 'input actions expose neither addAttachments (0.1.5) nor addImages (0.1.1), so the rolled-back images cannot be re-attached')
+          } else {
+            restoreImages(restored).then(ids => {
+              if (ids.length === 0) return
+              // A refused append (a submission is in flight) must not leave the
+              // drafts this call just created registered: first-party code releases
+              // them in exactly this case.
+              if (add(ids) === false) releaseImages?.(ids)
+            }, (e: unknown) => {
+              warnOnce('restore-images', 'could not rebuild the composer attachments of the rolled-back turn', e)
+            })
+          }
         }
       },
       (e: unknown) => { setBusy(false); setError(msg(e)) },
@@ -891,23 +1491,35 @@ const markerDefinition = {
     if (op === undefined || op === 'append' || op?.op !== 'replace') return null
     // Current builds: a `user/message` stamped with this plugin's provenance.
     // Its content is the model-facing checkpoint text, so the client reads the
-    // rolled-back range from the EVENT (`surfaceOp.start`) instead.
+    // rolled-back range from the EVENT (`surfaceOp.startSeq`/`start`) instead.
     if (event?.type === 'user/message') {
       const source = event?.data?.source
       if (source?.kind !== 'plugin' || source?.plugin !== 'rollback') return null
+      reportUnreadableCut(op)
       return { id: String(event.seq), role: 'start' }
     }
     // Legacy builds (<= 852c656): an empty-content `assistant/message` whose
     // message carried the rollback facts. Still recognized so an old session's
     // markers keep hiding their range.
     if (event?.type === 'assistant/message' && event?.data?.message?.rollback !== undefined) {
+      reportUnreadableCut(op)
       return { id: String(event.seq), role: 'start' }
     }
     return null
   },
+  // 0.1.5 refuses an undefined state outright — `requireState` throws
+  // `conversation Definition "…" returned undefined from start()`
+  // (dsh-client-ui-conversation/lib/client.js:2165-2168), and that throw lands
+  // inside the conversation view's own assembly, which leaves the transcript
+  // EMPTY. Returning undefined here is therefore not a missing feature but a
+  // blank conversation, so this always answers with a state object: an
+  // unreadable cut yields a state whose `truncatedFromSeq` is absent, which
+  // `markerCutOf` reports and skips. The marker then hides nothing, which is the
+  // only acceptable failure for a range that cannot be established.
   start: (_context: any, match: any) => {
-    const from = match?.event?.surfaceOp?.start
-    return typeof from === 'number' ? { seq: match.event.seq, truncatedFromSeq: from } : undefined
+    const event = match?.event
+    const seq = typeof event?.seq === 'number' && Number.isSafeInteger(event.seq) ? event.seq : 0
+    return { seq, truncatedFromSeq: surfaceCutOf(event?.surfaceOp) }
   },
   update: (context: any) => context.state,
   buildViewNode: (context: any) => {
@@ -924,6 +1536,149 @@ const markerDefinition = {
       data: context.state,
     }
   },
+}
+
+/**
+ * The conversation-node registry this DSH build ships, in preference order.
+ *
+ * 0.1.5 keeps it on `uiConversation` (`uiConversation.events`, a
+ * `ConversationEventRegistry`); 0.1.1 provided the same role as a service of its
+ * own, `conversationEvents`. Both are looked up through `ctx.get`, which needs no
+ * `inject` entry and returns undefined while the providing fiber is inactive — so
+ * this answers "can the registry be used right now", not "does the package
+ * exist". Naming either one in `inject` is what must never happen (see the
+ * `inject` comment): the other version would park the fiber forever.
+ * @param ctx - a context able to resolve services.
+ * @returns the registry, or undefined when neither route is available.
+ */
+function eventRegistryOf(ctx: any): any {
+  const modern = ctx?.get?.('uiConversation')?.events
+  if (modern !== undefined && typeof modern.register === 'function') return modern
+  const legacy = ctx?.get?.('conversationEvents')
+  if (legacy !== undefined && typeof legacy.register === 'function') return legacy
+  return undefined
+}
+
+/** Whether the marker Definition is registered, and for which plugin context. */
+let markerRegistered = false
+let markerOwner: any = null
+
+/**
+ * Register the marker Definition on whichever registry this build ships.
+ *
+ * Exactly once per plugin context: `register` THROWS when the kind is already
+ * taken, and both registries could exist in one future composition, so the two
+ * waits in `apply()` must not race into a duplicate. A different (new) plugin
+ * context re-attempts the registration instead of trusting the flag, because a
+ * registration belongs to the fiber that made it — a re-run whose anchor silently
+ * vanished is precisely the failure mode this file exists to prevent, and a
+ * still-live Definition turns the second attempt into the reported duplicate
+ * rather than into two markers.
+ *
+ * The registry owns the registration's lifetime through the CALLER's context
+ * (cordis rebinds the service to the caller), so passing the plugin's own `ctx`
+ * — never an injected child's — ties the marker to this plugin and not to a
+ * transient dependency wait.
+ * @param ctx - the plugin's own context.
+ * @returns whether a registry was found (and now carries the Definition).
+ */
+function registerMarkerDefinition(ctx: any): boolean {
+  if (markerRegistered && markerOwner === ctx) return true
+  const registry = eventRegistryOf(ctx)
+  if (registry === undefined) return false
+  try {
+    registry.register(markerDefinition)
+  } catch (error) {
+    // Already registered: the durable anchor exists either way, so a duplicate is
+    // not a failure — but it IS printed, because a foreign owner of
+    // `rollback-marker` would otherwise look exactly like success.
+    warnOnce('marker-dup', 'rollback marker Definition is already registered on this registry', msg(error))
+  }
+  markerRegistered = true
+  markerOwner = ctx
+  return true
+}
+
+/**
+ * Whether the session kit declares the 0.1.5 `chat` hook (delivered to entries as
+ * the `useChat` prop).
+ *
+ * It is read from the live session-standard roster — the very object the renderer
+ * turns into props — rather than guessed from a version number. The roster lists
+ * every DECLARED hook even while no Session is selected, so the answer is about
+ * the composition, not about the current conversation.
+ * @param ctx - a context able to resolve services.
+ * @returns true/false when the roster is readable, undefined when this build has
+ * no readable roster (the audit then stays silent instead of guessing).
+ */
+function chatHookDeclared(ctx: any): boolean | undefined {
+  const hooks = ctx?.get?.('uiSession')?.adapter?.current?.getSnapshot?.()?.hooks
+  if (hooks === null || typeof hooks !== 'object') return undefined
+  return Object.prototype.hasOwnProperty.call(hooks, 'chat')
+}
+
+/**
+ * How long the start-up audit keeps re-checking before it reports (ms), and how
+ * often it looks in that window. The wait exists because a MISSING seam and a
+ * NOT-YET-MOUNTED one are indistinguishable at boot: our bundle may be applied
+ * before the plugin that ships the seam (nothing makes ui-chat load first), so a
+ * single early check would name a healthy composition as broken. A seam that is
+ * still absent after this window is a real mismatch for this page load.
+ */
+const AUDIT_WINDOW_MS = 8000
+const AUDIT_INTERVAL_MS = 500
+
+/**
+ * The framework seams this bundle needs and cannot find right now, by name.
+ *
+ * The chat hook is audited only where the modern registry route is in play,
+ * because that is by definition the route that moved chat off the session
+ * snapshot: on the legacy route `snapshot.chat` is the expected source, so a
+ * roster without a `chat` hook proves nothing there.
+ * @param ctx - the plugin's own context.
+ * @returns one message per missing seam, empty when both are present.
+ */
+function missingContracts(ctx: any): string[] {
+  const missing: string[] = []
+  if (!markerRegistered) {
+    missing.push('conversation-node registry — neither ctx.get("uiConversation").events nor ctx.get("conversationEvents") is available, so the rollback marker cannot be anchored')
+  }
+  if (ctx?.get?.('uiConversation')?.events !== undefined && chatHookDeclared(ctx) === false) {
+    missing.push('chat snapshot hook — the session kit declares no "chat" hook, so no useChat prop reaches the entries and 0.1.5 has no snapshot.chat to fall back to')
+  }
+  return missing
+}
+
+/**
+ * Start-up audit of the two framework seams this bundle cannot work without,
+ * reported LOUDLY and by name.
+ *
+ * Written for the failure this port hit: the browser half loaded, `apply()` never
+ * ran because a service it named no longer existed, and a plugin that renders
+ * nothing is indistinguishable from a plugin that was never installed. "It does
+ * nothing" is not a diagnosis, so each seam is named individually — and only
+ * after {@link AUDIT_WINDOW_MS} of re-checking, so a seam that merely arrives
+ * late is never reported. The driver reports the chat half again per session,
+ * where the props make it directly observable.
+ * @param ctx - the plugin's own context.
+ */
+function auditContracts(ctx: any): void {
+  const deadline = Date.now() + AUDIT_WINDOW_MS
+  const check = (): void => {
+    const missing = missingContracts(ctx)
+    if (missing.length === 0) return
+    if (Date.now() < deadline) {
+      setTimeout(check, AUDIT_INTERVAL_MS)
+      return
+    }
+    errorOnce('contracts', 'framework contract mismatch: ' + missing.join('; ')
+      + ' — still missing ' + (AUDIT_WINDOW_MS / 1000) + 's after the client applied')
+  }
+  // The first check lands on a macrotask, because the `ctx.inject` waits in
+  // `apply()` run on a microtask: checking synchronously would report a healthy
+  // service as absent.
+  if (typeof setTimeout === 'function') setTimeout(check, 0)
+  else check()
 }
 
 /** The marker node's view: nothing at all.
@@ -969,7 +1724,20 @@ export function apply(ctx: any): void {
   // The marker node is the durable anchor `syncHides` reads the truncated range
   // from, and it renders the welcome hero when its rollback emptied the surface
   // (see RollbackMarkerView) — an ordinary rollback renders no divider.
-  ctx.conversationEvents.register(markerDefinition)
+  //
+  // The registry is acquired dynamically (see `eventRegistryOf`): a synchronous
+  // hit is the normal case, and the `ctx.inject` waits cover a service that only
+  // becomes active later. Each wait names ONE service, because a plain array is a
+  // required SET in cordis and a single wait for both would be parked forever by
+  // whichever one this build lacks — the very bug this registration replaces.
+  if (!registerMarkerDefinition(ctx) && typeof ctx.inject === 'function') {
+    ctx.inject(['uiConversation'], () => { registerMarkerDefinition(ctx) })
+    ctx.inject(['conversationEvents'], () => { registerMarkerDefinition(ctx) })
+  }
+
+  // The audit re-checks over a short window (see `auditContracts`): its first
+  // check lands on a macrotask, because the waits above run on a microtask.
+  auditContracts(ctx)
 
   ctx.slots.inject('conversation.chat.node', () => ctx.slots.register(
     { name: 'conversation.chat.node', key: 'rollback-marker', locale: NS },
@@ -1020,22 +1788,15 @@ export function apply(ctx: any): void {
           await extCommand(ctx, sessionId, '/rollback ' + turn)
         },
         list: async () => (await extCommand(ctx, sessionId, '/rollback list')).text ?? '',
-        openFile: (path: string) => ctx.workspaces.openPath(path),
-        restoreImages: async (images: { name: string; mediaType: string; attachment: any }[]): Promise<string[]> => {
+        openFile: (path: string) => openFileInEditor(ctx, sessionId, path),
+        restoreImages: (images: { name: string; mediaType: string; attachment: any }[]) =>
+          restoreDraftImages(ctx, sessionId, images),
+        releaseImages: (ids: readonly string[]) => {
           const conversation = ctx.get?.('conversation')
-          if (conversation === undefined || conversation.resolveImage === undefined || conversation.createDraftImages === undefined) return []
-          const ids: string[] = []
-          for (const img of images) {
-            try {
-              const url: string = await conversation.resolveImage(sessionId, img.attachment)
-              const resp = await fetch(url)
-              const blob = await resp.blob()
-              const file = new File([blob], img.name || 'image', { type: img.mediaType || 'image/png' })
-              const drafts = conversation.createDraftImages([file])
-              if (drafts !== null && drafts[0] !== undefined && drafts[0].id !== undefined) ids.push(drafts[0].id)
-            } catch { /* skip a failed image */ }
+          if (conversation?.releaseDraftAttachment === undefined) return
+          for (const id of ids) {
+            try { conversation.releaseDraftAttachment(id) } catch { /* best effort */ }
           }
-          return ids
         },
       }),
     }, RollbackDriver)

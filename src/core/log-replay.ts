@@ -34,6 +34,36 @@ export interface ReplacedRange {
 const ROLLBACK_PLUGIN = 'rollback'
 
 /**
+ * The inclusive range one marker's surface op declares, whichever way it is spelled.
+ *
+ * DSH 0.1.5 renamed the two ends: `SurfaceOp` is now
+ * `{ op: 'replace'; startSeq: SessionSeq; endSeq: SessionSeq }` and the validator
+ * demands exactly those three keys, where <=0.1.1 used `start`/`end`. Both are
+ * read because the log outlives the build that wrote it — the same session file
+ * holds markers written before the upgrade and after it, and a marker whose range
+ * goes unread is precisely the bug this module exists to prevent: its turns come
+ * back as phantoms, offering turns the transcript no longer shows and letting a
+ * "created file" recorded there delete a file the user has since recreated.
+ * Neither pair is trusted blindly; each is validated as a real seq.
+ * @param op - the event's `surfaceOp`, as the log carries it.
+ * @returns the range, or null when the op is not a readable positional replace.
+ */
+function replacedRangeOf(op: unknown): ReplacedRange | null {
+  if (op === null || typeof op !== 'object') return null
+  const candidate = op as { op?: unknown; startSeq?: unknown; endSeq?: unknown; start?: unknown; end?: unknown }
+  if (candidate.op !== 'replace') return null
+  // 0.1.5 first, then the legacy spelling, so a marker carrying either is read.
+  // The pair is chosen whole: `startSeq` is never paired with a legacy `end`,
+  // which would invent a range out of two different spellings.
+  const [start, end] = 'startSeq' in candidate
+    ? [candidate.startSeq, candidate.endSeq]
+    : [candidate.start, candidate.end]
+  if (typeof start !== 'number' || typeof end !== 'number') return null
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < 0) return null
+  return { start, end }
+}
+
+/**
  * The surface ranges rollbacks replaced, from the log's own markers.
  *
  * Overlapping and nested markers are expected — rolling back twice over the same span
@@ -48,10 +78,9 @@ export function replacedSurfaceRanges(events: readonly ReplayEvent[]): ReplacedR
     if (event.type !== 'user/message') continue
     const source = (event.data as { source?: { plugin?: unknown } } | undefined)?.source
     if (source?.plugin !== ROLLBACK_PLUGIN) continue
-    const op = event.surfaceOp as { op?: unknown; start?: unknown; end?: unknown } | null | undefined
-    if (op === null || op === undefined || op.op !== 'replace') continue
-    if (typeof op.start !== 'number' || typeof op.end !== 'number') continue
-    ranges.push({ start: op.start, end: op.end })
+    const range = replacedRangeOf(event.surfaceOp)
+    if (range === null) continue
+    ranges.push(range)
   }
   return ranges
 }
