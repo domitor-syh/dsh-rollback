@@ -39,7 +39,7 @@ export const inject = ['slots', 'remote', 'remote.commands', 'locale', 'workspac
 const DEBUG = false
 /** Bundle revision — always reported once at apply, so a stale cached bundle is
  * identifiable in the console instead of looking like "the fix did nothing". */
-const BUNDLE_REV = 18
+const BUNDLE_REV = 19
 function log(...parts: unknown[]): void {
   if (DEBUG) console.info('[rollback]', ...parts)
 }
@@ -661,19 +661,36 @@ function loadEarlierButtonOf(column: HTMLElement | null): HTMLElement | null {
 }
 
 /**
- * The surface cut a rollback-marker node records, or undefined when unreadable.
+ * The replaced window a rollback-marker node records, in three readings.
+ *
+ * - a number: the first seq the rollback shadowed, so exactly `[cut, seq)` was
+ *   taken out of the conversation (the host's `replace` form);
+ * - `null`: the rollback replaced NOTHING — the host's `append` form, written when
+ *   the system-prompt clamp left no replaceable node. That is an empty range BY
+ *   CONTRACT, not a missing one: the node still proves a rollback happened (which
+ *   is what the emptiness decision needs), and it covers no seq, so it cannot hide
+ *   a row (see {@link coveredByRollback});
+ * - `undefined`: unreadable, reported rather than guessed. Such a marker
+ *   contributes no window at all, which is the only safe reading of one.
  *
  * This is the ONE place that knows the marker state's shape, which `start()`
- * writes as a FLAT `{ seq, truncatedFromSeq }` (the event's own seq plus the
- * shadowed range's first seq). Reading it through a stale path is how a working
- * rollback once became a silent no-op: the host truncated the conversation, the
- * client collected zero markers, and nothing was hidden. A marker without a
- * readable cut is therefore reported rather than skipped — and skipping it is
- * what keeps the account safe: an unresolvable marker hides nothing.
+ * writes as a FLAT `{ seq, truncatedFromSeq }` for a replacement and as a FLAT
+ * `{ seq, replacedNothing: true }` for an append. Reading it through a stale path
+ * is how a working rollback once became a silent no-op: the host truncated the
+ * conversation, the client collected zero markers, and nothing was hidden. A
+ * marker without a readable cut is therefore reported rather than skipped — and
+ * skipping it is what keeps the account safe: an unresolvable marker hides
+ * nothing.
  * @param node - a chat node of kind `rollback-marker`.
- * @returns the cut seq, or undefined when the node carries no readable one.
+ * @returns the cut seq, `null` for a marker that replaced nothing, or `undefined`
+ * when the node carries no readable reading.
  */
-function markerCutOf(node: any): number | undefined {
+function markerCutOf(node: any): number | null | undefined {
+  // Read BEFORE the cut: an append-form marker carries no `truncatedFromSeq`, and
+  // reading that absence as an unreadable range is the exact failure this branch
+  // rules out — the host had emptied the transcript, the marker was dropped, and
+  // the welcome hero never appeared over the infrastructure rows left behind.
+  if (node?.data?.replacedNothing === true) return null
   const from = node?.data?.truncatedFromSeq
   if (typeof from === 'number' && Number.isSafeInteger(from) && from >= 0) return from
   errorOnce('marker-cut', 'rollback marker node carries no readable cut seq, so its range stays visible', {
@@ -810,12 +827,16 @@ function nodeShapeOf(node: unknown): string {
  * replacement shadowed and `seq` is the marker event's own seq, so the window is
  * exactly the range the rollback removed. Both the emptiness count and the hide
  * pass call it, which is what makes them provably agree.
+ *
+ * A `from` of `null` is a marker that replaced nothing (the append form), and it
+ * answers `false` for EVERY seq — by this rule, never by an accident of
+ * arithmetic — so an append-form marker can never hide a row.
  * @param markers - the readable marker windows, oldest first.
  * @param seq - the node's anchor position.
  * @returns whether this position was rolled back.
  */
-function coveredByRollback(markers: { from: number; seq: number }[], seq: number): boolean {
-  return markers.some(m => seq >= m.from && seq < m.seq)
+function coveredByRollback(markers: { from: number | null; seq: number }[], seq: number): boolean {
+  return markers.some(m => m.from !== null && seq >= m.from && seq < m.seq)
 }
 
 /**
@@ -897,7 +918,7 @@ function syncHides(chat: any): void {
     if (k !== null) seatByKey.set(k, el)
   }
 
-  const markers: { from: number; seq: number }[] = []
+  const markers: { from: number | null; seq: number }[] = []
   for (const { node } of nodes) {
     if (node?.kind !== 'rollback-marker') continue
     const from = markerCutOf(node)
@@ -909,12 +930,19 @@ function syncHides(chat: any): void {
       errorOnce('marker-seq', 'rollback marker node carries no readable seq, so its range stays visible', nodeShapeOf(node))
       continue
     }
+    // `from === null` (the append form) is KEPT, not skipped: it is a marker that
+    // replaced nothing, so it bounds an EMPTY window. It hides no row, while still
+    // counting as "a rollback happened" for the emptiness decision below — which is
+    // exactly the degenerate case, where only infrastructure rows are left.
     markers.push({ from, seq })
   }
   // A session with no rollback marker must CLEAR the flag, not skip past it:
 // `heroWanted` is module state that outlives the session it was set in, so
 // returning early here left the welcome page standing at the end of every
 // conversation opened afterwards — until a page reload reset the module.
+// An append-form marker is a marker here like any other: it proves a rollback
+// happened, and a rollback with nothing left to replace is the case that leaves
+// nothing standing but the infrastructure rows.
   if (markers.length === 0) {
     heroWanted.visible = false
     revealAllRollbackSeats()
@@ -936,7 +964,9 @@ function syncHides(chat: any): void {
 // frames — long enough to flash the hero between the old conversation and the new
 // message. Every non-marker node either is covered by a rollback's range (hidden)
 // or is still standing content, and the transcript is empty when nothing is left
-// standing.
+// standing. An append-form marker contributes NO coverage — its window is empty —
+// so on that path only the infrastructure kinds are excluded, which is precisely
+// what a rollback with nothing to replace leaves behind.
   let contentLeft = 0
   for (const { node } of nodes) {
     const seq = node?.anchorSeq
@@ -974,7 +1004,10 @@ function syncHides(chat: any): void {
   // stranded log-only row is cosmetic. So `emptied` adds only rows whose kind is
   // in INFRASTRUCTURE_KINDS: permission receipts and turn tails sit before the
   // rollback point, were never in the model's context, and must not strand above
-  // the welcome page. Every other kind is content and stays.
+  // the welcome page. Every other kind is content and stays. An append-form marker
+  // adds no coverage of its own here: `coveredByRollback` is false for every seq of
+  // an empty window, so it can hide nothing by range and only the `emptied` half of
+  // this rule can ever touch its session's rows.
   for (const { key, node } of nodes) {
     const el = seatByKey.get(key)
     if (el === undefined) continue
@@ -991,12 +1024,13 @@ function syncHides(chat: any): void {
 
   // The hero stands in for an emptied transcript, and only for one a ROLLBACK
   // emptied — `markers` is non-empty here, since this pass returns early without
-  // one, and a session that never had content therefore never reaches it. It also
-  // needs the DOM to agree: a content seat still visible after Pass 3 keeps the
-  // welcome page away, because "the log says empty" and "the screen is empty" are
-  // two different readings and the second one is the one the user sees. A seat
-  // whose kind cannot be read counts as content, so an unrecognized kind errs
-  // toward showing the transcript.
+  // one, and a session that never had content therefore never reaches it. An
+  // append-form marker counts as such a rollback: it replaced nothing, and that is
+  // exactly the screen the hero belongs on. The DOM must agree too: a content seat
+  // still visible after Pass 3 keeps the welcome page away, because "the log says
+  // empty" and "the screen is empty" are two different readings and the second one
+  // is the one the user sees. A seat whose kind cannot be read counts as content,
+  // so an unrecognized kind errs toward showing the transcript.
   let contentSeatsVisible = 0
   for (const { key, node } of nodes) {
     if (node?.kind === 'rollback-marker') continue
@@ -1488,13 +1522,27 @@ const markerDefinition = {
   target: 'chat',
   match: (event: any) => {
     const op = event?.surfaceOp
-    if (op === undefined || op === 'append' || op?.op !== 'replace') return null
     // Current builds: a `user/message` stamped with this plugin's provenance.
     // Its content is the model-facing checkpoint text, so the client reads the
     // rolled-back range from the EVENT (`surfaceOp.startSeq`/`start`) instead.
     if (event?.type === 'user/message') {
       const source = event?.data?.source
       if (source?.kind !== 'plugin' || source?.plugin !== 'rollback') return null
+      // The PROVENANCE is the marker, and the host writes that marker under two
+      // surface ops: a `replace` naming the range it took out, and an `append` for
+      // the degenerate rollback that had nothing left to replace (the only legal
+      // spelling there — a `replace` over the protected system prompt is refused by
+      // the framework and an empty one cannot be spelled; see `appendRollbackMarker`
+      // in the host half). Both forms match here, whether or not a replace op is
+      // present: the append form replaces nothing, which `start` records as an EMPTY
+      // range, never as a missing one — dropping it is what left the checkpoint text
+      // as an ordinary message, no marker at all, and the infrastructure rows
+      // standing on an otherwise empty screen.
+      if (op === 'append' || op === undefined) return { id: String(event.seq), role: 'start' }
+      // Any OTHER op shape is one this Definition was not written against, and it is
+      // deliberately left unmatched: the checkpoint text then stays visible, which is
+      // cosmetic, instead of being turned into a claim about a range nobody can read.
+      if (op?.op !== 'replace') return null
       reportUnreadableCut(op)
       return { id: String(event.seq), role: 'start' }
     }
@@ -1502,6 +1550,7 @@ const markerDefinition = {
     // message carried the rollback facts. Still recognized so an old session's
     // markers keep hiding their range.
     if (event?.type === 'assistant/message' && event?.data?.message?.rollback !== undefined) {
+      if (op === undefined || op === 'append' || op?.op !== 'replace') return null
       reportUnreadableCut(op)
       return { id: String(event.seq), role: 'start' }
     }
@@ -1512,14 +1561,22 @@ const markerDefinition = {
   // (dsh-client-ui-conversation/lib/client.js:2165-2168), and that throw lands
   // inside the conversation view's own assembly, which leaves the transcript
   // EMPTY. Returning undefined here is therefore not a missing feature but a
-  // blank conversation, so this always answers with a state object: an
-  // unreadable cut yields a state whose `truncatedFromSeq` is absent, which
-  // `markerCutOf` reports and skips. The marker then hides nothing, which is the
-  // only acceptable failure for a range that cannot be established.
+  // blank conversation, so this always answers with a state object: a marker that
+  // replaced nothing says so (`replacedNothing`), and an unreadable cut yields a
+  // state whose `truncatedFromSeq` is absent, which `markerCutOf` reports and
+  // skips. The marker then hides nothing, which is the only acceptable failure for
+  // a range that cannot be established.
   start: (_context: any, match: any) => {
     const event = match?.event
     const seq = typeof event?.seq === 'number' && Number.isSafeInteger(event.seq) ? event.seq : 0
-    return { seq, truncatedFromSeq: surfaceCutOf(event?.surfaceOp) }
+    const op = event?.surfaceOp
+    // The append form is the degenerate rollback: the host had nothing left to
+    // replace (the system-prompt clamp), so it appended the checkpoint without any
+    // range. That is an empty replaced range BY CONTRACT, recorded as
+    // `replacedNothing`, because a `truncatedFromSeq` that is merely absent means
+    // "unreadable" everywhere else in this file and must keep meaning exactly that.
+    if (op === 'append' || op === undefined) return { seq, replacedNothing: true }
+    return { seq, truncatedFromSeq: surfaceCutOf(op) }
   },
   update: (context: any) => context.state,
   buildViewNode: (context: any) => {
@@ -1683,11 +1740,13 @@ function auditContracts(ctx: any): void {
 
 /** The marker node's view: nothing at all.
  *
- * It exists as the durable anchor `syncHides` reads the truncated range from, and
- * a rollback must leave no trace in the transcript — no divider, no notice. The
- * welcome hero is NOT rendered here, because a node's seat can be missing or sit
- * inside a container the hide pass collapsed, which would swallow the hero
- * silently; the driver hosts it instead (see {@link RollbackHero}). */
+ * It exists as the durable anchor `syncHides` reads the replaced range from — a
+ * range that a `replace` marker states and an `append` marker states as empty
+ * (nothing was left to replace) — and a rollback must leave no trace in the
+ * transcript: no divider, no notice. The welcome hero is NOT rendered here,
+ * because a node's seat can be missing or sit inside a container the hide pass
+ * collapsed, which would swallow the hero silently; the driver hosts it instead
+ * (see {@link RollbackHero}). */
 function RollbackMarkerView(): null {
   return null
 }
@@ -1721,9 +1780,10 @@ export function apply(ctx: any): void {
 
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'rollback: dictionaries')
 
-  // The marker node is the durable anchor `syncHides` reads the truncated range
-  // from, and it renders the welcome hero when its rollback emptied the surface
-  // (see RollbackMarkerView) — an ordinary rollback renders no divider.
+  // The marker node is the durable anchor `syncHides` reads the replaced range
+  // from — the range a `replace` marker states, or the empty one an `append` marker
+  // states — and the driver renders the welcome hero when that rollback emptied the
+  // surface (see RollbackMarkerView): an ordinary rollback renders no divider.
   //
   // The registry is acquired dynamically (see `eventRegistryOf`): a synchronous
   // hit is the normal case, and the `ctx.inject` waits cover a service that only
