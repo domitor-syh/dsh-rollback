@@ -19,6 +19,18 @@ A TRAE-style "roll back to before this turn" plugin for the [DeepSeek Harness](h
 - Model behavior is driven by both the conversation history and the workspace files, so a rollback must roll back **both** at once; otherwise you get hallucination continuation or state conflicts.
 - Rollback = restore the files touched in this turn and later (modified → write back the prior content, created → delete) + truncate the conversation history in place (same session id, so the model no longer sees the truncated content).
 
+## Supported DSH versions
+
+| DSH version | Status | Notes |
+| --- | --- | --- |
+| 0.1.5-rc.2 | **Tested** | The version this release was adapted to and verified against end to end: rollback, truncation, file restore, hero, hiding, and image re-attach |
+| 0.1.1-rc.2 | Supported by design, **not tested** | The plugin keeps feature-detected fallbacks for the older contracts: the retired `conversationEvents` service, `session.chat` on the snapshot, the legacy `start`/`end` surface-op spelling, `workspaces.openPath`, and `addImages`/`pruneImages`. No 0.1.1 build was available, so this path was **not exercised on a machine running 0.1.1** — it is a designed fallback, not a tested one |
+| Below 0.1.1, or 0.2.0 and above | Not supported | Below 0.1.1 does not have the contracts those fallbacks cover; from 0.2.0 on the contracts may change, and no adaptation has been done |
+
+When the framework contract is not the one the plugin expects, it **reports loudly instead of failing silently**: the browser console prints `[rollback] framework contract mismatch: …` or `[rollback] hiding disabled for this pass: …`. Its hiding logic is **fail-closed** — if the chat shape cannot be read it hides **nothing** and hands back anything it had hidden, so a future framework change can at worst degrade to "no hiding" (a cosmetic effect only) and can never blank the transcript. The host half keeps every observer it registers inside its own try/catch, so a plugin failure never breaks the host's own session loading.
+
+`dsh.engines.dsh` in `package.json` is `>=0.1.5-rc.2 <0.2.0`. DSH does not read that field — it is metadata for humans and tooling — and npm's semver prerelease rules make a single range covering both `0.1.1-rc.2` and `0.1.5-rc.2` impossible to express cleanly, which is why the matrix above is the authoritative statement.
+
 ## Features
 
 | Capability | Description |
