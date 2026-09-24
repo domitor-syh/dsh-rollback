@@ -1,7 +1,7 @@
 {
   "name": "@domitor-syh/dsh-rollback",
   "description": "TRAE-style conversation rollback for DeepSeek Harness: per-turn checkpoints, file restore + in-place conversation truncation, a /rollback command, and a Web rollback button with an affected-file preview",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org"
@@ -16,7 +16,7 @@
   },
   "dsh": {
     "engines": {
-      "dsh": ">=0.1.5-rc.2 <0.2.0"
+      "dsh": ">=0.1.5-rc.2"
     },
     "bundle": {
       "patch": "./cordis.patch.yml"

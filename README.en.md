@@ -21,21 +21,21 @@ A TRAE-style "roll back to before this turn" plugin for the [DeepSeek Harness](h
 
 ## Supported DSH versions
 
-How the latest release (**0.3.0**) fares on every DSH build published so far; the list comes from `@deepseek-ai/dsh` on the npm registry and covers every build published as of this release:
+How the latest release (**0.3.1**) fares on every DSH build published so far; the list comes from `@deepseek-ai/dsh` on the npm registry and covers every build published as of this release:
 
 | DSH version | Status | Notes |
 | --- | --- | --- |
 | 0.1.5-rc.2 | **Tested** | The build this release was adapted to and verified against end to end: rollback, truncation, file restore, hero, hiding, and image re-attach |
 | 0.1.1-rc.2 | Supported by design, **not tested** | The plugin keeps feature-detected fallbacks for the contracts this generation used: the retired `conversationEvents` service, `session.chat` on the snapshot, the legacy `start`/`end` surface-op spelling, `workspaces.openPath`, and `addImages`/`pruneImages`. No 0.1.1 build was available, so this path was **not exercised on a machine running 0.1.1** — it is a designed fallback, not a tested one |
 | 0.1.1-rc.1, 0.1.2-alpha.2–alpha.5, 0.1.2-rc.1, 0.1.3-alpha.2, 0.1.5-alpha.1/alpha.2/rc.1/rc.3, 0.1.6-alpha.1/alpha.2, 0.1.7-alpha.1/alpha.2/rc.1 | **Not verified** | The plugin was never run on these builds, including `0.1.5-rc.3` — the same 0.1.5 line, published after 0.1.5-rc.2. If such a build changed a contract, the plugin does not fail silently: it names the problem in the console (see below), and its hiding is fail-closed, so the worst case is the cosmetic "no hiding". If you want to try one, use a conversation you can throw away |
-| 0.0.1-rc.1/rc.2/rc.5, 0.1.0-rc.2/rc.3/rc.6/rc.7/rc.8 (below 0.1.1), and 0.2.0 and above (none published yet) | Not supported | Below 0.1.1 does not have the contracts those fallbacks cover; from 0.2.0 on the contracts may change, and no adaptation has been done. These versions are also outside `dsh.engines.dsh` (`>=0.1.5-rc.2 <0.2.0`) |
+| 0.0.1-rc.1/rc.2/rc.5, 0.1.0-rc.2/rc.3/rc.6/rc.7/rc.8 (below 0.1.1), and 0.2.0 and above (none published yet) | Not supported | Below 0.1.1 does not have the contracts those fallbacks cover; from 0.2.0 on the contracts may change, and no adaptation has been done. Of these, the ones below 0.1.1 fall below the lower bound of `dsh.engines.dsh` (`>=0.1.5-rc.2`); no 0.2.0-or-above build has ever been published |
 
 - On DSH **0.1.5-rc.2** install **0.3.x**. Do **not** put 0.1.0–0.2.2 on 0.1.5: that generation **breaks session loading** there — its client half listed the `conversationEvents` service among its required injects, and 0.1.5 no longer provides it, so the half stays pending forever (the install looks like it did nothing); its host half threw from inside the `session/created` observer while the framework resumed a session (0.1.5 no longer hands out `session.events`), so sessions fail to open and the transcript renders empty.
 - On DSH **0.1.1-rc.2**, 0.1.0–0.2.2 is the generation that was built and verified against it, so **0.2.x is the best-tested choice**; 0.3.0 is compatible by design through the fallbacks listed above, but was not exercised on a 0.1.1 build.
 
 When the framework contract is not the one the plugin expects, it **reports loudly instead of failing silently**: the browser console prints `[rollback] framework contract mismatch: …` or `[rollback] hiding disabled for this pass: …`. Its hiding logic is **fail-closed** — if the chat shape cannot be read it hides **nothing** and hands back anything it had hidden, so a future framework change can at worst degrade to "no hiding" (a cosmetic effect only) and can never blank the transcript. The host half keeps every observer it registers inside its own try/catch, so a plugin failure never breaks the host's own session loading.
 
-`dsh.engines.dsh` in `package.json` is `>=0.1.5-rc.2 <0.2.0`. DSH does not read that field — it is metadata for humans and tooling — and npm's semver prerelease rules make a single range covering both `0.1.1-rc.2` and `0.1.5-rc.2` impossible to express cleanly, which is why the matrix above is the authoritative statement.
+`dsh.engines.dsh` in `package.json` is `>=0.1.5-rc.2` — an open-ended range with no upper bound, because no 0.2.0 build has ever been published and a hard ceiling would declare a constraint that does not exist. DSH does not read that field — it is metadata for humans and tooling — and npm's semver prerelease rules make a single range covering both `0.1.1-rc.2` and `0.1.5-rc.2` impossible to express cleanly, which is why the matrix above is the authoritative statement.
 
 ## Features
 
