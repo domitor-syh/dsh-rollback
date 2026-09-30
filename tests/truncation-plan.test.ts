@@ -1,9 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+  isRollbackMarkerSource,
   planTruncationMarker,
   replaceSurfaceOpCandidates,
   ROLLBACK_CHECKPOINT_TEXT,
+  ROLLBACK_MARKER_KIND,
   ROLLBACK_MARKER_SOURCE,
+  ROLLBACK_PLUGIN,
   shadowedSurfaceFrom,
   systemPromptNodeSeq,
   turnStartSeqFor,
@@ -359,5 +362,60 @@ describe('withReplaceSurfaceOpFallback', () => {
     })
     expect(() => withReplaceSurfaceOpFallback({ start: 140, end: 795 }, attempt)).toThrow(legacyFailure)
     expect(attempt).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('the marker source format v4 accepts', () => {
+  it('is the producer-owned kind, never the released `plugin` wrapper', () => {
+    // THE regression this test exists for. The wrapper is what the plugin wrote
+    // through 0.3.1, and DSH 0.2.0's format v4 refuses it by name:
+    // `format v4 message requires a producer-owned source kind`
+    // (dsh-session-format-v3-to-v4/lib/index.js:126). The refusal lands on the
+    // marker's own event, so every later turn in that session failed — a rollback
+    // that appeared to succeed made the conversation unusable.
+    expect(ROLLBACK_MARKER_SOURCE.kind).toBe('plugin:rollback')
+    expect(ROLLBACK_MARKER_SOURCE.kind).not.toBe('plugin')
+    expect('plugin' in ROLLBACK_MARKER_SOURCE).toBe(false)
+  })
+
+  it('is the shape the framework\u2019s own v3\u2192v4 migration lifts a wrapper INTO', () => {
+    // `rewritePluginSource` maps `{kind:'plugin',plugin:'rollback'}` to
+    // `producerKind('rollback')` = `plugin:rollback` (there is no rename for this
+    // plugin). Writing that shape directly means a marker authored here and one
+    // carried over from an older log are byte-identical.
+    expect(ROLLBACK_MARKER_KIND).toBe(`plugin:${ROLLBACK_PLUGIN}`)
+  })
+
+  it('rides the marker data the planner builds', () => {
+    const { entries, nodes } = threeTurns()
+    const plan = planned(view(entries, nodes), 2)
+    expect(plan.data.source).toBe(ROLLBACK_MARKER_SOURCE)
+    expect(plan.data.role).toBe('user')
+  })
+})
+
+describe('isRollbackMarkerSource', () => {
+  it('recognizes both provenance spellings', () => {
+    // Old logs and new logs both exist, and the reader serves them equally.
+    expect(isRollbackMarkerSource({ kind: 'plugin:rollback' })).toBe(true)
+    expect(isRollbackMarkerSource({ kind: 'plugin', plugin: 'rollback' })).toBe(true)
+  })
+
+  it('refuses every other producer', () => {
+    expect(isRollbackMarkerSource({ kind: 'plugin:compaction' })).toBe(false)
+    expect(isRollbackMarkerSource({ kind: 'plugin', plugin: 'compaction' })).toBe(false)
+    expect(isRollbackMarkerSource({ kind: 'user' })).toBe(false)
+    expect(isRollbackMarkerSource({ kind: 'model', provider: 'p', model: 'm' })).toBe(false)
+    // The pair is the identity: a `plugin` field alone, or under another kind,
+    // does not make this plugin the producer.
+    expect(isRollbackMarkerSource({ plugin: 'rollback' })).toBe(false)
+    expect(isRollbackMarkerSource({ kind: 'user', plugin: 'rollback' })).toBe(false)
+  })
+
+  it('survives a missing or malformed source', () => {
+    expect(isRollbackMarkerSource(undefined)).toBe(false)
+    expect(isRollbackMarkerSource(null)).toBe(false)
+    expect(isRollbackMarkerSource('plugin:rollback')).toBe(false)
+    expect(isRollbackMarkerSource({})).toBe(false)
   })
 })

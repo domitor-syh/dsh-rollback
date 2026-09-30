@@ -1,0 +1,15 @@
+# Development overlay for adapting @domitor-syh/dsh-rollback to a running DSH.
+#
+# Used as `dsh --profile <name> --patch <this file> web --port 3081`, so the
+# plugin can be verified against a live build WITHOUT editing any profile file:
+# this layer is applied after the profile's own bundles and its cordis.patch.yml,
+# and disappears with the process.
+#
+# `name` is the package id, not a path: the host resolves it from the profile's
+# node_modules, which is also what `dsh-client-modules` needs in order to find the
+# browser half through the package's `dsh.client` declaration and its
+# `exports["./client"]` bundle. An entry named by file path would load the node
+# half and silently serve no client half at all.
+- insert:
+    - id: rollback
+      name: '@domitor-syh/dsh-rollback'

@@ -19,7 +19,8 @@
 import * as React from 'react'
 import { createPortal } from 'react-dom'
 import { FishLogo, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
-import { footerEntryNeeded } from '../core/turn-entry.ts'
+import { footerEntryNeeded, isTurnTailShapeRejection, otherTurnTailShape, turnTailRegistration, type TurnTailShape } from '../core/turn-entry.ts'
+import { isRollbackMarkerSource } from '../core/truncation-plan.ts'
 import { oldestTurnOf } from '../core/rollback-guard.ts'
 
 /**
@@ -39,7 +40,7 @@ export const inject = ['slots', 'remote', 'remote.commands', 'locale', 'workspac
 const DEBUG = false
 /** Bundle revision — always reported once at apply, so a stale cached bundle is
  * identifiable in the console instead of looking like "the fix did nothing". */
-const BUNDLE_REV = 19
+const BUNDLE_REV = 21
 function log(...parts: unknown[]): void {
   if (DEBUG) console.info('[rollback]', ...parts)
 }
@@ -1181,30 +1182,76 @@ function RollbackAction({ messageId, useSession, useChat, t }: any): React.React
 }
 
 /**
- * Routing selector for the turn-footer entry, and the reason this entry is a CHAIN
- * contribution: a chain entry MUST supply `select` (the framework throws without it),
- * and its non-null result becomes the component's `matched` prop.
+ * Routing selector for the turn-footer entry on builds that declare the seat as a
+ * CHAIN (0.1.5): a chain entry MUST supply `select` (the framework throws without
+ * it), and its non-null result becomes the component's `matched` prop.
  *
  * Returning null whenever the assistant action strip can offer the button keeps the
  * familiar placement and guarantees one button per turn — the footer shows up only
  * where that strip cannot exist (an interrupted turn, which has no closing message).
  * The tail data is read through the location's own reader rather than from the node,
  * because the selector only ever receives the owner props.
+ *
+ * 0.2.0 declares the same seat as a LIST instead, which has no election at all, so
+ * this function is only reachable through {@link registerTurnTailEntry}'s legacy
+ * branch; {@link RollbackTurnAction} states the same rule for both routes.
  */
 function selectFooterAction(owner: any): { turn: number } | null {
   const location = owner?.turn
   const turnNo = turnNoOf(location)
   if (turnNo === undefined) return null
-  let closing: unknown
-  try {
-    closing = location?.data?.get?.('turn-tail')?.closing
-  } catch (e) {
-    // Fail open: a missing button is worse than one the host may decline.
-    warnOnce('footer-tail-data', 'turn footer could not read its tail data', e)
-    return { turn: turnNo }
-  }
-  if (!footerEntryNeeded(closing as never)) return null
+  if (!footerEntryNeeded(closingOf(location) as never)) return null
   return { turn: turnNo }
+}
+
+/**
+ * The closing assistant node a turn's footer data carries, read through the
+ * location's own reader rather than from the node.
+ *
+ * Both shapes of failure are answered the same way — with `undefined`, which
+ * {@link footerEntryNeeded} treats as "no closing message" — because the caller's
+ * choice is fail-open: a button the host may decline is better than a button that
+ * silently never appears.
+ * @param location - the turn location the footer seat delivers.
+ * @returns the closing node, or undefined when it cannot be read.
+ */
+function closingOf(location: any): unknown {
+  try {
+    return location?.data?.get?.('turn-tail')?.closing
+  } catch (e) {
+    warnOnce('footer-tail-data', 'turn footer could not read its tail data', e)
+    return undefined
+  }
+}
+
+/**
+ * Register the turn-footer entry under whichever spelling this build's
+ * `conversation.chat.turnTail` seat takes.
+ *
+ * One artifact serves both versions: the modern `list` spelling is tried first,
+ * and the legacy `chain` one only when the seat refuses the list form by name
+ * (see {@link isTurnTailShapeRejection}). Nothing is recorded by a refused
+ * registration, so the retry cannot leave a half-registered entry behind.
+ * {@link RollbackTurnAction} re-applies the election itself, so both routes end
+ * with the same single button per turn.
+ * @param ctx - the plugin's own context.
+ * @returns the registration's disposer.
+ */
+function registerTurnTailEntry(ctx: any): () => void {
+  const fields = { id: 'rollback', order: 20, locale: NS, select: selectFooterAction }
+  let shape: TurnTailShape = 'list'
+  for (;;) {
+    try {
+      return ctx.slots.register(turnTailRegistration(shape, fields), RollbackTurnAction)
+    } catch (error) {
+      if (!isTurnTailShapeRejection(error)) throw error
+      const next = otherTurnTailShape(shape)
+      // Both spellings refused: the seat exists but takes a shape neither supported
+      // build declares, so this is a real failure and the caller reports it.
+      if (next === 'list') throw error
+      shape = next
+    }
+  }
 }
 
 /**
@@ -1252,16 +1299,25 @@ function useRollbackOldest(): number | null {
  * consequence of that, not a second mechanism.
  */
 function RollbackTurnAction({ turn: location, matched, useSession, t }: any): React.ReactElement | null {
+  // Every hook this entry uses runs before any early return: 0.2.0 renders the
+  // seat as a LIST, so most turns end in one of the returns below, and a hook
+  // reached only on the turns that survive would change the hook order between
+  // renders.
+  const oldest = useRollbackOldest()
   if (typeof useSession !== 'function') {
     warnOnce('footer-action-session', 'turn footer action lacks useSession')
     return null
   }
   const turnNo = matched?.turn ?? turnNoOf(location)
-  const oldest = useRollbackOldest()
   if (turnNo === undefined) {
     warnOnce('footer-action-turn', 'turn footer action could not resolve its turn', location)
     return null
   }
+  // The election the chain spelling used to express (see
+  // {@link selectFooterAction}) applies on both routes: the footer offers the
+  // button only where the assistant action strip cannot, so a turn never shows
+  // two of them.
+  if (!footerEntryNeeded(closingOf(location) as never)) return null
   const blocked = oldest !== null && turnNo < oldest
   log('turn-footer action rendered', { turn: turnNo, blocked })
   // Disabled says it: the greyed style is the whole message. A tooltip here would not
@@ -1527,7 +1583,10 @@ const markerDefinition = {
     // rolled-back range from the EVENT (`surfaceOp.startSeq`/`start`) instead.
     if (event?.type === 'user/message') {
       const source = event?.data?.source
-      if (source?.kind !== 'plugin' || source?.plugin !== 'rollback') return null
+      // Either provenance spelling: `{kind:'plugin:rollback'}` is what the host
+      // writes now (format v4 refuses the retired wrapper), and
+      // `{kind:'plugin', plugin:'rollback'}` is what a pre-fix log carries.
+      if (!isRollbackMarkerSource(source)) return null
       // The PROVENANCE is the marker, and the host writes that marker under two
       // surface ops: a `replace` naming the range it took out, and an `append` for
       // the degenerate rollback that had nothing left to replace (the only legal
@@ -1811,20 +1870,18 @@ export function apply(ctx: any): void {
 
   // The turn footer covers what the action strip cannot: an interrupted turn has no
   // closing assistant message, so the strip contributes no actions and the button
-  // would be missing exactly when it is wanted. `selectFooterAction` returns null for
-  // every other turn, so this never duplicates the strip's button.
+  // would be missing exactly when it is wanted. The entry renders nothing for every
+  // other turn, so this never duplicates the strip's button.
   //
-  // The registration is guarded because a chain entry's shape is easy to get wrong
-  // (it needs `select`, not the `id`/`order` a list entry takes) and the framework's
-  // rejection left a silently empty row behind the last time. A failure here is
-  // reported loudly and leaves the strip's button as the only — still working — entry.
+  // The seat's own shape is the one thing that differs between the supported builds
+  // — a chain with a `select` election on 0.1.5, a list with an `id` on 0.2.0 — so
+  // the registration picks whichever spelling this build takes (see
+  // registerTurnTailEntry). The guard stays because a rejection here leaves a
+  // silently empty row: reported loudly, and the strip's button remains the only —
+  // still working — entry.
   ctx.slots.inject('conversation.chat.turnTail', () => {
     try {
-      const dispose = ctx.slots.register({
-        name: 'conversation.chat.turnTail',
-        select: selectFooterAction,
-        locale: NS,
-      }, RollbackTurnAction)
+      const dispose = registerTurnTailEntry(ctx)
       console.info('[rollback] turn-footer action registered (rev ' + BUNDLE_REV + ')')
       return dispose
     } catch (error) {

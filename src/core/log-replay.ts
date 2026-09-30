@@ -16,6 +16,8 @@
  * @module @domitor-syh/dsh-rollback/core/log-replay
  */
 
+import { isRollbackMarkerSource } from './truncation-plan.ts'
+
 /** One session event, structurally (only the fields this rule needs). */
 export interface ReplayEvent {
   readonly type: string
@@ -29,9 +31,6 @@ export interface ReplacedRange {
   readonly start: number
   readonly end: number
 }
-
-/** This plugin's name in a marker's `source.plugin`. */
-const ROLLBACK_PLUGIN = 'rollback'
 
 /**
  * The inclusive range one marker's surface op declares, whichever way it is spelled.
@@ -76,8 +75,8 @@ export function replacedSurfaceRanges(events: readonly ReplayEvent[]): ReplacedR
   const ranges: ReplacedRange[] = []
   for (const event of events) {
     if (event.type !== 'user/message') continue
-    const source = (event.data as { source?: { plugin?: unknown } } | undefined)?.source
-    if (source?.plugin !== ROLLBACK_PLUGIN) continue
+    const source = (event.data as { source?: unknown } | undefined)?.source
+    if (!isRollbackMarkerSource(source)) continue
     const range = replacedRangeOf(event.surfaceOp)
     if (range === null) continue
     ranges.push(range)

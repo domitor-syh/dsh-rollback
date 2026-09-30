@@ -3,12 +3,25 @@ import { deadTurnsOf, isReplacedSeq, replacedSurfaceRanges, type ReplayEvent } f
 
 /** A rollback marker event, spelled the way DSH 0.1.5 writes it. */
 function marker(seq: number, start: number, end: number) {
-  return { type: 'user/message', seq, surfaceOp: { op: 'replace', startSeq: start, endSeq: end }, data: { source: { plugin: 'rollback' } } }
+  return { type: 'user/message', seq, surfaceOp: { op: 'replace', startSeq: start, endSeq: end }, data: { source: { kind: 'plugin', plugin: 'rollback' } } }
 }
 
 /** The same marker spelled the way DSH <= 0.1.1 wrote it — i.e. an old log. */
 function legacyMarker(seq: number, start: number, end: number) {
-  return { type: 'user/message', seq, surfaceOp: { op: 'replace', start, end }, data: { source: { plugin: 'rollback' } } }
+  return { type: 'user/message', seq, surfaceOp: { op: 'replace', start, end }, data: { source: { kind: 'plugin', plugin: 'rollback' } } }
+}
+
+/**
+ * A marker in the producer-owned spelling DSH 0.2.0 requires.
+ *
+ * Format v4 refuses the released `{kind:'plugin'}` wrapper outright
+ * (`format v4 message requires a producer-owned source kind`), so everything this
+ * plugin writes now carries `{kind:'plugin:rollback'}` — while a log written
+ * before that fix still holds the wrapper. A reader has to accept both or it
+ * loses the ranges of exactly one generation of markers.
+ */
+function producerMarker(seq: number, start: number, end: number) {
+  return { type: 'user/message', seq, surfaceOp: { op: 'replace', startSeq: start, endSeq: end }, data: { source: { kind: 'plugin:rollback' } } }
 }
 
 describe('replacedSurfaceRanges', () => {
@@ -34,17 +47,39 @@ describe('replacedSurfaceRanges', () => {
     expect(replacedSurfaceRanges(events)).toEqual([{ start: 10, end: 160 }, { start: 210, end: 370 }])
   })
 
+  it('reads the producer-owned spelling format v4 requires', () => {
+    // The v4-native marker. A reader that only knew the released wrapper would
+    // find no range here — and every rollback written on 0.2.0 uses this shape.
+    expect(replacedSurfaceRanges([producerMarker(805, 140, 795)])).toEqual([{ start: 140, end: 795 }])
+  })
+
+  it('reads a log holding BOTH provenance spellings side by side', () => {
+    // Exactly what a long-lived session looks like across the fix: old markers
+    // carrying the wrapper, new ones carrying the producer kind.
+    const events = [legacyMarker(200, 10, 160), producerMarker(400, 210, 370)]
+    expect(replacedSurfaceRanges(events)).toEqual([{ start: 10, end: 160 }, { start: 210, end: 370 }])
+  })
+
+  it('does not claim a marker for a different producer', () => {
+    // `plugin:compaction` and a plugin NAMED rollback are different producers; the
+    // identity is the pair, not the substring.
+    const other = { type: 'user/message', seq: 805, surfaceOp: { op: 'replace', startSeq: 1, endSeq: 9 }, data: { source: { kind: 'plugin:compaction' } } }
+    const named = { type: 'user/message', seq: 806, surfaceOp: { op: 'replace', startSeq: 1, endSeq: 9 }, data: { source: { kind: 'user', plugin: 'rollback' } } }
+    expect(replacedSurfaceRanges([other])).toEqual([])
+    expect(replacedSurfaceRanges([named])).toEqual([])
+  })
+
   it('never pairs one spelling’s start with the other’s end', () => {
     // Both spellings on one op is invalid under either build (`isReplaceOp` counts
     // the keys), and mixing them would invent a range out of two different
     // markers' numbers. The modern pair wins whole; there is no `endSeq` here, so
     // the op is unreadable rather than half-read.
-    const hybrid = { type: 'user/message', seq: 805, surfaceOp: { op: 'replace', startSeq: 140, end: 795 }, data: { source: { plugin: 'rollback' } } }
+    const hybrid = { type: 'user/message', seq: 805, surfaceOp: { op: 'replace', startSeq: 140, end: 795 }, data: { source: { kind: 'plugin', plugin: 'rollback' } } }
     expect(replacedSurfaceRanges([hybrid])).toEqual([])
   })
 
   it('ignores a range whose ends are not real seqs', () => {
-    const bad = (surfaceOp: unknown) => ({ type: 'user/message', seq: 805, surfaceOp, data: { source: { plugin: 'rollback' } } })
+    const bad = (surfaceOp: unknown) => ({ type: 'user/message', seq: 805, surfaceOp, data: { source: { kind: 'plugin', plugin: 'rollback' } } })
     expect(replacedSurfaceRanges([
       bad({ op: 'replace', startSeq: -1, endSeq: 795 }),
       bad({ op: 'replace', startSeq: 1.5, endSeq: 795 }),
@@ -63,9 +98,9 @@ describe('replacedSurfaceRanges', () => {
   it('ignores ordinary messages and malformed markers', () => {
     expect(replacedSurfaceRanges([
       { type: 'user/message', seq: 5, data: { content: 'hello' } },
-      { type: 'user/message', seq: 6, surfaceOp: { op: 'append' }, data: { source: { plugin: 'rollback' } } },
-      { type: 'user/message', seq: 7, surfaceOp: { op: 'replace', start: 1 }, data: { source: { plugin: 'rollback' } } },
-      { type: 'user/message', seq: 8, surfaceOp: { op: 'replace', startSeq: 1 }, data: { source: { plugin: 'rollback' } } },
+      { type: 'user/message', seq: 6, surfaceOp: { op: 'append' }, data: { source: { kind: 'plugin', plugin: 'rollback' } } },
+      { type: 'user/message', seq: 7, surfaceOp: { op: 'replace', start: 1 }, data: { source: { kind: 'plugin', plugin: 'rollback' } } },
+      { type: 'user/message', seq: 8, surfaceOp: { op: 'replace', startSeq: 1 }, data: { source: { kind: 'plugin', plugin: 'rollback' } } },
       { type: 'turn/start', seq: 9 },
     ])).toEqual([])
   })

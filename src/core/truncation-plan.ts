@@ -88,12 +88,47 @@ export const ROLLBACK_CHECKPOINT_TEXT =
   'Automated checkpoint: earlier messages removed, files restored to that point. Continue from what remains; don\'t mention this checkpoint.'
 
 /**
- * Provenance stamped on the marker, so the client recognizes its own node.
+ * Provenance stamped on the marker, so the framework and the client both
+ * recognize this plugin's own node.
  *
- * `kind: 'plugin'` is what the session validates (a `source.kind` must be a
- * non-empty string) and what the client's chat-node definition matches on.
+ * The kind must be **producer-owned**. DSH 0.2.0's session format v4 refuses the
+ * retired `kind: 'plugin'` wrapper outright — `format v4 message requires a
+ * producer-owned source kind` (`dsh-session-format-v3-to-v4/lib/index.js:126`) —
+ * and the refusal lands on the marker's own event, which makes every later turn
+ * in that session fail. Writing the accepted spelling is also exactly what the
+ * framework's own v3→v4 migration lifts a released wrapper INTO
+ * (`plugin:<plugin>`, `:87-106`), so a marker written here and a marker carried
+ * over from an older log end up identical.
+ *
+ * The legacy wrapper stays RECOGNIZED on read (see
+ * {@link isRollbackMarkerSource}): sessions written before this fix hold it, and
+ * the framework itself rewrites it to this shape when it migrates them.
  */
-export const ROLLBACK_MARKER_SOURCE = { kind: 'plugin', plugin: 'rollback' } as const
+export const ROLLBACK_MARKER_SOURCE = { kind: 'plugin:rollback' } as const
+
+/** This plugin's name, as the marker's provenance records it. */
+export const ROLLBACK_PLUGIN = 'rollback'
+
+/** The producer-owned source kind format v4 admits. */
+export const ROLLBACK_MARKER_KIND = `plugin:${ROLLBACK_PLUGIN}`
+
+/**
+ * Whether a message source is a rollback marker, in either spelling.
+ *
+ * Two spellings exist because the framework changed the rule: `<= 0.1.5` stored
+ * the released `{ kind: 'plugin', plugin: 'rollback' }` wrapper, and v4 requires
+ * `{ kind: 'plugin:rollback' }`. A session can hold both — an old log migrated
+ * forward holds the new one, and one written by a pre-fix build holds the old —
+ * so recognition must accept either, while WRITING only ever emits the new one.
+ * @param source - the message source to identify.
+ * @returns true when this plugin produced the message.
+ */
+export function isRollbackMarkerSource(source: unknown): boolean {
+  if (source === null || typeof source !== 'object') return false
+  const candidate = source as { kind?: unknown; plugin?: unknown }
+  if (candidate.kind === ROLLBACK_MARKER_KIND) return true
+  return candidate.kind === 'plugin' && candidate.plugin === ROLLBACK_PLUGIN
+}
 
 /** An inclusive surface seq range, as plain numbers — no framework field names. */
 export interface MarkerRange {
