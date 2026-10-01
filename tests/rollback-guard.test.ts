@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { oldestTurnOf, rollbackRefusal, windowRefusal } from '../src/core/rollback-guard.ts'
+import { oldestTurnOf, rollbackRefusal, turnsOf, windowRefusal } from '../src/core/rollback-guard.ts'
 
 describe('rollbackRefusal', () => {
   it('allows a rollback between turns', () => {
@@ -69,5 +69,51 @@ describe('oldestTurnOf', () => {
     // The window hint carries a number of its own ("10"); only what follows the
     // colon is the list, so the parse must not fold the hint into the range.
     expect(oldestTurnOf('可回退到的轮次：51, 52 (仅最近 10 轮)')).toBe(51)
+  })
+})
+
+describe('turnsOf', () => {
+  it('reads EVERY turn, ascending — the picker offers one entry per turn', () => {
+    expect(turnsOf('可回退到的轮次：51, 52, 53 (仅最近 10 轮)')).toEqual([51, 52, 53])
+    expect(turnsOf('可回退到的轮次：51 (仅最近 10 轮)')).toEqual([51])
+    // Ten turns is the full window, which is what the picker has to render.
+    expect(turnsOf('可回退到的轮次：32, 33, 34, 35, 36, 37, 38, 39, 40, 41 (仅最近 10 轮)'))
+      .toEqual([32, 33, 34, 35, 36, 37, 38, 39, 40, 41])
+  })
+
+  it('separates "no turn is rollback-able" from "not a list at all"', () => {
+    // `[]` and null are different answers and the picker renders them differently:
+    // an empty range is a known fact worth stating, while unrecognized text is
+    // "unknown" and must not claim there is nothing to roll back to.
+    expect(turnsOf('可回退到的轮次： (仅最近 10 轮)')).toEqual([])
+    expect(turnsOf('可回退到的轮次：')).toEqual([])
+    expect(turnsOf('当前会话没有可回退的轮次。(仅最近 10 轮)')).toBeNull()
+    expect(turnsOf('')).toBeNull()
+    expect(turnsOf(undefined)).toBeNull()
+    expect(turnsOf(null)).toBeNull()
+  })
+
+  it('never folds the window hint into the list', () => {
+    // "仅最近 10 轮" carries a 10 of its own. Offering it would put a turn on the
+    // picker that a click could not roll back to.
+    expect(turnsOf('可回退到的轮次：51, 52 (仅最近 10 轮)')).toEqual([51, 52])
+  })
+
+  it('agrees with oldestTurnOf on every input they share', () => {
+    // The two are one parse (oldestTurnOf is defined in terms of this one), and the
+    // button path and the picker path must never disagree about the window.
+    const samples = [
+      '可回退到的轮次：51, 52, 53 (仅最近 10 轮)',
+      '可回退到的轮次： (仅最近 10 轮)',
+      '可回退到的轮次：',
+      '当前会话没有可回退的轮次。(仅最近 10 轮)',
+      '',
+    ]
+    for (const text of samples) {
+      const turns = turnsOf(text)
+      const oldest = oldestTurnOf(text)
+      if (turns === null) expect(oldest).toBeNull()
+      else expect(oldest).toBe(turns.length === 0 ? Number.POSITIVE_INFINITY : turns[0])
+    }
   })
 })

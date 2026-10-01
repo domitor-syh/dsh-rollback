@@ -21,13 +21,13 @@
 
 ## 兼容的 DSH 版本
 
-最新发布（**0.4.0**）在各已发布 DSH 构建上的情况；清单取自 npm registry 上的 `@deepseek-ai/dsh`，覆盖截至本次发布已发布的全部构建：
+最新发布（**0.5.0**）在各已发布 DSH 构建上的情况；清单取自 npm registry 上的 `@deepseek-ai/dsh`，覆盖截至本次发布已发布的全部构建：
 
 | DSH 版本 | 状态 | 说明 |
 | --- | --- | --- |
 | 0.2.0-rc.2 | **已实测** | 官方桌面版当前捆绑的构建，本次发布适配并验证的目标。两处核心变更都在它上面修掉并复验：`conversation.chat.turnTail` 由 chain 变 list（否则被中断轮次的回退按钮会静默消失）、会话格式 v4 拒收 `source.kind: 'plugin'`（否则回退之后该会话每一轮都失败） |
 | 0.1.5-rc.2 | **已实测** | 上一代适配并逐项验证的构建：回退、截断、文件恢复、欢迎页、隐藏、图片回填都在它上面端到端跑通。0.4.0 对它仍是**实测过的那一套行为**——本次两处修复都保留了对旧拼写的识别与回落（`chain` 座位、`{kind:'plugin'}` 标记），所以同一份产物继续服务这一代 |
-| 0.1.1-rc.2 | 按设计支持，**未实测** | 插件为这一代契约保留了特性探测回退分支：已退役的 `conversationEvents` 服务、快照上的 `session.chat`、旧拼写的表层 `start`/`end`、`workspaces.openPath`、`addImages`/`pruneImages`。本机没有 0.1.1 的构建，这条路径**没有在真实运行 0.1.1 的机器上跑过**——它是设计上的回退，不是实测结论 |
+| 0.1.1-rc.2 | 按设计支持，**未实测** | 插件为这一代契约保留了特性探测回退分支：已退役的 `conversationEvents` 服务、快照上的 `session.chat`、旧拼写的表层 `start`/`end`、`addImages`/`pruneImages`。本机没有 0.1.1 的构建，这条路径**没有在真实运行 0.1.1 的机器上跑过**——它是设计上的回退，不是实测结论 |
 | 0.1.1-rc.1、0.1.2-alpha.2–alpha.5、0.1.2-rc.1、0.1.3-alpha.2、0.1.5-alpha.1/alpha.2/rc.1/rc.3、0.1.6-alpha.1/alpha.2、0.1.7-alpha.1/alpha.2/rc.1 | **未验证** | 没有在这些构建上跑过，包括同属 0.1.5 线、晚于 0.1.5-rc.2 发布的 `0.1.5-rc.3`。某个构建若改了契约，插件不会静默失败：它会在控制台点名报错（见下），隐藏逻辑 fail-closed，最坏只退化成「不隐藏」这一外观影响。要在这些版本上试，请挑一个可以丢弃的会话 |
 | 0.0.1-rc.1/rc.2/rc.5、0.1.0-rc.2/rc.3/rc.6/rc.7/rc.8（低于 0.1.1） | 不支持 | 低于 0.1.1 没有上述回退所覆盖的契约，且落在 `dsh.engines.dsh`（`>=0.2.0-rc.2`）的下界之外 |
 | 0.2.0-rc.1 及更早的 0.2.0 预发布，以及 0.2.0 之后尚未发布的构建 | **未验证** | 只实测过 `0.2.0-rc.2` 这一个构建。0.2.0 线仍在预发布期，契约可能再变；同样的自我保护仍然生效（控制台点名报错、隐藏 fail-closed，最坏只退化成「不隐藏」）。要在这些构建上试，请挑一个可以丢弃的会话 |
@@ -48,7 +48,7 @@
 | 文件回退 | 修改过的文件写回本轮前内容；已被删除的文件放回来；本轮新建的文件被删除；无法恢复的文件单独报告跳过 |
 | 原位截断 | 用 **`user/message` 承载的表层 `replace`**（内置 `/compact` 同款官方原语）就地替换模型上下文，**回退当场即生效**，保持同一 session id |
 | 两种触发入口 | 人工命令 `/rollback`、Web 端每轮结束后的「回退」按钮（正常轮次在回复的动作条上；被中断的轮次在轮次页脚） |
-| 受影响文件列表 | Web 按钮弹出对话框，列出本轮及之后受影响文件及动作（恢复/找回/删除/跳过），点击文件可在编辑器打开 |
+| 受影响文件列表 | Web 按钮弹出对话框，列出本轮及之后受影响文件及动作（恢复/找回/删除/跳过）。这是**只读回执**：行不可点击（早期版本可以点开编辑器，实测没人用），要打开文件走右侧文件树 |
 | 运行中禁止回退 | 只要有一轮还在跑就整体拒绝，必须等它结束或暂停（运行中的轮次本来也不会出现按钮） |
 
 ## 快速上手
@@ -68,10 +68,10 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 ### 使用
 
 1. **Web 按钮**：每条已完成 AI 回复下方、与「赞/踩」并排的动作条里出现 ↩「回退」按钮 → 弹出受影响文件列表 → 确认回退。
-2. **人工命令**：输入框键入
-   - `/rollback list` — 列出可回退到的轮次
-   - `/rollback preview <n>` — 预览回退到第 n 轮前会影响的文件（不执行）
-   - `/rollback <n>` — 回退到第 n 轮发起之前
+2. **人工命令**：输入框键入 `/`，在指令菜单里选「回退」（英文界面是 `rollback`）→ 弹出官方样式的**轮次选择弹窗**：`回退到上一轮` 加每个可回退轮次一个数字选项。**选择即执行，输入框不会被插入任何文字。**
+   - **两种入口**：`/rollback`（不带参数）弹出轮次选择弹窗 → **确认弹窗** → 回退；`/rollback <轮次号>` **直接回退，没有确认弹窗**。
+  - 差别来自框架：确认弹窗在客户端，而**带参数的命令行不会经过客户端** —— 客户端条目与装饰只对「裸」命令词生效，宿主命令一旦声明了参数就会把参数直接交给宿主。所以想要确认，就用不带参数的那种。
+  - 读信息的辅助命令：`/rollback list` 列轮次、`/rollback preview <n>` 预览回退到第 n 轮前会影响的文件（不执行）。
 3. **不提供模型工具**：模型自己调用回退必然发生在"某一轮进行中"，而运行中一律禁止回退，所以这个工具无法成立，已移除（回退始终由人发起）。
 
 ## 界面预览
@@ -115,7 +115,7 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 - **运行中一律禁止回退**：只要有一轮处于打开状态就整体拒绝（`src/core/rollback-guard.ts`），无论目标是哪一轮。agent loop 持有表层位置并持续追加，在它下面截断会把"这一轮正在写的历史"遮蔽掉、而它更晚的输出还在；命令也不会打断运行，所以**拒绝本身**才是让两者不交错的原因。运行中的轮次**本来就没有按钮**（页脚节点要等该轮 `turn/end` 才存在，动作条要等助手消息收尾），所以这里只有一条规则、没有第二套禁用机制。
 - **欢迎页**：把整段对话回退掉之后，由 driver 往对话区注入宿主元素，再用 React portal 把欢迎页渲染进去。
 - **客户端传输**：复用已出厂 `ctx.remote.commands.execute` 调 `/rollback …`。
-- **回归测试**：`tests/core.test.ts`（35）+ `tests/truncation-plan.test.ts`（10）+ `tests/root-write.test.ts`（14）+ `tests/root-write-fallback.test.ts`（15）+ `tests/literal-edit.test.ts`（12）+ `tests/dir-cleanup.test.ts`（15）+ `tests/empty-dirs.test.ts`（5）+ `tests/boundary-scan.test.ts`（10）+ `tests/boundary-rescan.test.ts`（13）+ `tests/boundary-pipeline.test.ts`（5）+ `tests/rollback-guard.test.ts`（10）+ `tests/turn-entry.test.ts`（3）。
+- **回归测试**：13 个文件 / 199 个用例 —— `tests/core.test.ts`（35）、`tests/truncation-plan.test.ts`（29）、`tests/log-replay.test.ts`（18）、`tests/dir-cleanup.test.ts`（15）、`tests/root-write-fallback.test.ts`（15）、`tests/rollback-guard.test.ts`（14）、`tests/root-write.test.ts`（14）、`tests/boundary-scan.test.ts`（13）、`tests/boundary-rescan.test.ts`（13）、`tests/literal-edit.test.ts`（12）、`tests/turn-entry.test.ts`（11）、`tests/boundary-pipeline.test.ts`（5）、`tests/empty-dirs.test.ts`（5）。
 
 ## 已知限制（Known Limitations）
 

@@ -21,13 +21,13 @@ A TRAE-style "roll back to before this turn" plugin for the [DeepSeek Harness](h
 
 ## Supported DSH versions
 
-How the latest release (**0.4.0**) fares on every DSH build published so far; the list comes from `@deepseek-ai/dsh` on the npm registry and covers every build published as of this release:
+How the latest release (**0.5.0**) fares on every DSH build published so far; the list comes from `@deepseek-ai/dsh` on the npm registry and covers every build published as of this release:
 
 | DSH version | Status | Notes |
 | --- | --- | --- |
 | 0.2.0-rc.2 | **Tested** | The build the official desktop app currently bundles, and the target this release was adapted to. Both core changes were fixed and re-verified on it: `conversation.chat.turnTail` moved from chain to list (otherwise the interrupted-turn rollback button silently disappears), and session format v4 refuses `source.kind: 'plugin'` (otherwise every later turn in a rolled-back session fails) |
 | 0.1.5-rc.2 | **Tested** | The build the previous adaptation was verified against end to end: rollback, truncation, file restore, hero, hiding, and image re-attach. 0.4.0 still behaves as verified there — both fixes keep recognizing and falling back to the old spelling (the `chain` seat, the `{kind:'plugin'}` marker), so one artifact keeps serving that generation |
-| 0.1.1-rc.2 | Supported by design, **not tested** | The plugin keeps feature-detected fallbacks for the contracts this generation used: the retired `conversationEvents` service, `session.chat` on the snapshot, the legacy `start`/`end` surface-op spelling, `workspaces.openPath`, and `addImages`/`pruneImages`. No 0.1.1 build was available, so this path was **not exercised on a machine running 0.1.1** — it is a designed fallback, not a tested one |
+| 0.1.1-rc.2 | Supported by design, **not tested** | The plugin keeps feature-detected fallbacks for the contracts this generation used: the retired `conversationEvents` service, `session.chat` on the snapshot, the legacy `start`/`end` surface-op spelling, and `addImages`/`pruneImages`. No 0.1.1 build was available, so this path was **not exercised on a machine running 0.1.1** — it is a designed fallback, not a tested one |
 | 0.1.1-rc.1, 0.1.2-alpha.2–alpha.5, 0.1.2-rc.1, 0.1.3-alpha.2, 0.1.5-alpha.1/alpha.2/rc.1/rc.3, 0.1.6-alpha.1/alpha.2, 0.1.7-alpha.1/alpha.2/rc.1 | **Not verified** | The plugin was never run on these builds, including `0.1.5-rc.3` — the same 0.1.5 line, published after 0.1.5-rc.2. If such a build changed a contract, the plugin does not fail silently: it names the problem in the console (see below), and its hiding is fail-closed, so the worst case is the cosmetic "no hiding". If you want to try one, use a conversation you can throw away |
 | 0.0.1-rc.1/rc.2/rc.5, 0.1.0-rc.2/rc.3/rc.6/rc.7/rc.8 (below 0.1.1) | Not supported | Below 0.1.1 does not have the contracts those fallbacks cover, and falls below the lower bound of `dsh.engines.dsh` (`>=0.2.0-rc.2`) |
 | 0.2.0-rc.1 and earlier 0.2.0 prereleases, and any 0.2.0-or-later build not yet published | **Not verified** | Only `0.2.0-rc.2` has been tested. The 0.2.0 line is still in prerelease, so its contracts may change again; the same self-protection applies (it names the problem in the console, hiding is fail-closed, so the worst case is the cosmetic "no hiding"). If you want to try one, use a conversation you can throw away |
@@ -48,7 +48,7 @@ When the framework contract is not the one the plugin expects, it **reports loud
 | File rollback | Modified files are written back to their pre-turn content; files deleted since are brought back; files created this turn are deleted; unrestorable files are reported as skipped |
 | In-place truncation | Rewrites the model context with a **`user/message` surface `replace`** — the same primitive the built-in `/compact` uses — taking effect the moment the rollback runs, keeping the same session id |
 | Two entry points | The `/rollback` human command, and a Web rollback button after every turn (on the reply's action strip for a normal turn, in the turn footer for an interrupted one) |
-| Affected-file list | The Web button opens a dialog listing the files affected by this and later turns and their actions (restore/recover/delete/skip); clicking a file opens it in the editor |
+| Affected-file list | The Web button opens a dialog listing the files affected by this and later turns and their actions (restore/recover/delete/skip). It is a **read-out, not a control**: the rows are not clickable (earlier versions opened the editor from here, which nobody used) — open a file from the sidebar's file tree instead |
 | No rollback while running | Any open turn refuses a rollback outright; wait for the turn to end or pause it (a running turn has no button to press anyway) |
 
 ## Getting started
@@ -68,10 +68,10 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 ### Usage
 
 1. **Web button**: a ↩ rollback button appears in the action strip under each finalized assistant reply, alongside the feedback buttons → opens the affected-files list → confirm to roll back.
-2. **Human command**: type in the composer:
-   - `/rollback list` — list the turns you can roll back to
-   - `/rollback preview <n>` — preview the files affected when rolling back to before turn n (no execution)
-   - `/rollback <n>` — roll back to before turn n
+2. **Human command**: type `/` in the composer and pick **回退** (or `rollback` in an English interface) → the framework's own **turn picker** opens: `Roll back the previous turn` plus one numeric entry per rollback-able turn. **Choosing runs it; nothing is inserted into the composer.**
+   - **Two entry points**: `/rollback` with no argument opens the turn picker → the **confirmation dialog** → rollback; `/rollback <turn>` **rolls back immediately, with no confirmation dialog**.
+  - The difference comes from the framework: the dialog lives in the client, and an **argument-bearing command line never reaches the client** — contributions and decorations are consulted only for a bare token, and a host command declaring input hands its arguments straight to the host. Pick the argument-free form when you want to confirm.
+  - Read-only helpers: `/rollback list` lists the turns, and `/rollback preview <n>` previews the files a rollback to before turn n would touch (without executing).
 3. **No model tool**: a model-invoked rollback would always happen while a turn is running, and a running turn refuses every rollback — so the tool cannot exist. A rollback is always started by a human.
 
 ## Interface preview
@@ -115,7 +115,7 @@ Key implementation points:
 - **No rollback while a turn runs**: an open turn refuses a rollback entirely (`src/core/rollback-guard.ts`), whatever the target turn. The agent loop holds a position in the model-visible surface and keeps appending, so truncating underneath it would shadow history the turn is still writing while its later output stays; a command does not interrupt the run either, so the refusal itself is what keeps the two from interleaving. A running turn simply has NO button (the footer node only exists once its turn ends, and the action strip only once a reply finalizes), so there is one rule here and no second disabling mechanism.
 - **Welcome hero**: once a rollback has emptied the whole conversation, the driver injects a host element into the transcript and portals the hero into it.
 - **Client transport**: reuses the shipped `ctx.remote.commands.execute` to call `/rollback …`.
-- **Regression tests**: `tests/core.test.ts` (35), `tests/truncation-plan.test.ts` (10), `tests/root-write.test.ts` (14), `tests/root-write-fallback.test.ts` (15), `tests/literal-edit.test.ts` (12), `tests/dir-cleanup.test.ts` (15), `tests/empty-dirs.test.ts` (5), `tests/boundary-scan.test.ts` (10), `tests/boundary-rescan.test.ts` (13), `tests/boundary-pipeline.test.ts` (5), `tests/rollback-guard.test.ts` (10), and `tests/turn-entry.test.ts` (3).
+- **Regression tests**: 13 files / 199 cases — `tests/core.test.ts` (35), `tests/truncation-plan.test.ts` (29), `tests/log-replay.test.ts` (18), `tests/dir-cleanup.test.ts` (15), `tests/root-write-fallback.test.ts` (15), `tests/rollback-guard.test.ts` (14), `tests/root-write.test.ts` (14), `tests/boundary-scan.test.ts` (13), `tests/boundary-rescan.test.ts` (13), `tests/literal-edit.test.ts` (12), `tests/turn-entry.test.ts` (11), `tests/boundary-pipeline.test.ts` (5), and `tests/empty-dirs.test.ts` (5).
 
 ## Known limitations
 

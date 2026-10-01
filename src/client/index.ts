@@ -21,10 +21,10 @@ import { createPortal } from 'react-dom'
 import { FishLogo, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import { footerEntryNeeded, isTurnTailShapeRejection, otherTurnTailShape, turnTailRegistration, type TurnTailShape } from '../core/turn-entry.ts'
 import { isRollbackMarkerSource } from '../core/truncation-plan.ts'
-import { oldestTurnOf } from '../core/rollback-guard.ts'
+import { oldestTurnOf, turnsOf } from '../core/rollback-guard.ts'
 
 /**
- * Required services: slots, the `commands` Remote, locale, and workspaces.
+ * Required services: slots, the `commands` Remote, and locale.
  *
  * The conversation node registry is deliberately NOT named here. 0.1.5 moved it
  * to `uiConversation.events` and no longer provides `conversationEvents` at all,
@@ -33,14 +33,19 @@ import { oldestTurnOf } from '../core/rollback-guard.ts'
  * plugin is invisible with no error anywhere — the exact silence this file keeps
  * having to design against. The registry is therefore acquired dynamically and
  * the result is audited (see `registerMarkerDefinition`, `auditContracts`).
+ *
+ * `workspaces` used to be named here for the preview dialog's "open in editor"
+ * rows. Those rows are a read-out now, so the requirement is gone — and dropping
+ * it is the safe direction: one fewer name that a future core could retire and
+ * park this fiber on.
  */
-export const inject = ['slots', 'remote', 'remote.commands', 'locale', 'workspaces']
+export const inject = ['slots', 'remote', 'remote.commands', 'locale']
 
 /** Console diagnostics; set to true to debug the client logic. */
 const DEBUG = false
 /** Bundle revision — always reported once at apply, so a stale cached bundle is
  * identifiable in the console instead of looking like "the fix did nothing". */
-const BUNDLE_REV = 21
+const BUNDLE_REV = 25
 function log(...parts: unknown[]): void {
   if (DEBUG) console.info('[rollback]', ...parts)
 }
@@ -92,7 +97,6 @@ const zh = {
   'dialog.aria': '回退确认',
   'dialog.warning': '此操作不可撤销，将恢复本轮及之后受影响的工作区文件并截断模型上下文。',
   'dialog.analyzing': '正在分析受影响文件…',
-  'dialog.openInEditor': '在编辑器中打开',
   'dialog.cancel': '取消',
   'dialog.confirm': '确认回退',
   'dialog.busy': '回退中…',
@@ -102,6 +106,13 @@ const zh = {
   'tag.skip': '跳过',
   'hero.title': '已回退到对话发起前',
   'hero.sub': '对话与文件已恢复 · 在下方输入框继续',
+  // The turn picker's copy. There is no `command.*` pair any more: the menu row is
+  // the host command's, and its description carries both languages itself.
+  'picker.previous': '回退到上一轮',
+  'picker.turn': '第 {turn} 轮',
+  'picker.placeholder': '搜索轮次',
+  'picker.empty': '当前会话没有可回退的轮次',
+  'picker.noResults': '没有匹配的轮次',
 } satisfies Record<string, string>
 
 const en: Record<keyof typeof zh, string> = {
@@ -111,7 +122,6 @@ const en: Record<keyof typeof zh, string> = {
   'dialog.aria': 'Rollback confirmation',
   'dialog.warning': 'This action is irreversible. It will restore workspace files affected by this turn and later, and truncate the model context.',
   'dialog.analyzing': 'Analyzing affected files…',
-  'dialog.openInEditor': 'Open in editor',
   'dialog.cancel': 'Cancel',
   'dialog.confirm': 'Roll back',
   'dialog.busy': 'Rolling back…',
@@ -121,6 +131,11 @@ const en: Record<keyof typeof zh, string> = {
   'tag.skip': 'skip',
   'hero.title': 'Rolled back to the start',
   'hero.sub': 'Conversation and files restored · continue below',
+  'picker.previous': 'Roll back the previous turn',
+  'picker.turn': 'Turn {turn}',
+  'picker.placeholder': 'Search turns',
+  'picker.empty': 'No turn in this session can be rolled back',
+  'picker.noResults': 'No matching turn',
 }
 
 type RollbackKey = keyof typeof zh
@@ -268,125 +283,6 @@ function syncPendingRpcRow(): void {
 }
 
 /**
- * Opening one affected file in the editor, across both DSH generations.
- *
- * 0.1.5 deleted `IWorkspaces.openPath`, so the first-party way in is the right
- * Sidebar's navigation controller: `ctx.sidebarRight.openResource(address)`, with
- * the address built by `fileAddressFor` — the exact shape `dsh-client-ui-chat` and
- * `dsh-client-ui-sidebar-files` call it with. `sidebarRight` is resolved through
- * `ctx.get` and never named in `inject`, for the reason spelled out on the inject
- * comment above: on a build that lacks it, a plain-array entry would park this
- * fiber forever.
- *
- * The address builder is COPIED here rather than imported. `fileAddressFor` lives in
- * `@deepseek-ai/dsh-util-workspace-path`, which is not a client module: it declares
- * no `dsh.client`, ships no browser bundle, and is not one of the frontend's
- * platform seed words (`react`, `cordis`, `dsh-client-store`,
- * `dsh-client-ui-slots`, `dsh-client-ui-primitives`, `dsh-client-ui-dockkit`) — the
- * first-party client bundles inline its source instead of requiring it. A `require`
- * of it would miss the module table and take the whole client half down at load.
- */
-const FILE_ADDRESS_PREFIX = 'dsh-resource://file/'
-/** Component-encode one id or path segment, keeping `:` literal for drive letters. */
-function encodeAddressSegment(segment: string): string {
-  return encodeURIComponent(segment).replace(/%3A/gi, ':')
-}
-/** Encode a `/`-separated path segment by segment. */
-function encodeAddressPath(path: string): string {
-  return path.split('/').map(encodeAddressSegment).join('/')
-}
-/** Build the address of a file read through one session. */
-function sessionFileAddress(sessionId: string, path: string): string {
-  const normalized = path.replace(/\\/g, '/').replace(/^(?:\.\/)+/, '')
-  return `${FILE_ADDRESS_PREFIX}session/${encodeAddressSegment(sessionId)}/${encodeAddressPath(normalized)}`
-}
-/** Whether a path uses a Windows drive or UNC prefix. */
-function isWindowsStylePath(value: string): boolean {
-  return /^[A-Za-z]:[/\\]/.test(value) || value.startsWith('\\\\')
-}
-/** Whether a path is absolute in either spelling the host accepts. */
-function isAbsoluteWorkspacePath(path: string): boolean {
-  return path.startsWith('/') || isWindowsStylePath(path)
-}
-/**
- * The `dsh-resource://file/…` address for a path as this plugin holds it: a
- * workspace-relative path, or an absolute path inside the session's workspace,
- * becomes a relative session address; anything else keeps its absolute spelling.
- * @param sessionId - the session the path is read in.
- * @param cwd - that session's workspace root, when known.
- * @param path - absolute or workspace-relative path, in either separator spelling.
- */
-function fileAddressFor(sessionId: string, cwd: string | undefined, path: string): string {
-  const normalized = path.replace(/\\/g, '/')
-  if (!isAbsoluteWorkspacePath(normalized)) return sessionFileAddress(sessionId, normalized)
-  const root = cwd === undefined ? '' : cwd.replace(/\\/g, '/').replace(/\/+$/, '')
-  if (root !== '' && normalized === root) return sessionFileAddress(sessionId, '')
-  if (root !== '' && normalized.startsWith(`${root}/`)) return sessionFileAddress(sessionId, normalized.slice(root.length + 1))
-  return sessionFileAddress(sessionId, normalized)
-}
-
-/**
- * The session's workspace root, from the sessions list the way first-party code
- * reads it. `undefined` is a legal answer (the address builder then keeps an
- * absolute path absolute), so an unreadable list degrades instead of throwing.
- * @param ctx - a context able to resolve services.
- * @param sessionId - the session whose root is wanted.
- */
-function sessionCwdOf(ctx: any, sessionId: string): string | undefined {
-  try {
-    const row = ctx?.get?.('sessions')?.list?.getSnapshot?.()?.byId?.[sessionId]
-    return typeof row?.cwd === 'string' && row.cwd !== '' ? row.cwd : undefined
-  } catch {
-    return undefined
-  }
-}
-
-/**
- * Open one path in the editor: the 0.1.5 right-Sidebar route first, the 0.1.1
- * `workspaces.openPath` route when this build still has it, else a one-time
- * warning.
- *
- * `openResource` is the primary because it is the only route 0.1.5 ships. It can
- * legitimately refuse (no session surface mounted, or no registered tab type
- * claims the address), and on a build that still ships `openPath` that refusal
- * must not leave the click with no effect — so the legacy opener is tried as a
- * fallback rather than merely skipped. A build with neither is reported once.
- * @param ctx - the plugin's own context.
- * @param sessionId - the session the file belongs to.
- * @param path - the affected file's path, as the preview reported it.
- */
-async function openFileInEditor(ctx: any, sessionId: string, path: string): Promise<void> {
-  const sidebarRight = ctx?.get?.('sidebarRight')
-  const workspaces = ctx?.get?.('workspaces')
-  const modern = sidebarRight !== undefined && typeof sidebarRight.openResource === 'function' ? sidebarRight : undefined
-  const legacy = workspaces !== undefined && typeof workspaces.openPath === 'function' ? workspaces : undefined
-  if (modern === undefined && legacy === undefined) {
-    warnOnce(
-      'open-editor',
-      'no way to open a file in the editor is available: neither ctx.sidebarRight.openResource (0.1.5) nor ctx.workspaces.openPath (0.1.1) exists',
-    )
-    return
-  }
-  if (modern !== undefined) {
-    try {
-      modern.openResource(fileAddressFor(sessionId, sessionCwdOf(ctx, sessionId), path))
-      return
-    } catch (error) {
-      if (legacy === undefined) {
-        warnOnce('open-resource', 'could not open the file in the right sidebar', path, msg(error))
-        return
-      }
-      warnOnce('open-resource-legacy', 'the right sidebar refused the file address; falling back to workspaces.openPath', path, msg(error))
-    }
-  }
-  try {
-    await legacy!.openPath(path)
-  } catch (error) {
-    warnOnce('open-path', 'workspaces.openPath failed', path, msg(error))
-  }
-}
-
-/**
  * Rebuild draft attachments for the images a rolled-back turn had, so the composer
  * holds them again.
  *
@@ -470,16 +366,27 @@ function extCommand(ctx: any, sessionId: string, line: string): Promise<{ text?:
 }
 
 const CSS =
-  '.rbk-act{position:relative;display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:5px;border:none;border-radius:28px;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;}' +
+  '.rbk-act{position:relative;display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:5px;border:none;border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;}' +
   '.rbk-act:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary);}' +
   '.rbk-act:disabled{cursor:default;opacity:.4;}' +
+  // The box stays 28px because that is the action row's own height
+  // (`.xD_KDq_actions{height:28px}`) and a taller button would stick out of it. The
+  // GLYPH is what grows: 17px is the official size for the same button when the row
+  // is the end-of-turn variant (`.xD_KDq_actions[data-clock=end] .xD_KDq_action
+  // svg{width:17px}`), so this is a size the design already uses rather than an
+  // invented one. Padding drops to 5px to make room inside the fixed box.
+  '.rbk-act svg{width:17px;height:17px;}' +
   '.rbk-overlay{position:fixed;inset:0;z-index:1300;display:flex;align-items:center;justify-content:center;background:rgb(0 0 0/.4);backdrop-filter:blur(2px);}' +
-  '.rbk-panel{width:min(460px,calc(100vw - 32px));max-height:70vh;display:flex;flex-direction:column;border-radius:12px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);box-shadow:0 16px 48px rgb(0 0 0/.35);color:var(--dsw-alias-label-primary);}' +
+  // `--dsw-radius-panel` (28px) is the official dialog radius: the primitives'
+  // Modal uses it (`Modal.module.css:44`) and so does the composer's own card
+  // (`.RlGAzG_card` in dsh-client-ui-conversation), which is the input box this
+  // dialog sits under. It replaces a hand-picked 12px.
+  '.rbk-panel{width:min(460px,calc(100vw - 32px));max-height:70vh;display:flex;flex-direction:column;border-radius:var(--dsw-radius-panel);border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);box-shadow:0 16px 48px rgb(0 0 0/.35);color:var(--dsw-alias-label-primary);}' +
   '.rbk-head{padding:14px 16px 8px;font-size:14px;font-weight:700;}' +
   '.rbk-warn{padding:0 16px 8px;font-size:12px;color:var(--dsw-alias-label-secondary);}' +
   '.rbk-list{overflow-y:auto;padding:2px 8px;flex:1;}' +
-  '.rbk-row{display:flex;align-items:center;gap:8px;width:100%;text-align:left;padding:6px 8px;border-radius:7px;border:none;background:transparent;color:var(--dsw-alias-label-primary);font-size:12.5px;cursor:pointer;}' +
-  '.rbk-row:hover{background:color-mix(in srgb,var(--dsw-alias-label-primary) 10%,transparent);}' +
+  // The rows are a READ-OUT, not a control: no hover, no pointer, no click.
+  '.rbk-row{display:flex;align-items:center;gap:8px;width:100%;text-align:left;padding:6px 8px;border-radius:var(--dsw-radius-sm);border:none;background:transparent;color:var(--dsw-alias-label-primary);font-size:12.5px;}' +
   '.rbk-tag{flex:none;font-size:11px;padding:1px 6px;border-radius:5px;}' +
   '.rbk-tag-restore{background:color-mix(in srgb,var(--dsw-alias-state-success-primary, #3fb27f) 22%,transparent);color:var(--dsw-alias-state-success-primary, #3fb27f);}' +
   '.rbk-tag-recover{background:color-mix(in srgb,var(--dsw-static-blue-500, #3b82f6) 22%,transparent);color:var(--dsw-static-blue-500, #3b82f6);}' +
@@ -503,11 +410,28 @@ const CSS =
   '.rbk-hero-title{font-size:16px;font-weight:600;color:var(--dsw-alias-label-primary);}' +
   '.rbk-hero-sub{font-size:13px;color:var(--dsw-alias-label-tertiary);}'
 
-/** The curved reply/return arrow (↩), as a React element this time. */
-function ReplyIcon(): React.ReactElement {
-  return React.createElement('svg', { width: 18, height: 18, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': true },
-    React.createElement('path', { d: 'M6.6 3.4 3 7l3.6 3.6', stroke: 'currentColor', strokeWidth: 1.4, strokeLinecap: 'round', strokeLinejoin: 'round' }),
-    React.createElement('path', { d: 'M3 7h6.4c2.3 0 4 1.7 4 3.9V13', stroke: 'currentColor', strokeWidth: 1.4, strokeLinecap: 'round' }),
+/**
+ * The curved reply/return arrow (↩) — this plugin's mark, used both on the
+ * rollback buttons and as the `/rollback` entry's icon in the command menu.
+ *
+ * Drawn to the primitives' own convention so it sits beside theirs without
+ * reading heavy: a 16-unit viewBox like every `Icon*Outline*` there, and the
+ * REGULAR stroke weight they use — `ICON_REGULAR_STROKE = 1`
+ * (`dsh-client-ui-primitives/lib/index.js:250`). This plugin drew it at 1.4,
+ * which is above even their MEDIUM weight (1.3), and that is why it looked
+ * thicker than the buttons it stands next to.
+ *
+ * The props are theirs too (`{ size, className, strokeWidth }`), so the very
+ * same element is what `commandUi.register` accepts as its `icon`.
+ * @param props - render props, all optional.
+ * @returns the icon element.
+ */
+function RollbackIcon({ size = 16, className, strokeWidth = 1 }: { size?: number; className?: string; strokeWidth?: number } = {}): React.ReactElement {
+  // `strokeWidth` rides the <svg>, exactly as the primitives do it, so both
+  // paths inherit one weight instead of each carrying its own copy.
+  return React.createElement('svg', { width: size, height: size, viewBox: '0 0 16 16', fill: 'none', className, strokeWidth, 'aria-hidden': true },
+    React.createElement('path', { d: 'M6.6 3.4 3 7l3.6 3.6', stroke: 'currentColor', strokeLinecap: 'round', strokeLinejoin: 'round' }),
+    React.createElement('path', { d: 'M3 7h6.4c2.3 0 4 1.7 4 3.9V13', stroke: 'currentColor', strokeLinecap: 'round', strokeLinejoin: 'round' }),
   )
 }
 
@@ -1177,7 +1101,7 @@ function RollbackAction({ messageId, useSession, useChat, t }: any): React.React
     'aria-label': label,
     disabled,
     onClick: () => { if (!disabled && turn !== undefined && openRollbackDialog !== null) openRollbackDialog(turn) },
-  }, React.createElement(ReplyIcon))
+  }, React.createElement(RollbackIcon))
   return React.createElement(Tooltip, { label, side: 'bottom' }, button)
 }
 
@@ -1329,7 +1253,7 @@ function RollbackTurnAction({ turn: location, matched, useSession, t }: any): Re
     'aria-label': t('action.label'),
     disabled: blocked,
     onClick: () => { if (!blocked && openRollbackDialog !== null) openRollbackDialog(turnNo) },
-  }, React.createElement(ReplyIcon))
+  }, React.createElement(RollbackIcon))
   return React.createElement(Tooltip, { label: t('action.label'), side: 'bottom' }, button)
 }
 
@@ -1338,7 +1262,6 @@ interface DriverProps {
   execute: (turn: number) => Promise<void>
   /** Raw `/rollback list` output, for the range the action entries may offer. */
   list: () => Promise<string>
-  openFile: (path: string) => Promise<void>
   useSession: <T>(selector: (snapshot: any) => T) => T
   /**
    * The session kit hook carrying the chat target (0.1.5). Absent on 0.1.1,
@@ -1379,7 +1302,7 @@ interface DriverProps {
  * confirmation dialog, opened from the assistant action through the module
  * bridge. Renders nothing into its own dock seat.
  */
-function RollbackDriver({ preview, execute, list, openFile, useSession, useChat, inputActions, restoreImages, releaseImages, t }: DriverProps): React.ReactElement | null {
+function RollbackDriver({ preview, execute, list, useSession, useChat, inputActions, restoreImages, releaseImages, t }: DriverProps): React.ReactElement | null {
   if (typeof useSession !== 'function') {
     warnOnce('useSession', 'props lack useSession', Object.keys({ useSession }))
     return null
@@ -1547,11 +1470,13 @@ function RollbackDriver({ preview, execute, list, openFile, useSession, useChat,
           // file a shell command wrote outside the tools' reach is invisible to it),
           // so an empty list must not read as a promise that the workspace is
           // untouched. The dialogue says only what it knows.
+          // A read-out, not a control: the list says WHICH files this rollback
+          // will touch, and that is all it is for. Opening one from here was
+          // possible and turned out to be a surface nobody used — the editor is
+          // one click away in the sidebar and the path is already on screen — so
+          // the rows are plain elements now: no hover, no pointer, no focus stop.
           files !== null && files.length > 0
-            ? files.map(f => React.createElement('button', {
-                key: f.path, type: 'button', className: 'rbk-row', title: t('dialog.openInEditor'),
-                onClick: () => { void openFile(f.path).catch(() => {}) },
-              },
+            ? files.map(f => React.createElement('div', { key: f.path, className: 'rbk-row' },
                 React.createElement('span', { className: 'rbk-tag rbk-tag-' + f.action }, t(('tag.' + f.action) as RollbackKey)),
                 React.createElement('span', { className: 'rbk-path' }, f.path),
               ))
@@ -1823,6 +1748,119 @@ function RollbackHero({ t }: any): any {
 }
 
 /** Client plugin body: stylesheet, dictionaries, the assistant action, and the driver. */
+/** Turn number encoded in a picker option id (`turn-12`, or `previous-12` for the head). */
+function pickerTurnOf(id: unknown): number {
+  const m = typeof id === 'string' ? /^(?:turn|previous)-(\d+)$/.exec(id) : null
+  if (m === null) return Number.NaN
+  const turn = Number(m[1])
+  return Number.isSafeInteger(turn) && turn >= 1 ? turn : Number.NaN
+}
+
+/**
+ * The `/rollback` turn picker, and the two menu rows that reach it.
+ *
+ * Picking an entry inserts NOTHING into the composer — the menu consumes the token
+ * and the shell is the framework's own component — so this is the whole interaction:
+ * open, choose a turn, done. That is why the host command no longer advertises a
+ * spelling to copy.
+ *
+ * It takes TWO registrations because the framework splits what a row may carry:
+ *
+ * - `decorate` hangs the popup on the HOST command. A host row can never carry an
+ *   icon or localized copy (the catalog hands the client its name and its one
+ *   description, and the localized faces are a table inside `dsh-client-ui-commands`
+ *   that third parties cannot extend) — so this is what makes picking `rollback`
+ *   open the picker.
+ * - `register` adds the Chinese row. A client contribution is the only kind of row
+ *   that can carry `icon`/`label`/`description`, and it may NOT share a name with a
+ *   host command: that check throws while the menu is being built and takes the whole
+ *   command group down with it. So `回退` is registered as its own row rather than as
+ *   a second spelling on the host's, and only while the interface is Chinese — an
+ *   English interface has the `rollback` row for exactly this.
+ *
+ * The replacement for a Remote call: a profile-loaded host half cannot import a core
+ * package at runtime (measured — the entry fails to import), so the client reaches
+ * this plugin's host half through the shipped `commands` Remote, and the host command
+ * therefore has to keep existing under a name of its own.
+ * @param ctx - the plugin's client context.
+ * @param t - the plugin's translator, already bound to {@link NS}.
+ */
+function registerRollbackCommand(ctx: any, t: (key: RollbackKey, params?: Record<string, string | number>) => string): void {
+  const sessionIdOf = (session: any): string | undefined =>
+    typeof session?.sessionId === 'string' ? session.sessionId : undefined
+
+  // Every turn the host still holds a checkpoint for. An unreadable list yields no
+  // rows, and the picker then says so, rather than offering a turn a click would fail
+  // on. Newest first: the recent turns are the ones worth undoing.
+  const optionsOf = async (session: any): Promise<unknown[]> => {
+    const sessionId = sessionIdOf(session)
+    if (sessionId === undefined) return []
+    const turns = turnsOf((await extCommand(ctx, sessionId, '/rollback list')).text ?? '') ?? []
+    const newest = turns[turns.length - 1]
+    const rows: unknown[] = []
+    // The head is a shortcut for the newest turn, which is also listed below — the
+    // duplicate is deliberate: it is the action wanted most of the time.
+    if (newest !== undefined) rows.push({ id: `previous-${newest}`, label: t('picker.previous') })
+    for (let i = turns.length - 1; i >= 0; i -= 1) {
+      const turn = turns[i]!
+      rows.push({ id: `turn-${turn}`, label: t('picker.turn', { turn }) })
+    }
+    return rows
+  }
+
+  const ui = {
+    kind: 'popupSelect',
+    searchMode: 'substring',
+    searchLabels: () => ({
+      placeholder: t('picker.placeholder'),
+      empty: t('picker.empty'),
+      noResults: t('picker.noResults'),
+    }),
+    options: optionsOf,
+    // Choosing a turn opens the SAME confirmation the button opens — the affected
+    // files, and the right to cancel — instead of rolling back on the spot. That is
+    // what makes the picker a menu rather than a trigger: it picks a TARGET, it does
+    // not commit to one. It is the module-level bridge the assistant action and the
+    // turn footer already use, so this path inherits that whole flow, including
+    // re-attaching the rolled-back turn's images to the composer.
+    onSelect: async (option: any, session: any): Promise<void> => {
+      const sessionId = sessionIdOf(session)
+      const turn = pickerTurnOf(option?.id)
+      if (sessionId === undefined || Number.isNaN(turn)) return
+      if (openRollbackDialog !== null) {
+        openRollbackDialog(turn)
+        return
+      }
+      // The dialog is hosted by the dock entry, so this only happens with no
+      // conversation surface mounted. Executing is the one route left; saying so is
+      // better than a picker that silently does nothing.
+      warnOnce('picker-no-dialog', 'no rollback dialog is mounted, so the picked turn is executed without confirmation')
+      await extCommand(ctx, sessionId, '/rollback --apply ' + turn)
+    },
+  }
+
+  ctx.inject(['commandUi'], (scope: any) => {
+    const commandUi = scope.get?.('commandUi') ?? scope.commandUi
+    if (commandUi === undefined || typeof commandUi.decorate !== 'function') {
+      errorOnce('command-ui', 'the command menu is unavailable: no commandUi service, so /rollback offers no turn picker')
+      return
+    }
+    scope.effect(
+      () => commandUi.decorate({ name: 'rollback', available: () => true, ui }),
+      'rollback: /rollback turn picker',
+    )
+    // Deliberately NO client contribution. A contribution is the only kind of row
+    // that can carry an icon or localized copy, but it may not share a name with a
+    // host command (that check throws while the menu is built and takes the whole
+    // command group down), and the host command has to exist — the browser half
+    // reaches this plugin's host through the shipped `commands` Remote, and a
+    // profile-loaded host half cannot import a core package to expose a Remote of its
+    // own (measured: the entry fails to import). So the menu can never be one row AND
+    // carry an icon, and this plugin chose the one row: the host command's, whose
+    // description carries both languages because it cannot follow the interface.
+  })
+}
+
 export function apply(ctx: any): void {
   // Always reported, once per page load: the first question when a rollback looks
   // like it did nothing is whether the browser is even running the new bundle.
@@ -1838,6 +1876,17 @@ export function apply(ctx: any): void {
   })
 
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'rollback: dictionaries')
+
+  // The command menu row and its turn picker. Registered through a dynamic inject
+  // rather than by naming `commandUi` in `inject`: a name no service provides would
+  // park this whole half in "pending" forever (see the inject comment at the top),
+  // and the picker is an addition, not a reason to lose the rollback button.
+  if (typeof ctx.locale?.bind === 'function') {
+    const t = ctx.locale.bind(NS) as (key: RollbackKey, params?: Record<string, string | number>) => string
+    registerRollbackCommand(ctx, t)
+  } else {
+    errorOnce('locale-bind', 'no locale.bind, so the /rollback menu entry and its turn picker are not registered')
+  }
 
   // The marker node is the durable anchor `syncHides` reads the replaced range
   // from — the range a `replace` marker states, or the empty one an `append` marker
@@ -1902,10 +1951,9 @@ export function apply(ctx: any): void {
           return parsePreview(r.text)
         },
         execute: async (turn: number) => {
-          await extCommand(ctx, sessionId, '/rollback ' + turn)
+          await extCommand(ctx, sessionId, '/rollback --apply ' + turn)
         },
         list: async () => (await extCommand(ctx, sessionId, '/rollback list')).text ?? '',
-        openFile: (path: string) => openFileInEditor(ctx, sessionId, path),
         restoreImages: (images: { name: string; mediaType: string; attachment: any }[]) =>
           restoreDraftImages(ctx, sessionId, images),
         releaseImages: (ids: readonly string[]) => {

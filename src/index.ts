@@ -1,11 +1,14 @@
 /**
  * Rollback plugin body (Host half).
  *
- * Wires the {@link RollbackService} capture observers and registers the two
- * trigger surfaces: the model-facing `rollback` tool and the human `/rollback`
- * command. The browser half (rollback button + affected-file dialog) ships via
- * `./client` and reaches this host through the already-shipped `commands`
- * Remote (`/rollback preview|list|<turn>`).
+ * Wires the {@link RollbackService} capture observers and registers the human
+ * `/rollback` command — the plugin's only trigger surface, since a model-invoked
+ * rollback cannot exist: it would always land inside a running turn, and a running
+ * turn refuses every rollback. The browser half (rollback button, affected-file
+ * dialog, turn picker) ships via `./client` and reaches this host through the
+ * already-shipped `commands` Remote — `/rollback list` and `/rollback preview
+ * <turn>` for reading, and the internal `/rollback --apply <turn>` that only the
+ * confirmation dialog issues.
  *
  * @module @domitor-syh/dsh-rollback
  */
@@ -78,8 +81,23 @@ export function apply(ctx: Context): void {
 
   ctx.commands.register({
     name: 'rollback',
-    description: '回退到某一轮对话发起前（恢复文件并截断对话，同一会话）',
-    input: { hint: '[list | preview <turn> | <turn>]' },
+    // Both languages in one string, because a host command's description CANNOT follow
+    // the interface: the menu row shows the catalog copy verbatim, the client's only
+    // interface to a host row (`decorate`) carries behaviour and no text, and the
+    // documented locale preference is host-side only when the user explicitly picked
+    // one — "absence delegates to the browser". Carrying both readings is what keeps
+    // one row legible in either interface.
+    description: '回退到某轮对话发起前 / Roll back to before a turn',
+    // No usage example: picking the row — or typing the bare command — opens the
+    // client's turn picker instead, so a spelling to copy would be noise. The
+    // descriptor itself has to stay, because that is what keeps the argument route
+    // alive: a host command without `input` refuses a line like `/rollback 12` at
+    // the composer (`matchEnter` returns void for a non-bare token), and an
+    // unmatched slash line is submitted to the model as an ordinary prompt. An empty
+    // hint is refused by the registry (`normalizeDefinition`: "input hint must not
+    // be empty"), so the placeholder states the affordance instead of listing the
+    // syntax.
+    input: { hint: '（从弹窗选择轮次）' },
     async handler(invocation) {
       const session = invocation.agent.session
       const raw = invocation.rawInput.trim()
@@ -96,9 +114,20 @@ export function apply(ctx: Context): void {
           const plan = await service.preview(session as never, turn)
           return { kind: 'success', text: planText(plan, `回退到第 ${turn} 轮发起前，受影响文件：`) }
         }
-        const turn = Number(raw)
+        // Two spellings reach the same execute. `--apply` is what the confirmation
+        // dialog issues, so the picker and the button both commit through a dialog.
+        // A bare number is what a person types, and it is honoured — but it does NOT
+        // raise that dialog, because the framework gives the client no way to
+        // intercept an argument-bearing line: contributions and decorations are
+        // consulted only for a BARE token, and a host command that declares `input`
+        // hands the arguments straight to this handler. Documented in both READMEs so
+        // the difference is a stated property rather than a surprise.
+        const turn = raw.startsWith('--apply') ? Number(raw.slice('--apply'.length).trim()) : Number(raw)
         if (!Number.isSafeInteger(turn) || turn < 1) {
-          return { kind: 'error', text: '用法：/rollback [list | preview <turn> | <turn>]' }
+          return {
+            kind: 'error',
+            text: '用法：/rollback（弹出轮次选择）｜ /rollback <轮次号>（直接回退，无确认弹窗）｜ 辅助：/rollback list、/rollback preview <turn>',
+          }
         }
         const outcome = await service.execute(session as never, turn, invocation.signal)
         return { kind: 'success', text: outcome.summary }

@@ -48,6 +48,30 @@ export function windowRefusal(fromTurn: number, availableTurns: readonly number[
 }
 
 /**
+ * The rollback-able turns named by the host's `/rollback list` text, ascending.
+ *
+ * The same parse as {@link oldestTurnOf}, for the caller that needs every turn
+ * rather than just the floor — the `/rollback` picker offers one entry per turn.
+ * Only the comma-separated run of numbers DIRECTLY after the marker counts: the
+ * line also carries a window hint with a number of its own ("仅最近 10 轮"), and
+ * folding that one in would offer a turn that cannot be rolled back.
+ * @param text - the command's output, as the client received it.
+ * @returns the turns, ascending; `[]` when the text names none; null when the
+ * text is not a list this function recognizes (which is "unknown", not "none").
+ */
+export function turnsOf(text: string | null | undefined): number[] | null {
+  if (text === null || text === undefined || text === '') return null
+  const marker = text.includes('：') ? '：' : text.includes(':') ? ':' : null
+  if (marker === null) return null
+  const list = /^\s*((?:\d+\s*,\s*)*\d+)/.exec(text.slice(text.indexOf(marker) + 1))
+  if (list === null) return []
+  return list[1]!
+    .split(',')
+    .map(part => Number(part.trim()))
+    .filter(turn => Number.isSafeInteger(turn) && turn >= 1)
+}
+
+/**
  * The oldest rollback-able turn named by the host's `/rollback list` text.
  *
  * The action entries read the range from that command's human-readable output, so the
@@ -64,14 +88,7 @@ export function windowRefusal(fromTurn: number, availableTurns: readonly number[
  * @returns the oldest available turn, or null when the text says nothing usable.
  */
 export function oldestTurnOf(text: string | null | undefined): number | null {
-  if (text === null || text === undefined || text === '') return null
-  const marker = text.includes('：') ? '：' : text.includes(':') ? ':' : null
-  if (marker === null) return null
-  const list = /^\s*((?:\d+\s*,\s*)*\d+)/.exec(text.slice(text.indexOf(marker) + 1))
-  if (list === null) return Number.POSITIVE_INFINITY
-  const turns = list[1]!
-    .split(',')
-    .map(part => Number(part.trim()))
-    .filter(turn => Number.isSafeInteger(turn) && turn >= 1)
+  const turns = turnsOf(text)
+  if (turns === null) return null
   return turns.length === 0 ? Number.POSITIVE_INFINITY : Math.min(...turns)
 }
