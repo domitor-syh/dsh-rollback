@@ -10,7 +10,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import type { Session } from '@deepseek-ai/dsh-session'
+import type { Session, SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session/types'
 import { unlink } from 'node:fs/promises'
 import { resolve } from 'node:path'
@@ -22,6 +22,7 @@ import { deadTurnsOf, isReplacedSeq, replacedSurfaceRanges } from './core/log-re
 import { rollbackRefusal, windowRefusal } from './core/rollback-guard.ts'
 import { BoundaryRescan } from './boundary-rescan.ts'
 import { cleanupEmptyDirs } from './empty-dirs.ts'
+import { diagnose } from './log.ts'
 import {
   planTruncationMarker,
   shadowedSurfaceFrom,
@@ -137,7 +138,12 @@ function appendRollbackMarker(session: Session, plan: TruncationMarkerPlan): { r
   return withReplaceSurfaceOpFallback(range, surfaceOp =>
     session.append('user/message', plan.data as never, {
       surfaceOp: surfaceOp as never,
-      sourceEventSeqs: [...plan.sourceEventSeqs],
+      // `src/core` is deliberately dependency-free and never imports a DSH type, so
+      // the plan carries plain numbers. They ARE the session's own event seqs, so the
+      // brand is restored here — at the one place those two worlds meet. Without the
+      // cast the compiler is right to complain, and this line used to be invisible
+      // because the whole file was checked with the unresolved-package fallout silenced.
+      sourceEventSeqs: [...plan.sourceEventSeqs] as unknown as SessionSeq[],
     }))
 }
 
@@ -175,9 +181,9 @@ function eventsOf(session: any): readonly any[] {
   return []
 }
 
-function watchablePaths(sessionId: string, skipTurns?: ReadonlySet<number>): string[] {
+function watchablePaths(sessionId: string, skipTurns?: ReadonlySet<number>, report?: (message: string) => void): string[] {
   const paths = new Set<string>()
-  for (const byPath of loadCheckpoints(sessionId, skipTurns).values()) {
+  for (const byPath of loadCheckpoints(sessionId, skipTurns, report).values()) {
     for (const [path, record] of byPath) {
       // Only a create/update record proves a file is real state worth watching. A
       // `remove` record is a FINDING, and a finding about a path whose only real
@@ -212,22 +218,26 @@ export class RollbackService {
     // anchor a finding at the boundary's turn.
     this.rescan = new BoundaryRescan({
       hostPathOf: async (sessionId, path) => {
-        const session = this.ctx.sessions.get(sessionId)
+        // Same boundary as above: the id arrives as a plain string from this plugin's
+        // own dependency-free layers, and `SessionId` is branded.
+        const session = this.ctx.sessions.get(sessionId as unknown as SessionId)
         if (session === undefined) return undefined
         const policy = this.ctx.sandboxPolicy.resolve({ session })
         const target = await this.ctx.fs.resolve(path, { cwd: policy.workspaceRoot })
         return this.ctx.fs.processPath(target)
       },
-      watchedPaths: sessionId => watchablePaths(sessionId, this.deadTurns.get(sessionId)),
+      watchedPaths: sessionId => watchablePaths(sessionId, this.deadTurns.get(sessionId), message => diagnose(this.ctx, 'warn', message)),
       knownContent: sessionId => loadWatched(sessionId, this.deadTurns.get(sessionId)),
       record: (sessionId, turn, mutation) => {
-        const session = this.ctx.sessions.get(sessionId)
+        // Same boundary as above: the id arrives as a plain string from this plugin's
+        // own dependency-free layers, and `SessionId` is branded.
+        const session = this.ctx.sessions.get(sessionId as unknown as SessionId)
         if (session === undefined) return
         const fold = this.foldFor(session)
         if (!fold.mutationInto(turn, mutation)) {
           // The boundary's turn already left the retained window: recording it
           // elsewhere would restore the wrong state, so it is dropped with a word.
-          console.warn(`[dsh-rollback] turn ${turn} left the retained window before its boundary scan finished; ${mutation.path} was not recorded`)
+          diagnose(this.ctx, 'warn', `[dsh-rollback] turn ${turn} left the retained window before its boundary scan finished; ${mutation.path} was not recorded`)
           return
         }
         appendCheckpoint({
@@ -239,7 +249,7 @@ export class RollbackService {
           after: mutation.after,
         })
       },
-      warn: message => console.warn(message),
+      warn: message => diagnose(this.ctx, 'warn', message),
     })
 
     // Plugin failures are CONTAINED here, never propagated: this observer runs
@@ -265,7 +275,7 @@ export class RollbackService {
             const endedSessionId = typeof session.id === 'string' ? session.id : ''
             if (endedSessionId !== '') {
               this.rescan.scan(endedSessionId, event.data.turn).catch(error => {
-                console.warn('[dsh-rollback] boundary re-scan failed; the host keeps working:', error)
+                diagnose(this.ctx, 'warn', '[dsh-rollback] boundary re-scan failed; the host keeps working:', error)
               })
             }
             fold.fold({ kind: 'turn-end', turn: event.data.turn, seq: event.seq })
@@ -285,7 +295,7 @@ export class RollbackService {
               const sessionId = typeof session.id === 'string' ? session.id : ''
               if (openedTurn !== null && sessionId !== '') {
                 this.rescan.scan(sessionId, openedTurn).catch(error => {
-                  console.warn('[dsh-rollback] boundary re-scan failed; the host keeps working:', error)
+                  diagnose(this.ctx, 'warn', '[dsh-rollback] boundary re-scan failed; the host keeps working:', error)
                 })
               }
             }
@@ -294,7 +304,7 @@ export class RollbackService {
             break
         }
       } catch (error) {
-        console.warn('[dsh-rollback] session/event observer failed; the host keeps working:', error)
+        diagnose(this.ctx, 'warn', '[dsh-rollback] session/event observer failed; the host keeps working:', error)
       }
     })
 
@@ -307,14 +317,14 @@ export class RollbackService {
     // tool failure and hand the host an apparent success, which is a semantics
     // change, not a defensive one.
     ctx.on('tools/pre-execute', async (exec, next) => {
-      if ((exec as { name?: string }).name !== 'str_replace_editor') return next()
+      if (!['str_replace_editor', 'write', 'edit'].includes((exec as { name?: string }).name ?? '')) return next()
       try {
         await this.captureBefore(exec as Parameters<RollbackService['captureBefore']>[0])
       } catch (error) {
         // Still never blocks or fails the tool — but no longer silently: a capture
         // read that stopped working is exactly the kind of thing this must say out
         // loud, or rollback coverage would decay unobserved.
-        console.warn('[dsh-rollback] tools/pre-execute observer failed; the host keeps working:', error)
+        diagnose(this.ctx, 'warn', '[dsh-rollback] tools/pre-execute observer failed; the host keeps working:', error)
       }
       return next()
     })
@@ -339,14 +349,28 @@ export class RollbackService {
           exec as unknown as MutationActor,
           (result as { value?: unknown }).value,
         )
-        const mutation = reported ?? (pending === undefined
-          ? null
-          : {
-              path: pending.path,
-              operation: pending.kind === 'created' ? 'create' : 'update',
-              before: pending.before,
-              after: '',
-            })
+        // A `remove` is the tool's own news and is kept. Everything else defers to our
+        // own observation of whether the target EXISTED before the tool ran, because
+        // the tool cannot express that distinction here: measured on 0.2.0-rc.2, a file
+        // created by `write` is reported with `before: ""` and no `create` marker, so it
+        // was recorded as an update — and rolling that turn back RESTORED the file
+        // instead of deleting it, while a turn that only created files looked like it
+        // had changed nothing at all. `mutationOf` still supplies the bytes.
+        const operation = reported !== null && reported.operation === 'remove'
+          ? 'remove'
+          : pending?.kind === 'created'
+            ? 'create'
+            : reported?.operation ?? 'update'
+        const mutation = reported !== null
+          ? { ...reported, operation }
+          : pending === undefined
+            ? null
+            : {
+                path: pending.path,
+                operation,
+                before: pending.before,
+                after: '',
+              }
         if (mutation === null) return
 
         const fold = this.foldFor(sessionObj)
@@ -379,7 +403,7 @@ export class RollbackService {
           })
         }
       } catch (error) {
-        console.warn('[dsh-rollback] tools/result observer failed; the host keeps working:', error)
+        diagnose(this.ctx, 'warn', '[dsh-rollback] tools/result observer failed; the host keeps working:', error)
       }
     })
 
@@ -393,7 +417,7 @@ export class RollbackService {
       try {
         this.seedFromLog(session as Session)
       } catch (error) {
-        console.warn('[dsh-rollback] session/created observer failed; the host keeps working:', error)
+        diagnose(this.ctx, 'warn', '[dsh-rollback] session/created observer failed; the host keeps working:', error)
       }
     })
     for (const session of this.ctx.sessions.list()) this.seedFromLog(session as Session)
@@ -427,7 +451,7 @@ export class RollbackService {
     // Keep watching whatever the sidecar still knows — minus those removed turns — so
     // a restarted process notices a shell command that removes one of those files.
     if (sessionKey !== '') this.rescan.prime(sessionKey)
-    const durable = loadCheckpoints(String(session.id), this.deadTurns.get(sessionKey))
+    const durable = loadCheckpoints(String(session.id), this.deadTurns.get(sessionKey), message => diagnose(this.ctx, 'warn', message))
     const calls = new Map<string, { name: string; argsRaw: string }>()
     for (const event of eventsOf(session)) {
       if (isReplacedSeq(event.seq, replaced)) continue
@@ -500,7 +524,10 @@ export class RollbackService {
     agent?: { session?: { header?: { cwd?: string } } }
   }): Promise<void> {
     const args = (exec.arguments ?? {}) as { command?: unknown; path?: unknown }
-    if (args.command !== 'create' && args.command !== 'str_replace' && args.command !== 'insert') return
+    const name = exec.name ?? ''
+    if (name === 'str_replace_editor') {
+      if (args.command !== 'create' && args.command !== 'str_replace' && args.command !== 'insert') return
+    } else if (name !== 'write' && name !== 'edit') return
     const path = args.path
     if (typeof path !== 'string' || path === '') return
     const session = exec.agent?.session
@@ -641,12 +668,12 @@ export class RollbackService {
       if (spanStartMs === undefined) {
         // No opening time in the log: the creation-time test cannot be made, and this
         // pass fails closed by doing nothing.
-        console.warn(`[dsh-rollback] no turn/start time for turn ${fromTurn}; skipping empty-directory cleanup`)
+        diagnose(this.ctx, 'warn', `[dsh-rollback] no turn/start time for turn ${fromTurn}; skipping empty-directory cleanup`)
       } else {
         const cleanup = await cleanupEmptyDirs(deletedHostPaths, spanStartMs, policy.workspaceRoot)
         removedDirs.push(...cleanup.removed)
         for (const failure of cleanup.failed) {
-          console.warn(`[dsh-rollback] could not remove emptied directory ${failure.path}: ${failure.reason}`)
+          diagnose(this.ctx, 'warn', `[dsh-rollback] could not remove emptied directory ${failure.path}: ${failure.reason}`)
         }
       }
     }

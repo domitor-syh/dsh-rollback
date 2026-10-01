@@ -1,4 +1,4 @@
-<div align="center">
+﻿<div align="center">
 
 # dsh-rollback · TRAE 式「回退」插件
 
@@ -29,7 +29,7 @@
 | 0.1.5-rc.2 | **已实测** | 上一代适配并逐项验证的构建：回退、截断、文件恢复、欢迎页、隐藏、图片回填都在它上面端到端跑通。0.4.0 对它仍是**实测过的那一套行为**——本次两处修复都保留了对旧拼写的识别与回落（`chain` 座位、`{kind:'plugin'}` 标记），所以同一份产物继续服务这一代 |
 | 0.1.1-rc.2 | 按设计支持，**未实测** | 插件为这一代契约保留了特性探测回退分支：已退役的 `conversationEvents` 服务、快照上的 `session.chat`、旧拼写的表层 `start`/`end`、`addImages`/`pruneImages`。本机没有 0.1.1 的构建，这条路径**没有在真实运行 0.1.1 的机器上跑过**——它是设计上的回退，不是实测结论 |
 | 0.1.1-rc.1、0.1.2-alpha.2–alpha.5、0.1.2-rc.1、0.1.3-alpha.2、0.1.5-alpha.1/alpha.2/rc.1/rc.3、0.1.6-alpha.1/alpha.2、0.1.7-alpha.1/alpha.2/rc.1 | **未验证** | 没有在这些构建上跑过，包括同属 0.1.5 线、晚于 0.1.5-rc.2 发布的 `0.1.5-rc.3`。某个构建若改了契约，插件不会静默失败：它会在控制台点名报错（见下），隐藏逻辑 fail-closed，最坏只退化成「不隐藏」这一外观影响。要在这些版本上试，请挑一个可以丢弃的会话 |
-| 0.0.1-rc.1/rc.2/rc.5、0.1.0-rc.2/rc.3/rc.6/rc.7/rc.8（低于 0.1.1） | 不支持 | 低于 0.1.1 没有上述回退所覆盖的契约，且落在 `dsh.engines.dsh`（`>=0.2.0-rc.2`）的下界之外 |
+| 0.0.1-rc.1/rc.2/rc.5、0.1.0-rc.2/rc.3/rc.6/rc.7/rc.8（低于 0.1.1） | 不支持 | 低于 0.1.1 没有上述回退所覆盖的契约，且落在兼容区间（`dsh.engines.dsh` 与 `peerDependencies` 同为 `>=0.1.5-rc.2 …`）的下界之外 |
 | 0.2.0-rc.1 及更早的 0.2.0 预发布，以及 0.2.0 之后尚未发布的构建 | **未验证** | 只实测过 `0.2.0-rc.2` 这一个构建。0.2.0 线仍在预发布期，契约可能再变；同样的自我保护仍然生效（控制台点名报错、隐藏 fail-closed，最坏只退化成「不隐藏」）。要在这些构建上试，请挑一个可以丢弃的会话 |
 
 - 在 DSH **0.1.5-rc.2** 上装 **0.3.x**。**不要**把 0.1.0–0.2.2 装到 0.1.5 上：那一代在 0.1.5 上会**弄坏会话加载**——客户端半边把已不再存在的 `conversationEvents` 服务写进必需注入，于是永远停在 pending（表现是「装了什么也没发生」）；宿主半边则在框架恢复会话时从 `session/created` 观察者里抛错（0.1.5 不再交出 `session.events`），结果是会话打不开、对话区渲染为空。
@@ -37,7 +37,16 @@
 
 框架契约和插件预期不一致时，插件**大声报错而不是静默失败**：浏览器控制台会打印 `[rollback] framework contract mismatch: …` 或 `[rollback] hiding disabled for this pass: …`。界面隐藏逻辑是 **fail-closed** 的——聊天结构读不出来时它**什么都不隐藏**，并把此前隐藏的内容全部交还，所以未来的框架改动最多退化成「不隐藏」（纯外观影响），永远不会把对话区清空。宿主半侧把它注册的每个观察者都包在自己的 try/catch 里，所以插件出错不会影响宿主自身的会话加载。
 
-`package.json` 里的 `dsh.engines.dsh` 为 `>=0.2.0-rc.2`。下界就是本次适配并实测的构建；不写上界，是因为上界只会让下一个构建（比如正式的 `0.2.0`——按 semver 它大于 `0.2.0-rc.2`，而它几乎必然可用）被误判成不兼容。DSH **不读取**这个字段：0.2.0 的兼容性闸门只看 `peerDependencies` 里的 `@deepseek-ai/dsh*`，本插件在那里只有 `react`，所以这个取值不会挡住安装或加载——它是给人和其他工具（市场徽章）看的元数据。另外，npm 的预发布规则让**任何**区间都覆盖不到下一个 `x.y.z-rc.1` 形式的预发布，这不是插件能靠区间解决的问题；所以上面这张矩阵才是权威说明。
+`package.json` 里的 `dsh.engines.dsh` 为 `>=0.1.5-rc.2 <0.2.0-0 || >=0.2.0-rc.2 <0.3.0-0`。**DSH 不读取这个字段**——真正生效的兼容闸门在 `peerDependencies`（见下），它只是给人和其他工具（市场徽章）看的元数据，取值与闸门保持同一个表达式。
+
+**兼容闸门**（`dsh-app-boot` 内）：只检查 `peerDependencies` 里名字为 `@deepseek-ai/dsh` 或 `@deepseek-ai/dsh-*` 的项，用 `semver.satisfies(runtimeVersion, range, { includePrerelease: true })` 与**当前运行时的版本**比较；**一项都没声明就完全不检查**。本插件因此显式声明了 `@deepseek-ai/dsh`、`@deepseek-ai/dsh-session`、`@deepseek-ai/dsh-invariants` 三项（后两项只是把我们实际耦合的宿主接口写明白，比较对象仍是运行时版本），范围同上。
+
+这个区间为什么长这样，两处都是必须的：
+
+- **两段子句，而不是一个开区间下界**。`>=0.1.5-rc.2` 这一个子句在**默认** semver 规则下**不包含** `0.2.0-rc.2`（区间里没有同一 `major.minor.patch` 的预发布比较子）——这正是生态里同类插件普遍写成 OR 链的原因。本插件同时支持 0.1.5 线与 0.2.0 线（旧契约回退分支就是为此存在），所以两条线各写一段。
+- **上界写成 `<0.2.0-0` / `<0.3.0-0`，而不是 `<0.2.0` / `<0.3.0`**。闸门带 `includePrerelease`，而预发布版排在自己的正式版**之下**，于是 `<0.3.0` 会**放行** `0.3.0-rc.1`。`<0.3.0-0`（数字标识符低于任何字母标识符）才是「整条下一条线都不要」的正确写法。这道闸门的存在意义就是防止「跑在没见过的格式上导致崩溃或数据丢失」，所以下一条线必须**被拦下并要求重新验证**，而不是静默通过。
+
+因此**上面这张矩阵才是权威说明**：区间决定闸门放不放行，矩阵说明哪些构建真的跑过。
 
 ## 功能特性
 
@@ -115,7 +124,7 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 - **运行中一律禁止回退**：只要有一轮处于打开状态就整体拒绝（`src/core/rollback-guard.ts`），无论目标是哪一轮。agent loop 持有表层位置并持续追加，在它下面截断会把"这一轮正在写的历史"遮蔽掉、而它更晚的输出还在；命令也不会打断运行，所以**拒绝本身**才是让两者不交错的原因。运行中的轮次**本来就没有按钮**（页脚节点要等该轮 `turn/end` 才存在，动作条要等助手消息收尾），所以这里只有一条规则、没有第二套禁用机制。
 - **欢迎页**：把整段对话回退掉之后，由 driver 往对话区注入宿主元素，再用 React portal 把欢迎页渲染进去。
 - **客户端传输**：复用已出厂 `ctx.remote.commands.execute` 调 `/rollback …`。
-- **回归测试**：13 个文件 / 199 个用例 —— `tests/core.test.ts`（35）、`tests/truncation-plan.test.ts`（29）、`tests/log-replay.test.ts`（18）、`tests/dir-cleanup.test.ts`（15）、`tests/root-write-fallback.test.ts`（15）、`tests/rollback-guard.test.ts`（14）、`tests/root-write.test.ts`（14）、`tests/boundary-scan.test.ts`（13）、`tests/boundary-rescan.test.ts`（13）、`tests/literal-edit.test.ts`（12）、`tests/turn-entry.test.ts`（11）、`tests/boundary-pipeline.test.ts`（5）、`tests/empty-dirs.test.ts`（5）。
+- **回归测试**：14 个文件 / 206 个用例 —— `tests/core.test.ts`（35）、`tests/truncation-plan.test.ts`（29）、`tests/log-replay.test.ts`（18）、`tests/dir-cleanup.test.ts`（15）、`tests/root-write-fallback.test.ts`（15）、`tests/rollback-guard.test.ts`（14）、`tests/root-write.test.ts`（14）、`tests/boundary-scan.test.ts`（13）、`tests/boundary-rescan.test.ts`（13）、`tests/literal-edit.test.ts`（12）、`tests/turn-entry.test.ts`（11）、`tests/sidecar-replay.test.ts`（7）、`tests/boundary-pipeline.test.ts`（5）、`tests/empty-dirs.test.ts`（5）。
 
 ## 已知限制（Known Limitations）
 
@@ -125,6 +134,9 @@ pnpm dsh plugin --profile web add @domitor-syh/dsh-rollback
 - **模型会读到一行检查点文字**：轮次之间写不出"模型不可见"的标记（那需要一个已开启的 step），所以模型会读到那段检查点说明，约 **34 token**（136 字符；压缩前是 331 字符 / 约 83 token）。这段文字**会一直留在模型上下文里直到本次会话结束**（只有下一次回退会替换它），所以每个后续请求都要付一次——因此措辞写到最紧，同时保住四件事：① 它是机器生成的、不是用户说的；② 此后的消息已移除；③ 工作区文件同时被还原；④ 从剩下的内容继续、**不要在意也不要提及这个检查点**。`tests/truncation-plan.test.ts` 用一条字符预算断言钉住它，防止以后又长回去。
 - **检查点为进程内存态 + 20 轮 sidecar**：折叠状态随会话对象存于内存（`WeakMap`）；重启后由 sidecar（`storages/dsh-rollback/checkpoints-v2/`）重建，保留最近 20 轮（`KEEP_TURNS`），更早的记录在加载时被剪枝。
 - **新建文件删除与空目录清理走本地文件系统**：文件系统抽象层没有删除原语，删除通过 `processPath` + Node `unlink`、空目录清理通过 Node `rmdir` 完成，仅对本地后端可靠。
+- **回退后带路径的附件（参考芯片）不会回到输入框**：文字与图片都会回填，唯独参考芯片回不来——框架把输入框建模为 `{ draft, occurrences, attachmentIds }`，但只对插件开放**后两项的登记动作**，而**芯片**唯一入口是 `@` 提及协议返回的引用，插件没有任何接口能主动插入一个芯片。同类里最成熟的 `dsh-recall-plugin` 同样做不到（其引用相关命中均为 0）。因此这里只回填文字与图片，**不把路径当纯文本塞进输入框**（那会改变你要发出去的内容）。
+- **用 `@路径` 提的文件，回退后回来的只有那段文字**：这条是上一条的实测版。`@路径` 提及在消息里就是**一个 `text` 块**（实测：`blocks: {text: 1}`，内容形如 `@C:\dir\file.dll 这是什么文件`），**框架不会把它变成上传附件**，所以插件既看不到附件、也无从重建芯片——回退后你看到的是**原样的 `@路径` 文字**。这与"附件没回来"看起来一样，但原因不同：**那个附件从来就不存在**。诊断方式：回退后控制台会打印 `[rollback] rolled-back turn message: { turn, blocks, restorable, beforeRead }` —— `blocks` 里没有 `file`/`image` 就说明这一轮消息里没有附件。
+- **明确声明**：**没有任何官方接口能把「文件」送回输入框**。插件能重建的只有**图片**（用 `uiConversation.imageUrl` 取回字节 + `conversation.createDrafts` 登记草稿 + `addAttachments` 挂回，这条路已实测可用 ✓）。对**文件**，官方面只提供了同一套 `createDrafts`（它会触发一次上传），插件**已经照做并且会重试 append**，但凡框架没有把该文件留成 durable attachment（例如输入框里那个"芯片"其实是 `@路径` 引用），就**没有任何办法**把它变回输入框里的芯片——这不是本插件缺了什么，而是插件可用的接口里不存在这条路。同类插件 `dsh-recall-plugin` 对文件同样是尝试 + 兜底提示（其文案写明"官方 API 只读得回图片"），也没有别的招。
 - **回退不可撤销**：执行即替换历史，不提供 redo 链。
 - **shell 新建的文件、以及从未被文件工具碰过的文件不在回退范围**：插件只从 `write`/`edit` 的结果里捕获改动，并在消息边界复查这些路径——所以「shell 改写了/删除了**已登记**文件」（含工作区外，如 `E:\`、桌面）**可以**回退；而「shell 新建一个全新文件」或「改动一个从未被工具碰过的文件」无法回退（后者连它存在过都不知道）。插件会注入提示引导模型改走文件工具，但无法强制。
 
@@ -135,10 +147,10 @@ pnpm install        # 安装依赖（prepare 会先构建一次）
 pnpm build          # 从 src/ 产出 lib/index.js、lib/invariant.js、lib/client.js
 pnpm test           # 运行核心逻辑（src/core/）单测
 pnpm typecheck      # tsc 检查 core + tests；scripts/typecheck-host.mjs 再检查
-                    #   src/service.ts、src/index.ts、src/client/index.ts
-                    #   （这三个文件 import 的 @deepseek-ai/* 不在本仓库安装，
-                    #     故只忽略这些包造成的 TS2307/TS7006/TS7016，
-                    #     其余一律视为真错误——含 TS2304「未定义标识符」）
+                    #     宿主与客户端面向 DSH 的 5 个文件（src/dsh-types.ts、
+                    #     src/service.ts、src/index.ts、src/invariant.ts、
+                    #     src/client/index.ts），**一条诊断都不静音**
+pnpm check:readmes  # 中英两个 README 的结构与语言无关事实必须一致
 pnpm deploy:profile # 打包并部署到 DSH profile（默认 web），随后需重启 DSH
 ```
 

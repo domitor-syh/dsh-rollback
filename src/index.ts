@@ -19,7 +19,16 @@ import { installRootWriteFallback } from './root-write-fallback.ts'
 import { RollbackService, summarize } from './service.ts'
 
 export const name = 'rollback'
-export const inject = ['fs', 'sessions', 'tools', 'commands', 'sandboxPolicy']
+/**
+ * Required services. `tools` is deliberately absent: this plugin listens to
+ * `tools/pre-execute` and `tools/result`, which are EVENTS and need no service, and
+ * the model tool that once needed the service was removed in 0.2.0 — so naming it
+ * here bought nothing while carrying the one failure this list can cause. A name no
+ * build provides parks the whole host half in "pending" forever: no apply, no
+ * command, no observers, and no error anywhere. One fewer name is one fewer way for
+ * a future core to silently kill the plugin.
+ */
+export const inject = ['fs', 'sessions', 'commands', 'sandboxPolicy']
 
 const WINDOW_HINT = '(仅最近 10 轮)'
 

@@ -29,6 +29,7 @@
  */
 
 import { open, readFile, rename, stat as nodeStat, unlink } from 'node:fs/promises'
+import { diagnose } from './log.ts'
 import {
   applyLiteralEdit,
   detectLineEndings,
@@ -245,7 +246,7 @@ async function writeAtDriveRoot(
   const after = await fs.stat(target, signal)
   // Worth one line: while this never appears, the provider is still failing this
   // way and the fallback is still earning its place.
-  ctx.logger?.info?.(`[rollback] wrote "${display}" past the drive-root mkdir failure`)
+  diagnose(ctx, 'info', `[rollback] wrote "${display}" past the drive-root mkdir failure`)
   return {
     operation: existing === undefined ? 'create' : 'update',
     version: after?.version ?? `missing:${hostPath}`,
@@ -311,7 +312,7 @@ async function editAtDriveRoot(
   await landBytes(hostPath, restoreLineEndings(applied.content, original.lineEndings), true, signal)
 
   const after = await fs.stat(target, signal)
-  ctx.logger?.info?.(`[rollback] edited "${display}" past the drive-root mkdir failure`)
+  diagnose(ctx, 'info', `[rollback] edited "${display}" past the drive-root mkdir failure`)
   return {
     version: after?.version ?? `missing:${hostPath}`,
     before: original.content,

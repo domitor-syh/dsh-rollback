@@ -83,9 +83,17 @@ describe('findingTurn', () => {
     expect(findingTurn(9, 9)).toBe(9)
   })
 
-  it('moves to the turn after the last confirmation otherwise', () => {
-    expect(findingTurn(5, 9)).toBe(6)
+  it('stays on the scanned turn however stale the last confirmation was', () => {
+    // The earlier rule advanced to `lastSeenTurn + 1`, which is a claim that the change
+    // happened in a turn whose boundary had ALREADY seen the file intact — impossible,
+    // and harmful: it filed a deletion under the previous turn, so rolling back the turn
+    // that actually deleted the file planned a window that excluded the removal.
+    // Measured on the desktop (2026-10-02): a file created in turn 6, untouched in turn 7
+    // and deleted in turn 8 was recorded as turn 7, and the 找回 entry went missing.
+    expect(findingTurn(5, 9)).toBe(9)
     expect(findingTurn(1, 2)).toBe(2)
+    expect(findingTurn(6, 7)).toBe(7)
+    expect(findingTurn(6, 8)).toBe(8)
   })
 
   it('falls back to the scanned turn when nothing was ever confirmed', () => {

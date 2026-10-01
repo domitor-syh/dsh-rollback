@@ -74,26 +74,35 @@ export function unchangedByStat(tracked: TrackedFile, size: number, mtimeMs: num
 /**
  * The turn a finding belongs to.
  *
- * The scan runs at a turn's END, so that is the first moment the plugin learns a watched
- * file changed or vanished -- but "first noticed" is not "when it happened", and a
- * finding attributed to the noticing turn claims that turn did it. A rollback acts on
- * exactly that claim, so getting it wrong invents file changes in turns that made none:
- * rolling back an ordinary conversation turn offered files that had disappeared many
- * turns earlier, because noticing was all that happened in that turn.
+ * The scan runs at a turn's END, so a change is only ever LEARNED at a boundary at or
+ * before the turn being scanned. A finding must therefore be attributed to the turn
+ * whose boundary produced it — never to an earlier one.
  *
- * The honest attribution is the turn AFTER the last moment the file was confirmed to
- * exist, since the change happened somewhere in between. When that confirmation came in
- * the very turn being scanned, the change did happen inside it -- the case the re-scan
- * exists for, a shell command deleting a file the same turn wrote -- and it stays
- * attributed to that turn so rolling it back restores the file.
+ * The earlier rule was "the turn after the last confirmation" (`lastSeenTurn + 1`),
+ * on the theory that first-noticed is not when-it-happened. It was wrong in the
+ * direction that MATTERS, and it lost data: measured on the desktop (2026-10-02), a
+ * file confirmed in turn 6 and deleted in turn 7 was reported as a finding of turn 7
+ * only by luck — and a file confirmed in turn 6 and deleted in turn 8 (with turn 7
+ * touching it not at all) was reported as a finding of turn **7**. Rolling back turn 8
+ * then planned a window starting at 8, which EXCLUDED the removal, so the file the
+ * user had just deleted was never offered as 找回 and the dialog silently listed one
+ * file too few.
+ *
+ * Keeping the finding at the scanned turn is the conservative direction: it makes the
+ * change undoable by rolling back to before the turn whose boundary found it. That is
+ * true even when the deletion really happened earlier — the file was still present at
+ * that earlier turn's boundary (otherwise the scan would have noticed then), so a
+ * rollback to before the scanned turn restoring it is correct, and a rollback to
+ * before the earlier turn is not offered as if it had been the cause.
  * @param lastSeenTurn - the turn that last confirmed the file existed, or null when this
- *   plugin has never confirmed it.
+ *   plugin has never confirmed it. Retained in the signature because callers track it
+ *   for the registry; the attribution no longer depends on it.
  * @param scannedTurn - the turn whose end the scan is running at.
  * @returns the turn the finding must be recorded against.
  */
 export function findingTurn(lastSeenTurn: number | null | undefined, scannedTurn: number): number {
-  if (lastSeenTurn == null) return scannedTurn
-  return lastSeenTurn === scannedTurn ? scannedTurn : lastSeenTurn + 1
+  void lastSeenTurn
+  return scannedTurn
 }
 /**
  * Decide what a re-check found.

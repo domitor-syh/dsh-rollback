@@ -1,17 +1,21 @@
-/**
+﻿/**
  * Rollback plugin, browser half — a per-message "回退" action on the
  * finalized assistant message's IconActions strip.
  *
  * The button rides DSH's official `conversation.chat.assistant-actions` slot
  * (the same surface the Like/Dislike feedback uses), so the placement and
- * life-cycle are framework-managed — no DOM injection, no MutationObserver
- * button correlation. Clicking opens the affected-files dialog (host RPC
- * through the shipped `commands` Remote) with an irreversible confirm.
+ * life-cycle are framework-managed — the button itself needs no DOM injection and
+ * no observer. Clicking opens the affected-files dialog (host RPC through the
+ * shipped `commands` Remote) with an irreversible confirm.
  *
  * The remaining DOM-touching helpers (`syncHides`, `syncHiddenRpcRows`) are not
  * button placement: they hide chat seats DSH renders but this plugin rolls
  * back, and suppress the receipt cards of button-dispatched command calls —
- * both are durable-log side effects with no official slot.
+ * both are durable-log side effects with no official slot. Those passes DO run
+ * under a `MutationObserver` (see the driver effect below): hiding is an
+ * attribute on a seat React owns, so a re-render that replaces the element would
+ * otherwise bring a rolled-back row back, and the observer re-runs the pass on
+ * every child-list change rather than trusting the previous reading.
  *
  * @module @domitor-syh/dsh-rollback/client
  */
@@ -45,7 +49,7 @@ export const inject = ['slots', 'remote', 'remote.commands', 'locale']
 const DEBUG = false
 /** Bundle revision — always reported once at apply, so a stale cached bundle is
  * identifiable in the console instead of looking like "the fix did nothing". */
-const BUNDLE_REV = 25
+const BUNDLE_REV = 28
 function log(...parts: unknown[]): void {
   if (DEBUG) console.info('[rollback]', ...parts)
 }
@@ -304,52 +308,65 @@ function syncPendingRpcRow(): void {
  * browser that refuses the fetch) is skipped and the rest still restore.
  * @param ctx - the plugin's own context.
  * @param sessionId - the session the images belong to.
- * @param images - the rolled-back turn's image blocks, in order.
- * @returns the created draft attachment ids, in order, or an empty list.
+ * @param attachments - the rolled-back turn's durable attachments, in order.
+ * @returns the created draft ids plus the draft descriptors they came from, so a
+ *   refused append can be released through the first-party face.
  */
-async function restoreDraftImages(
+async function restoreDraftAttachments(
   ctx: any,
   sessionId: string,
   images: { name: string; mediaType: string; attachment: any }[],
-): Promise<string[]> {
+): Promise<{ ids: string[]; descriptors: unknown[] }> {
   const conversation = ctx?.get?.('conversation')
   const uiConversation = ctx?.get?.('uiConversation')
   if (conversation !== undefined && typeof conversation.createDrafts === 'function'
     && uiConversation !== undefined && typeof uiConversation.imageUrl === 'function') {
     const ids: string[] = []
+    const descriptors: unknown[] = []
     for (const img of images) {
       try {
         const url: string = await uiConversation.imageUrl(sessionId, img.attachment)
         const resp = await fetch(url)
         const blob = await resp.blob()
-        const file = new File([blob], img.name || 'image', { type: img.mediaType || 'image/png' })
+        const file = new File([blob], img.name || 'attachment', { type: blob.type || img.mediaType || 'application/octet-stream' })
         const drafts = conversation.createDrafts(sessionId, [file])
         const id = drafts?.[0]?.id
-        if (typeof id === 'string' && id !== '') ids.push(id)
+        if (typeof id === 'string' && id !== '') {
+          ids.push(id)
+          descriptors.push(drafts[0])
+        }
       } catch { /* skip a failed image */ }
     }
-    return ids
+    // The descriptors, not just the ids: releasing a refused draft needs the object the
+    // FIRST-PARTY face takes (`conversation.releaseDraftAttachments(drafts)` — the same
+    // call the product's own composer makes), and that is more reliable than this
+    // plugin's optional `inputActions` release verb.
+    return { ids, descriptors }
   }
   if (conversation !== undefined && typeof conversation.resolveImage === 'function'
     && typeof conversation.createDraftImages === 'function') {
     const ids: string[] = []
+    const descriptors: unknown[] = []
     for (const img of images) {
       try {
         const url: string = await conversation.resolveImage(sessionId, img.attachment)
         const resp = await fetch(url)
         const blob = await resp.blob()
-        const file = new File([blob], img.name || 'image', { type: img.mediaType || 'image/png' })
+        const file = new File([blob], img.name || 'attachment', { type: blob.type || img.mediaType || 'application/octet-stream' })
         const drafts = conversation.createDraftImages([file])
-        if (drafts !== null && drafts[0] !== undefined && drafts[0].id !== undefined) ids.push(drafts[0].id)
+        if (drafts !== null && drafts[0] !== undefined && drafts[0].id !== undefined) {
+          ids.push(drafts[0].id)
+          descriptors.push(drafts[0])
+        }
       } catch { /* skip a failed image */ }
     }
-    return ids
+    return { ids, descriptors }
   }
   warnOnce(
     'restore-images-api',
-    'no image-restore API is available: neither conversation.createDrafts + uiConversation.imageUrl (0.1.5) nor conversation.resolveImage + createDraftImages (0.1.1) exists, so rolled-back images cannot be re-attached',
+    'no attachment-restore API is available: neither conversation.createDrafts + uiConversation.imageUrl (0.1.5) nor conversation.resolveImage + createDraftImages (0.1.1) exists, so the rolled-back turn\'s attachments cannot be re-attached',
   )
-  return []
+  return { ids: [], descriptors: [] }
 }
 
 /** A `/rollback` command through the shipped Remote, unwrapping its envelope. */
@@ -384,7 +401,11 @@ const CSS =
   '.rbk-panel{width:min(460px,calc(100vw - 32px));max-height:70vh;display:flex;flex-direction:column;border-radius:var(--dsw-radius-panel);border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);box-shadow:0 16px 48px rgb(0 0 0/.35);color:var(--dsw-alias-label-primary);}' +
   '.rbk-head{padding:14px 16px 8px;font-size:14px;font-weight:700;}' +
   '.rbk-warn{padding:0 16px 8px;font-size:12px;color:var(--dsw-alias-label-secondary);}' +
-  '.rbk-list{overflow-y:auto;padding:2px 8px;flex:1;}' +
+  // `overflow: hidden auto` rather than `overflow-y: auto`: when one axis is not
+  // `visible`, CSS computes the other axis's `visible` to `auto` too, so a vertical
+  // scroller alone still produced a horizontal bar under the file list whenever a row
+  // came out a pixel wide. The intent is vertical-only, so the x axis says so.
+  '.rbk-list{overflow:hidden auto;padding:2px 8px;flex:1;}' +
   // The rows are a READ-OUT, not a control: no hover, no pointer, no click.
   '.rbk-row{display:flex;align-items:center;gap:8px;width:100%;text-align:left;padding:6px 8px;border-radius:var(--dsw-radius-sm);border:none;background:transparent;color:var(--dsw-alias-label-primary);font-size:12.5px;}' +
   '.rbk-tag{flex:none;font-size:11px;padding:1px 6px;border-radius:5px;}' +
@@ -489,11 +510,27 @@ function findUserPrompt(chat: any, turn: number): string {
 }
 
 /**
- * Image blocks of a turn-opening user prompt, for re-attaching to the composer.
+ * Block census of the LAST user message {@link findUserAttachments} read, for the
+ * restore diagnostic. Module state is enough: the diagnostic is read in the same
+ * rollback pass that just called that function.
+ */
+let lastAttachmentCensus: Record<string, number> | null = null
+
+/**
+ * Durable attachments of a turn-opening user prompt, for re-attaching to the composer.
+ *
+ * Both block kinds qualify, not just images: a `file` block carries the same
+ * `{ attachment }` durable reference, and the reader behind `imageUrl` is generic —
+ * it keys on `attachment.attachmentId` and types the blob from the attachment's own
+ * `mediaType`, with no image check anywhere. So a rolled-back turn's files come back
+ * through exactly the same path as its images, and the name `imageUrl` is historical
+ * rather than a restriction. (Files dropped into the composer with a workspace path
+ * never become attachments at all: they are `@path` references, so their text already
+ * returns with the prompt.)
  * @param chat - the chat snapshot slice (see {@link useChatOrSnapshot}).
  * @param turn - the 1-based turn whose images are wanted.
  */
-function findUserImages(chat: any, turn: number): { name: string; mediaType: string; attachment: any }[] {
+function findUserAttachments(chat: any, turn: number): { name: string; mediaType: string; attachment: any }[] {
   const order = chat?.order
   const store = chat?.nodes
   if (!Array.isArray(order) || typeof store?.get !== 'function') return []
@@ -502,9 +539,33 @@ function findUserImages(chat: any, turn: number): { name: string; mediaType: str
     if (node?.kind !== 'user' || turnNoOf(node.location) !== turn) continue
     const content = node?.data?.content
     if (!Array.isArray(content)) return []
+    // Census of what the turn's message ACTUALLY carries, for the restore diagnostic.
+    // Measured on the desktop (2026-10-01): two reports of "the attachment did not come
+    // back" were both turns whose logged message carried `text` blocks only — the file
+    // never reached the message at all. That is indistinguishable from "the plugin
+    // failed to rebuild it" without this line, and the code's own silence is why it
+    // took two rounds to tell the two apart.
+    const kinds: Record<string, number> = {}
+    for (const block of content) {
+      const kind = typeof block?.type === 'string' ? block.type : '(no type)'
+      kinds[kind] = (kinds[kind] ?? 0) + 1
+    }
+    lastAttachmentCensus = kinds
     return content
-      .filter((b: any) => b?.type === 'image' && b?.attachment)
-      .map((b: any) => ({ name: b.attachment.name ?? 'image', mediaType: b.attachment.mediaType ?? 'image/png', attachment: b.attachment }))
+      // Both kinds of durable attachment, not only images. A `file` block carries the
+      // same `{ attachment }` reference, and the loader written for images is generic:
+      // it keys on `attachment.attachmentId` and types the blob from the attachment's
+      // own `mediaType`, with no image check in it at all — so `imageUrl` is a
+      // historical name, not a restriction. (A file dropped in WITH a workspace path
+      // never becomes an attachment at all: it is an `@path` reference, so its text
+      // already returns with the prompt.)
+      .filter((b: any) => (b?.type === 'image' || b?.type === 'file') && b?.attachment)
+      .map((b: any) => ({
+        name: b.attachment.name ?? (b.type === 'image' ? 'image' : 'file'),
+        // Only the fallback: the reader types the bytes from the attachment itself.
+        mediaType: b.attachment.mediaType ?? (b.type === 'image' ? 'image/png' : 'application/octet-stream'),
+        attachment: b.attachment,
+      }))
   }
   return []
 }
@@ -660,17 +721,72 @@ function reportUnreadableCut(op: any): void {
 }
 
 /**
- * Chat node kinds that are infrastructure rather than conversation content.
+ * Chat node kinds that ARE conversation content, by inverting the old rule.
  *
- * A visible one of these must not hold the welcome hero back once every real
- * message is hidden: `turn-tail` is a per-turn action affordance, and `command`
- * is a slash-command receipt (this plugin hides its own receipts separately),
- * and `system-prompt` is the official collapsed prompt-disclosure row: a rollback
- * to the very first turn leaves exactly those two on an otherwise empty screen.
- * Anything NOT listed counts as content, so an unrecognized kind errs toward
- * keeping the hero away rather than showing it over a message.
+ * The previous rule listed *infrastructure* kinds and counted everything else as
+ * content. Measured on the desktop (2026-10-01), that denylist missed **three**
+ * different kinds in turn — `turn-process` ("已停止"), text-free steps
+ * ("已完成分析"), and then a third that survived both fixes — because the status/UI
+ * family of a chat snapshot is open-ended and grows with the product, while the
+ * CONTENT family is small and stable.
+ *
+ * So this is an ALLOWLIST: only a kind listed here can count as content or keep the
+ * welcome page away. Anything else is treated as UI scaffolding. The direction is
+ * safe because the hero is gated twice — the log must prove a rollback emptied the
+ * transcript AND no content seat may still be visible — and because a genuinely new
+ * message arrives as `user` (listed), which immediately makes `contentLeft` non-zero
+ * and keeps the transcript on screen. An unrecognized kind can therefore only lose a
+ * stranding status row, never a message that arrived after the rollback.
+ *
+ * `compaction`, `skill` and `apply` are listed because DSH renders them as their own
+ * rows: they are product UI, but they narrate what happened, so keeping them visible
+ * (and keeping the hero away) preserves the honest reading of "the screen is empty".
  */
-const INFRASTRUCTURE_KINDS = new Set<string>(['turn-tail', 'command', 'system-prompt'])
+const CONTENT_KINDS = new Set<string>([
+  'user',
+  'assistant-step',
+  'system-prompt',
+  'compaction',
+  'skill',
+  'apply',
+])
+
+/**
+ * Whether a node is UI scaffolding rather than conversation content: its kind is not
+ * a content kind, or it is a step with nothing to show.
+ * @param node - one chat node.
+ * @returns whether the node may be ignored for emptiness and hidden when emptied.
+ */
+function isUiOnlyNode(node: any): boolean {
+  const kind = node?.kind
+  if (typeof kind !== 'string' || !CONTENT_KINDS.has(kind)) return true
+  return isTextFreeStep(node)
+}
+
+/**
+ * Whether a node is a step that carries NO user-visible text — only reasoning or
+ * tool blocks.
+ *
+ * Such a step is DSH's process/progress row, not conversation content, and a
+ * rollback hides reasoning by design: rolling back past a turn must not leave its
+ * "已完成分析" (`message.stepProcess.done.thinking`) disclosure standing above the
+ * welcome page, which is exactly what was reported from the desktop on
+ * 2026-10-01 — twice, both times on a turn that had been INTERRUPTED, because an
+ * interrupted step is settled as reasoning-only with no final text.
+ *
+ * Erring toward CONTENT is deliberate in every uncertain case (an unreadable
+ * `blocks`, an empty block list, any `text` block): only a step whose blocks are
+ * readable AND contain no `text` at all is treated as process UI. An `assistant-step`
+ * is never whole-message content when it has no text to show.
+ * @param node - one chat node.
+ * @returns whether the node is a text-free step.
+ */
+function isTextFreeStep(node: any): boolean {
+  if (node?.kind !== 'assistant-step') return false
+  const blocks = node?.data?.blocks
+  if (!Array.isArray(blocks) || blocks.length === 0) return false
+  return !blocks.some((block: any) => block?.kind === 'text')
+}
 
 /**
  * Whether the transcript is currently emptied by a rollback, as {@link syncHides}
@@ -893,13 +1009,25 @@ function syncHides(chat: any): void {
 // so on that path only the infrastructure kinds are excluded, which is precisely
 // what a rollback with nothing to replace leaves behind.
   let contentLeft = 0
+  /**
+   * What is still standing, by kind, for the one diagnostic line below. Measured on
+   * the desktop (2026-10-01): a rollback of an INTERRUPTED turn left status rows above
+   * the welcome page whose kinds were not in the old infrastructure denylist — first
+   * `turn-process` ("已停止"), then a text-free step ("已完成分析"), then a third that
+   * survived both fixes. That is why the rule is now an allowlist ({@link CONTENT_KINDS})
+   * and why this census exists: the next unexpected kind names itself instead of
+   * costing another round of guessing.
+   */
+  const leftovers = new Map<string, number>()
   for (const { node } of nodes) {
     const seq = node?.anchorSeq
     if (typeof seq !== 'number') continue
     if (node?.kind === 'rollback-marker') continue
-    if (INFRASTRUCTURE_KINDS.has(node?.kind)) continue
+    if (isUiOnlyNode(node)) continue
     if (coveredByRollback(markers, seq)) continue
     contentLeft += 1
+    const kind = typeof node?.kind === 'string' ? node.kind : '(no kind)'
+    leftovers.set(kind, (leftovers.get(kind) ?? 0) + 1)
   }
   const emptied = contentLeft === 0
 
@@ -926,20 +1054,20 @@ function syncHides(chat: any): void {
   // proof about one row: this node's own seq sits inside a marker's shadowed
   // window. An emptiness COUNT is not a proof about a row and therefore never
   // hides one — a hidden message cannot be recovered by the user, while a
-  // stranded log-only row is cosmetic. So `emptied` adds only rows whose kind is
-  // in INFRASTRUCTURE_KINDS: permission receipts and turn tails sit before the
-  // rollback point, were never in the model's context, and must not strand above
-  // the welcome page. Every other kind is content and stays. An append-form marker
-  // adds no coverage of its own here: `coveredByRollback` is false for every seq of
-  // an empty window, so it can hide nothing by range and only the `emptied` half of
-  // this rule can ever touch its session's rows.
+  // stranded log-only row is cosmetic. So `emptied` adds only UI scaffolding
+  // ({@link isUiOnlyNode}: a kind outside {@link CONTENT_KINDS}, or a text-free
+  // step): those rows sit before the rollback point, were never in the model's
+  // context, and must not strand above the welcome page. Every content kind stays.
+  // An append-form marker adds no coverage of its own here: `coveredByRollback` is
+  // false for every seq of an empty window, so it can hide nothing by range and only
+  // the `emptied` half of this rule can ever touch its session's rows.
   for (const { key, node } of nodes) {
     const el = seatByKey.get(key)
     if (el === undefined) continue
     const seq = node?.anchorSeq
     if (typeof seq !== 'number' || node?.kind === 'rollback-marker') continue
-    const strayInfrastructure = emptied && INFRASTRUCTURE_KINDS.has(node?.kind)
-    if (coveredByRollback(markers, seq) || strayInfrastructure) {
+    const strayUi = emptied && isUiOnlyNode(node)
+    if (coveredByRollback(markers, seq) || strayUi) {
       hideRollbackSeat(el)
       hidden += 1
     } else {
@@ -954,16 +1082,46 @@ function syncHides(chat: any): void {
   // exactly the screen the hero belongs on. The DOM must agree too: a content seat
   // still visible after Pass 3 keeps the welcome page away, because "the log says
   // empty" and "the screen is empty" are two different readings and the second one
-  // is the one the user sees. A seat whose kind cannot be read counts as content,
-  // so an unrecognized kind errs toward showing the transcript.
+  // is the one the user sees. The same allowlist decides this, so the two readings
+  // cannot disagree about which rows are content.
   let contentSeatsVisible = 0
   for (const { key, node } of nodes) {
     if (node?.kind === 'rollback-marker') continue
-    if (INFRASTRUCTURE_KINDS.has(node?.kind)) continue
+    // The same allowlist the emptiness count uses, so the log reading and the DOM
+    // reading can never disagree about which rows are content.
+    if (isUiOnlyNode(node)) continue
     const el = seatByKey.get(key)
     if (el === undefined || el.style.display === 'none') continue
     contentSeatsVisible += 1
   }
+
+  // Pass 4 — seats with NO node in the chat slice: the durable ghost rows.
+  //
+  // Passes 1–3 all walk `nodes`, so a row left behind by the surface replace without a
+  // node was never even considered. First measured on 2026-10-01 (`contentLeft: 0`,
+  // `contentSeatsVisible: 0`, `emptied: true`, welcome page standing — and a
+  // "已完成分析" row still on screen), and then reported AGAIN the next day in a worse
+  // form: it came back as soon as the user sent a new message, because hiding it was
+  // tied to the emptied state, and a transcript with a new message is not empty.
+  //
+  // Hiding cannot be the answer for these rows, because there is no state in which they
+  // are legitimate: a seat the chat slice has no node for cannot have been rendered by
+  // this snapshot's data, so React is not tracking it and only a stale DOM node can
+  // explain it. The pass therefore REMOVES them, which is what the user asked for — a
+  // ghost must not survive the next message. Removal is scoped exactly this narrowly
+  // (node-less seats only, restored by a page load like any other DOM leaf), so a row
+  // that belongs to a real message is never touched: real messages always have nodes.
+  const knownKeys = new Set(nodes.map(entry => entry.key))
+  const nodeLessSeats: string[] = []
+  for (const [key, el] of seatByKey) {
+    if (knownKeys.has(key)) continue
+    nodeLessSeats.push(key)
+    try {
+      el.remove()
+      hidden += 1
+    } catch { /* a detached node needs no removal */ }
+  }
+
   heroWanted.visible = emptied && contentSeatsVisible === 0
 
   const column = document.querySelector<HTMLElement>('[data-chat-flow=""]')
@@ -997,6 +1155,14 @@ function syncHides(chat: any): void {
       markerSeats,
       seatsInDom: seatByKey.size,
       contentLeft,
+      // WHICH kinds are still standing, so a stranded row names itself in the console
+      // instead of costing a "which kind was it?" round trip (see `leftovers`).
+      contentKinds: Object.fromEntries(leftovers),
+      // Seats the chat slice has no node for (Pass 4). A non-empty list here means the
+      // DOM is holding rows the log does not describe — the shape that produced a
+      // stranded status row while every node-side count read zero.
+      nodeLessSeats: nodeLessSeats.length,
+      nodeLessSample: nodeLessSeats.slice(0, 5),
       contentSeatsVisible,
       emptied,
       hiddenSeats: hidden,
@@ -1102,7 +1268,13 @@ function RollbackAction({ messageId, useSession, useChat, t }: any): React.React
     disabled,
     onClick: () => { if (!disabled && turn !== undefined && openRollbackDialog !== null) openRollbackDialog(turn) },
   }, React.createElement(RollbackIcon))
-  return React.createElement(Tooltip, { label, side: 'bottom' }, button)
+  // `children` goes INSIDE the props object, not as createElement's third argument.
+  // React treats both identically at runtime, but the official Tooltip declares
+  // `children` as a required prop and current @types/react no longer derives it from
+  // createElement's varargs — so only this spelling type-checks against the component
+  // the host actually ships. It was invisible while the client half was checked with
+  // react's unresolved-package fallout silenced.
+  return React.createElement(Tooltip, { label, side: 'bottom', children: button })
 }
 
 /**
@@ -1254,7 +1426,7 @@ function RollbackTurnAction({ turn: location, matched, useSession, t }: any): Re
     disabled: blocked,
     onClick: () => { if (!blocked && openRollbackDialog !== null) openRollbackDialog(turnNo) },
   }, React.createElement(RollbackIcon))
-  return React.createElement(Tooltip, { label: t('action.label'), side: 'bottom' }, button)
+  return React.createElement(Tooltip, { label: t('action.label'), side: 'bottom', children: button })
 }
 
 interface DriverProps {
@@ -1284,16 +1456,24 @@ interface DriverProps {
     pruneImages?(ids: readonly string[]): void
   }
   /**
-   * Rebuild draft attachments for images a rolled-back turn had attached.
-   * @returns the draft attachment ids that were created, in the input order.
+   * Rebuild draft attachments for the attachments a rolled-back turn had.
+   * @returns the draft ids plus the draft descriptors they came from, so a refused
+   *   append can be released through the first-party `releaseDraftAttachments` face.
    */
-  restoreImages?: (images: { name: string; mediaType: string; attachment: any }[]) => Promise<string[]>
+  restoreAttachments?: (images: { name: string; mediaType: string; attachment: any }[]) =>
+    Promise<{ ids: string[]; descriptors: unknown[] }>
   /**
    * Release draft attachments the input refused (0.1.5's `addAttachments` returns
    * false while a submission is in flight). Mirrors first-party code, which
    * releases the descriptors it just created when the shell declines them.
    */
-  releaseImages?: (ids: readonly string[]) => void
+  releaseAttachments?: (ids: readonly string[]) => void
+  /**
+   * The conversation face, for the first-party release verb only
+   * (`releaseDraftAttachments(drafts)`, which is what the product's own composer
+   * calls). Preferred over {@link releaseAttachments} when present.
+   */
+  conversation?: { releaseDraftAttachments?: (descriptors: unknown) => void }
 }
 
 /**
@@ -1302,7 +1482,7 @@ interface DriverProps {
  * confirmation dialog, opened from the assistant action through the module
  * bridge. Renders nothing into its own dock seat.
  */
-function RollbackDriver({ preview, execute, list, useSession, useChat, inputActions, restoreImages, releaseImages, t }: DriverProps): React.ReactElement | null {
+function RollbackDriver({ preview, execute, list, useSession, useChat, inputActions, restoreAttachments, releaseAttachments, conversation, t }: DriverProps): React.ReactElement | null {
   if (typeof useSession !== 'function') {
     warnOnce('useSession', 'props lack useSession', Object.keys({ useSession }))
     return null
@@ -1400,7 +1580,7 @@ function RollbackDriver({ preview, execute, list, useSession, useChat, inputActi
     // exists to prevent. A pre-read cannot be worse: the values are identical
     // whenever the later read still sees the nodes.
     const promptBefore = findUserPrompt(chatRef.current, turn)
-    const imagesBefore = findUserImages(chatRef.current, turn)
+    const imagesBefore = findUserAttachments(chatRef.current, turn)
     setBusy(true)
     setError(null)
     markPendingCommandDispatch()
@@ -1413,7 +1593,7 @@ function RollbackDriver({ preview, execute, list, useSession, useChat, inputActi
         // the hide rule below applies it.
         ensureRef.current()
         const prompt = findUserPrompt(chatRef.current, turn) || promptBefore
-        const images = findUserImages(chatRef.current, turn)
+        const images = findUserAttachments(chatRef.current, turn)
         const restored = images.length > 0 ? images : imagesBefore
         if (inputActions !== undefined) {
           inputActions.setDraft(prompt)
@@ -1424,7 +1604,7 @@ function RollbackDriver({ preview, execute, list, useSession, useChat, inputActi
           if (inputActions.pruneAttachments !== undefined) inputActions.pruneAttachments([])
           else if (inputActions.pruneImages !== undefined) inputActions.pruneImages([])
         }
-        if (restored.length > 0 && restoreImages !== undefined && inputActions !== undefined) {
+        if (restored.length > 0 && restoreAttachments !== undefined && inputActions !== undefined) {
           const add = inputActions.addAttachments !== undefined
             ? (ids: readonly string[]) => inputActions.addAttachments!(ids)
             : inputActions.addImages !== undefined
@@ -1433,17 +1613,56 @@ function RollbackDriver({ preview, execute, list, useSession, useChat, inputActi
           if (add === undefined) {
             warnOnce('input-add-attachments', 'input actions expose neither addAttachments (0.1.5) nor addImages (0.1.1), so the rolled-back images cannot be re-attached')
           } else {
-            restoreImages(restored).then(ids => {
+            restoreAttachments(restored).then(result => {
+              const { ids, descriptors } = result
+              // Report the OUTCOME, not just the failures: "the API refused" and "the
+              // composer rejected the ids" both used to end in the same silence.
+              console.info('[rollback] attachments:', { carried: restored.length, rebuilt: ids.length })
               if (ids.length === 0) return
-              // A refused append (a submission is in flight) must not leave the
-              // drafts this call just created registered: first-party code releases
-              // them in exactly this case.
-              if (add(ids) === false) releaseImages?.(ids)
+              // RETRY the append, do not fire once. The composer's action face is handed
+              // to us by the chat seat and can still be the previous instance for a moment
+              // after the surface was replaced — which is exactly what a rollback just did.
+              // A single refused call therefore loses the chip while the draft text (set
+              // through the same face) appears, i.e. "text came back, the chip did not".
+              // The peer plugin of this kind retries this up to 8 times at 150 ms
+              // (`dsh-recall-plugin`'s `fillDraft`, read from its shipped bundle), and the
+              // measured symptom it prevents is the one reported here on 2026-10-01.
+              let attempts = 0
+              const tryAdd = (): void => {
+                let accepted: boolean | undefined
+                try { accepted = add(ids) } catch (error) { accepted = false; void error }
+                if (accepted !== false) {
+                  if (attempts > 0) console.info('[rollback] attachments accepted after retry:', { attempts, ids })
+                  return
+                }
+                attempts += 1
+                if (attempts < 8) { setTimeout(tryAdd, 150); return }
+                console.warn('[rollback] the composer refused the rebuilt attachments after 8 attempts; releasing them', { ids })
+                // Release through the FIRST-PARTY face, which is what the product's own
+                // composer calls; the input-action verb is this plugin's optional fallback.
+                try {
+                  if (typeof conversation?.releaseDraftAttachments === 'function') conversation.releaseDraftAttachments(descriptors)
+                  else releaseAttachments?.(ids)
+                } catch (error) { void error }
+              }
+              tryAdd()
             }, (e: unknown) => {
               warnOnce('restore-images', 'could not rebuild the composer attachments of the rolled-back turn', e)
             })
           }
         }
+        // ALWAYS say what the rolled-back turn's message carried — not only when
+        // something was found. Measured on the desktop (2026-10-01): two reports of
+        // "the attachment did not come back" were turns whose logged message carried
+        // `text` blocks only, and the plugin's silence in exactly that case is why it
+        // took two rounds to tell "nothing was ever attached" apart from "the rebuild
+        // failed". The census comes from the same read the restore used.
+        console.info('[rollback] rolled-back turn message:', {
+          turn,
+          blocks: lastAttachmentCensus ?? '(no user message node found for this turn)',
+          restorable: restored.length,
+          beforeRead: imagesBefore.length,
+        })
       },
       (e: unknown) => { setBusy(false); setError(msg(e)) },
     )
@@ -1954,9 +2173,11 @@ export function apply(ctx: any): void {
           await extCommand(ctx, sessionId, '/rollback --apply ' + turn)
         },
         list: async () => (await extCommand(ctx, sessionId, '/rollback list')).text ?? '',
-        restoreImages: (images: { name: string; mediaType: string; attachment: any }[]) =>
-          restoreDraftImages(ctx, sessionId, images),
-        releaseImages: (ids: readonly string[]) => {
+        restoreAttachments: (images: { name: string; mediaType: string; attachment: any }[]) =>
+          restoreDraftAttachments(ctx, sessionId, images),
+        // The first-party release face, read once here where the context is at hand.
+        conversation: { releaseDraftAttachments: ctx.get?.('conversation')?.releaseDraftAttachments?.bind(ctx.get('conversation')) },
+        releaseAttachments: (ids: readonly string[]) => {
           const conversation = ctx.get?.('conversation')
           if (conversation?.releaseDraftAttachment === undefined) return
           for (const id of ids) {

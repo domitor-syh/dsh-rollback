@@ -90,9 +90,20 @@ describe('BoundaryRescan', () => {
     await unlink(file)
 
     await scanner.scan('s1', 9)
-    // The sidecar last confirmed the file at turn 5, so the change happened after it:
-    // attributing it to turn 9 (the turn that merely noticed) is what this fixes.
-    expect(records).toEqual([{ turn: 6, mutation: { path: file, operation: 'remove', before: 'durable content', after: '' } }])
+    // The finding belongs to the boundary that produced it. Recording it under turn 6
+    // (the old `lastSeenTurn + 1` rule) claimed a turn whose own boundary had already
+    // seen the file intact had deleted it, and — measured on the desktop 2026-10-02 —
+    // it filed a deletion under the turn BEFORE the one that caused it, so rolling back
+    // the causing turn planned a window that excluded the removal and the `找回` entry
+    // disappeared from the dialog.
+    //
+    // The tradeoff is stated rather than hidden: if a file was really deleted long
+    // before a late prime, this now offers it as a finding of the first scanned turn.
+    // That costs a restore entry that restores nothing (the file is already gone and its
+    // pre-deletion content is what goes back), while the old rule cost a MISSING entry
+    // on the very turn that did the deleting — one is cosmetic, the other loses the
+    // user's file from the preview.
+    expect(records).toEqual([{ turn: 9, mutation: { path: file, operation: 'remove', before: 'durable content', after: '' } }])
   })
 
   it('learns the content of a path it has never read, then notices a later change', async () => {

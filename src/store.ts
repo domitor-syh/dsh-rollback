@@ -134,7 +134,15 @@ function readRecords(sessionId: string): CheckpointRecord[] {
  * retention window are pruned and the file is rewritten; corrupt lines are
  * skipped and reported.
  */
-export function loadCheckpoints(sessionId: string, skipTurns?: ReadonlySet<number>): CheckpointMap {
+export function loadCheckpoints(
+  sessionId: string,
+  skipTurns?: ReadonlySet<number>,
+  // Reporting is the CALLER's business: this module is pure filesystem work with no
+  // context, and a plugin's `console.warn` never reaches the app's log — the host
+  // routes `ctx.logger`, which only the caller holds. Optional, so an existing
+  // caller keeps the old silence rather than gaining a console line.
+  report?: (message: string) => void,
+): CheckpointMap {
   const file = sessionFile(sessionId)
   const out: CheckpointMap = new Map()
   if (!existsSync(file)) return out
@@ -181,10 +189,10 @@ export function loadCheckpoints(sessionId: string, skipTurns?: ReadonlySet<numbe
     }
   }
   if (corrupt > 0) {
-    console.warn(`[dsh-rollback] checkpoints: skipped ${corrupt} corrupt line(s) for session ${sessionId}`)
+    report?.(`[dsh-rollback] checkpoints: skipped ${corrupt} corrupt line(s) for session ${sessionId}`)
   }
   if (pruned > 0) {
-    console.warn(`[dsh-rollback] checkpoints: dropped ${pruned} record(s) (stale or from rolled-back turns) for session ${sessionId}`)
+    report?.(`[dsh-rollback] checkpoints: dropped ${pruned} record(s) (stale or from rolled-back turns) for session ${sessionId}`)
   }
   return out
 }

@@ -16,7 +16,7 @@
   },
   "dsh": {
     "engines": {
-      "dsh": ">=0.2.0-rc.2"
+      "dsh": ">=0.1.5-rc.2 <0.2.0-0 || >=0.2.0-rc.2 <0.3.0-0"
     },
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -39,9 +39,11 @@
   "scripts": {
     "build": "tsdown",
     "prepare": "tsdown",
+    "prepublishOnly": "pnpm typecheck && pnpm test && pnpm check:readmes && pnpm build",
     "test": "vitest run",
     "typecheck": "tsc --noEmit && node scripts/typecheck-host.mjs",
     "typecheck:host": "node scripts/typecheck-host.mjs",
+    "check:readmes": "node scripts/check-readmes.mjs",
     "deploy:profile": "node scripts/deploy-profile.mjs"
   },
   "license": "MIT",
@@ -65,10 +67,24 @@
     "plugin"
   ],
   "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.1.5-rc.2 <0.2.0-0 || >=0.2.0-rc.2 <0.3.0-0",
+    "@deepseek-ai/dsh-invariants": ">=0.1.5-rc.2 <0.2.0-0 || >=0.2.0-rc.2 <0.3.0-0",
+    "@deepseek-ai/dsh-session": ">=0.1.5-rc.2 <0.2.0-0 || >=0.2.0-rc.2 <0.3.0-0",
     "react": "^18.2.0"
   },
   "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.4",
+    "@deepseek-ai/dsh-client-ui-primitives": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-commands": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-fs": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-invariants": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-sandbox-policy": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
     "@types/node": "^22.0.0",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
     "tsdown": "^0.22.2",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
