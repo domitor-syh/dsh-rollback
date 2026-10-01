@@ -21,7 +21,7 @@ A TRAE-style "roll back to before this turn" plugin for the [DeepSeek Harness](h
 
 ## Supported DSH versions
 
-How the latest release (**0.5.0**) fares on every DSH build published so far; the list comes from `@deepseek-ai/dsh` on the npm registry and covers every build published as of this release:
+How the latest release (**0.4.0**) fares on every DSH build published so far; the list comes from `@deepseek-ai/dsh` on the npm registry and covers every build published as of this release:
 
 | DSH version | Status | Notes |
 | --- | --- | --- |
