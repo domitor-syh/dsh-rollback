@@ -12,13 +12,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
         with:
-          # Must match the pnpm that writes pnpm-lock.yaml. Pinned to 9 the lockfile
-          # was refused outright (`ERR_PNPM_OUTDATED_LOCKFILE`: the root importer had
-          # lost the `@deepseek-ai/dsh` peer entry, and the two majors disagree about
-          # how peer dependencies are recorded at the root), so CI failed on a commit
-          # whose tests all passed locally. Same major as the project's own toolchain
-          # keeps the writer and the verifier from drifting apart again.
-          version: 11
+          # Must be the exact pnpm that wrote pnpm-lock.yaml. Two prior failures, one
+          # root cause -- the verifier was not the writer:
+          #   - pnpm 9 refused the lockfile outright (ERR_PNPM_OUTDATED_LOCKFILE):
+          #     the two majors disagree about how a peer-only dependency is recorded
+          #     in the root importer.
+          #   - `version: 11` floats, so CI ran 11.28.x while the lockfile had been
+          #     written and locally verified under 11.5.0 -- and 11.28's frozen check
+          #     requires the root importer to carry the `@deepseek-ai/dsh` peer entry,
+          #     which the older lockfile lacked (the lockfile was regenerated with
+          #     11.28.3 so both versions accept it now).
+          # Pinned exactly, so a future pnpm release cannot fail a commit that passes
+          # locally. Bump this in the same commit as any lockfile change.
+          version: 11.28.3
       - uses: actions/setup-node@v4
         with:
           node-version: 20
