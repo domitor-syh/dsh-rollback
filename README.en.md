@@ -32,9 +32,11 @@ The current target is **DSH 0.2.0-rc.2**. The declared compatibility range is `>
 
 ## Usage
 
-Click **Rollback** on an ended turn, review the file list and confirm. Alternatively, enter `/rollback`, choose a target turn and confirm.
+There are three ways to use the plugin:
 
-Typing `/rollback` followed by Space opens the subcommand menu. Selecting an item only completes its arguments; press Enter to execute. Press Esc to return from the `preview` turn submenu.
+1. **Rollback button**: click **Rollback** on an ended turn → review affected files → confirm rollback.
+2. **`/rollback`**: enter `/rollback` without arguments → open the turn picker → choose a target turn → review affected files and confirm rollback.
+3. **`/rollback` + Space**: type `/rollback` and press Space → open the subcommand menu → select a command or arguments → press Enter to execute. Selecting a menu item only completes arguments; it does not execute immediately. `preview` opens a turn submenu; press Esc to return.
 
 | Command | Purpose |
 | --- | --- |
