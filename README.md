@@ -28,6 +28,8 @@ dsh plugin --profile web add @domitor-syh/dsh-rollback
 
 安装后重启 `dsh web` 并刷新页面。从 DSH 源码运行时，在上述命令前加 `pnpm`。
 
+桌面端同理：在桌面应用的官方插件安装处填入包名 **`@domitor-syh/dsh-rollback`**（等价命令 `dsh plugin --profile desktop add @domitor-syh/dsh-rollback`），装完重启桌面应用。
+
 当前适配目标为 **DSH 0.2.0-rc.2**。声明的兼容范围为 `>=0.1.5-rc.2 <0.2.0-0 || >=0.2.0-rc.2 <0.3.0-0`，其他构建需确认兼容性。
 
 ## 使用
