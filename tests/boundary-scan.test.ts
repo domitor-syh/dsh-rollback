@@ -37,6 +37,14 @@ describe('unchangedByStat', () => {
 })
 
 describe('planBoundaryAction', () => {
+  it('preserves a known baseline on a typed failed probe', () => {
+    for (const reason of ['EACCES', 'EPERM', 'EBUSY', 'ELOOP', 'read failed', 'non-regular']) {
+      expect(planBoundaryAction(tracked('content'), { kind: 'unknown', reason })).toEqual({ kind: 'unknown', reason })
+    }
+    expect(planBoundaryAction(tracked(''), { kind: 'missing' })).toEqual({ kind: 'missing', before: '' })
+    expect(planBoundaryAction(tracked(null, { missing: true }), { kind: 'missing' })).toEqual({ kind: 'none' })
+  })
+
   it('adopts the content of a file it has never read', () => {
     const action = planBoundaryAction(tracked(null), observed('first'))
     expect(action).toEqual({ kind: 'adopt', observed: observed('first') })
@@ -68,7 +76,7 @@ describe('planBoundaryAction', () => {
 
   it('re-adopts a file that came back after it was recorded missing', () => {
     const cameBack = tracked('content', { missing: true })
-    expect(planBoundaryAction(cameBack, observed('fresh'))).toEqual({ kind: 'adopt', observed: observed('fresh') })
+    expect(planBoundaryAction(cameBack, observed('fresh'))).toEqual({ kind: 'created', observed: observed('fresh') })
   })
 
   it('refuses to record a disappearance it could not undo', () => {

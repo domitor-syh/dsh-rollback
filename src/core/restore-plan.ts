@@ -13,26 +13,18 @@ import type { ChangeKind, FileChange, TurnCheckpoint } from './model.ts'
 /** One file the rollback must act on. */
 export interface RestoredFile {
   readonly path: string
-  /**
-   * `restore` rewrites the pre-turn content of a file that still exists;
-   * `recover` writes that content back to a file that was DELETED (a shell
-   * command's work, caught by the boundary re-scan); `delete` removes a file the
-   * rolled-back span created.
-   */
+  /** `restore` restores changed content; `recover` undoes conversation deletion;
+   * `delete` undoes conversation creation. Live external state does not relabel these. */
   readonly action: 'restore' | 'recover' | 'delete'
-  /** Pre-turn content when the action writes one, else null. */
+  /** Earliest recorded preimage in the rollback window, or confirmed absence. */
   readonly content: string | null
   readonly kind: ChangeKind
+  readonly conflict?: boolean
 }
 
 /** A file the rollback cannot act on. */
 export interface SkippedFile {
   readonly path: string
-  /**
-   * Why the rollback skipped it: `basis-unknown` when no pre-turn content was
-   * recorded for the path (the plan is honest about it rather than restoring a
-   * guess), or `io-error: <message>` when the filesystem refused the write.
-   */
   readonly reason: 'basis-unknown' | `io-error: ${string}`
 }
 
@@ -44,28 +36,19 @@ export interface TruncationRange {
 
 /** The complete, deterministic rollback plan for one target turn. */
 export interface RollbackPlan {
-  /** Roll back every turn with `turn >= fromTurn`. */
   readonly fromTurn: number
-  /** Files to restore/delete, in first-touch (ascending turn) order. */
   readonly restored: RestoredFile[]
-  /** Files with a mutation but no trustworthy pre-turn basis. */
   readonly skipped: SkippedFile[]
-  /** Surface range to truncate, or null when nothing to truncate. */
   readonly truncation: TruncationRange | null
 }
 
 /**
- * Compute a rollback plan.
+ * Compute a rollback plan from net conversation-derived state.
  *
- * The "before" of a file touched across several turns is its content before
- * the FIRST touch in the window: restoring to any target turn only ever needs
- * that earliest original content, and a file created inside the window is
- * deleted outright.
- *
- * @param checkpoints - retained per-turn checkpoints, ascending by turn.
- * @param fromTurn - restore the state before this turn (removes it and later).
- * @param lastSurfaceSeq - current tail seq of the model-visible surface, or
- *   null when the surface is empty.
+ * For each path, the first mutation supplies the state immediately before the
+ * rollback target, while the last mutation supplies the conversation-derived
+ * state at the end of the rolled-back span. Intermediate operations are ignored
+ * for listing and labels. Equal endpoint states are omitted.
  */
 export function planRollback(
   checkpoints: readonly TurnCheckpoint[],
@@ -75,31 +58,30 @@ export function planRollback(
   const window = checkpoints.filter(cp => cp.turn >= fromTurn)
   window.sort((a, b) => a.turn - b.turn)
 
-  // First touch across the window wins: its `before` is the restore content.
-  const firstTouch = new Map<string, FileChange>()
+  const net = new Map<string, { first: FileChange; after: string | null; afterKnown: boolean }>()
   for (const cp of window) {
     for (const change of Object.values(cp.changes)) {
-      if (!firstTouch.has(change.path)) firstTouch.set(change.path, change)
+      const existing = net.get(change.path)
+      if (existing === undefined) net.set(change.path, { first: change, after: change.after, afterKnown: change.afterKnown !== false })
+      else { existing.after = change.after; existing.afterKnown = change.afterKnown !== false }
     }
   }
 
   const restored: RestoredFile[] = []
   const skipped: SkippedFile[] = []
-  for (const change of firstTouch.values()) {
-    if (change.kind === 'created') {
-      restored.push({ path: change.path, action: 'delete', content: null, kind: 'created' })
-    } else if (change.basisKnown && change.before !== null) {
-      restored.push({
-        path: change.path,
-        // A file that vanished is brought back; one that was rewritten has its old
-        // content put back. Both write the same bytes, but they are different
-        // stories to the user, and only the record knows which one happened.
-        action: change.kind === 'removed' ? 'recover' : 'restore',
-        content: change.before,
-        kind: change.kind,
-      })
+  for (const { first, after, afterKnown } of net.values()) {
+    if (!first.basisKnown || (first.before === null && first.kind !== 'created')) {
+      skipped.push({ path: first.path, reason: 'basis-unknown' })
+      continue
+    }
+    if (afterKnown && first.before === after) continue
+
+    if (first.before === null) {
+      restored.push({ path: first.path, action: 'delete', content: null, kind: 'created' })
+    } else if (afterKnown ? after === null : first.kind === 'removed') {
+      restored.push({ path: first.path, action: 'recover', content: first.before, kind: 'removed' })
     } else {
-      skipped.push({ path: change.path, reason: 'basis-unknown' })
+      restored.push({ path: first.path, action: 'restore', content: first.before, kind: 'updated' })
     }
   }
 

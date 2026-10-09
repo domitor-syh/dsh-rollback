@@ -22,8 +22,9 @@
  * Only the byte landing changes: the write tool still builds its own result from
  * the outcome returned here, so the plugin's existing capture (which reads
  * `before`/`after` off the tool result) keeps working unchanged. The plugin's own
- * rollback restore calls the same wrapped method, so restoring a file at a drive
- * root is fixed by the same code.
+ * rollback restore calls the same wrapped method with a version guard. If the
+ * provider fails at a drive root, guarded mutations refuse the fallback: native
+ * rename cannot supply conditional publication and must not weaken that guard.
  *
  * @module @domitor-syh/dsh-rollback/root-write-fallback
  */
@@ -199,9 +200,8 @@ function permitted(ctx: InstallContext, sandboxPolicy: unknown, fs: FsLike, targ
  * Land the bytes without the parent-directory preflight.
  *
  * Staging in the destination's own directory keeps the replace on one volume and
- * therefore atomic, and the two guarded-mutation preconditions the provider
- * enforces are reproduced here so the fallback cannot write something the original
- * would have refused.
+ * therefore atomic. Guarded mutations preserve preflight diagnostics but refuse
+ * publication: a preflight stat followed by rename cannot enforce a version guard.
  * @param ctx - context for logging.
  * @param fs - the fs service.
  * @param target - the resolved target.
@@ -239,6 +239,8 @@ async function writeAtDriveRoot(
   } else if (intent?.kind === 'createIfAbsent' && existing !== undefined) {
     throw failure('FS_NOT_OBSERVED', `cannot overwrite existing "${display}" without reading it first`, cause, 'read the file, then retry')
   }
+  // A preflight stat cannot make the later rename conditional.
+  if (expected !== undefined) throw conditionalPublicationFailure(display, cause)
 
   const before = await readPriorText(fs, target, content, signal)
   await landBytes(hostPath, content, existing !== undefined, signal)
@@ -295,6 +297,8 @@ async function editAtDriveRoot(
   if (guard?.version !== undefined && existing.version !== guard.version) {
     throw failure('FS_STALE_VERSION', `cannot edit "${display}": file changed since it was read`, cause, 're-read the file, then retry')
   }
+
+  if (expected !== undefined) throw conditionalPublicationFailure(display, cause)
 
   const original = await readForEditAt(hostPath, display, signal)
   const request = (edit ?? {}) as EditRequestLike
@@ -410,6 +414,11 @@ async function readPriorText(
     // the target exists, and the diff basis is best-effort.
     return null
   }
+}
+
+/** Native rename is atomic but cannot compare the destination's version. */
+function conditionalPublicationFailure(display: string, cause: unknown): Error {
+  return failure('EPERM', `cannot mutate "${display}": drive-root fallback does not support conditional publication; guarded mutation refused`, cause)
 }
 
 /** The display path the provider would name in a message. */

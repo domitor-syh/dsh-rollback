@@ -90,7 +90,7 @@ if (typeof specifier !== 'string' || !specifier.startsWith('file:')) {
   console.error(`deploy-profile: ${profileManifest} does not depend on ${PACKAGE} via file: (got ${JSON.stringify(specifier)})`)
   process.exit(1)
 }
-const referencedTarball = resolve(specifier.slice('file:'.length))
+const referencedTarball = resolve(dirname(profileManifest), specifier.slice('file:'.length))
 const installed = join(profile, 'node_modules', ...PACKAGE.split('/'))
 
 const builtEntry = join(repo, 'lib', 'index.js')
@@ -126,9 +126,10 @@ copyFileSync(packed, referencedTarball)
 // 3) Refresh the extracted copy, so a plain restart is enough — no reinstall.
 // The first backup is kept, so the pre-deploy build stays recoverable.
 if (existsSync(installed)) {
+  const installedLib = join(installed, 'lib')
   const libBackup = join(installed, 'lib.bak')
-  if (!existsSync(libBackup)) replaceTree(join(installed, 'lib'), libBackup)
-  replaceTree(join(repo, 'lib'), join(installed, 'lib'))
+  if (existsSync(installedLib) && !existsSync(libBackup)) replaceTree(installedLib, libBackup)
+  replaceTree(join(repo, 'lib'), installedLib)
   for (const file of ['package.json', 'cordis.patch.yml', 'README.md', 'README.en.md']) {
     if (existsSync(join(repo, file))) replaceFile(join(repo, file), join(installed, file))
   }

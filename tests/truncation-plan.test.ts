@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+  alreadyShadowed,
   isRollbackMarkerSource,
   planTruncationMarker,
   replaceSurfaceOpCandidates,
@@ -7,6 +8,7 @@ import {
   ROLLBACK_MARKER_KIND,
   ROLLBACK_MARKER_SOURCE,
   ROLLBACK_PLUGIN,
+  rolledBackAlready,
   shadowedSurfaceFrom,
   systemPromptNodeSeq,
   turnStartSeqFor,
@@ -134,7 +136,10 @@ describe('planTruncationMarker', () => {
     const { entries, nodes } = threeTurns()
     const plan = planned(view(entries, nodes), 2)
     expect(plan.range).toEqual({ start: nodes[2]!, end: nodes[5]! })
-    expect(plan.sourceEventSeqs).toEqual([nodes[2]!, nodes[3]!, nodes[4]!, nodes[5]!])
+    // Same seqs, not the same ORDER: the citation is deliberately spelled so the session
+    // store will not compress it into range pairs, which is what made a session
+    // unopenable (see "the shadowed seqs a marker cites"). `shadowed` keeps surface order.
+    expect([...plan.sourceEventSeqs].sort((a, b) => a - b)).toEqual([nodes[2]!, nodes[3]!, nodes[4]!, nodes[5]!])
     expect(plan.shadowed).toEqual([nodes[2]!, nodes[3]!, nodes[4]!, nodes[5]!])
   })
 
@@ -150,18 +155,14 @@ describe('planTruncationMarker', () => {
     expect(ROLLBACK_CHECKPOINT_TEXT.length).toBeGreaterThan(0)
   })
 
-  it('keeps the checkpoint notice inside its token budget', () => {
-    // The marker replaces history the model no longer sees, and it STAYS in the
-    // model's context for the rest of the session: a later rollback replaces it,
-    // nothing else removes it. So its length is paid on every subsequent request,
-    // which is why it was tightened from 331 characters. This budget is the guard
-    // against it quietly growing back — the four facts it must carry are (1) it is
-    // machine-generated, (2) earlier messages were removed, (3) files were reverted
-    // with them, and (4) continue from what remains without mentioning it.
+  it('keeps the checkpoint notice bounded and limits its file claim to tracked contents', () => {
+    // Replacement text is model-visible on subsequent requests, so keep it
+    // short without implying a complete workspace or metadata restoration.
     expect(ROLLBACK_CHECKPOINT_TEXT.length).toBeLessThanOrEqual(150)
     expect(ROLLBACK_CHECKPOINT_TEXT).toContain('Automated checkpoint')
-    expect(ROLLBACK_CHECKPOINT_TEXT).toContain('removed')
-    expect(ROLLBACK_CHECKPOINT_TEXT).toMatch(/files restored/i)
+    expect(ROLLBACK_CHECKPOINT_TEXT).toContain('later messages removed')
+    expect(ROLLBACK_CHECKPOINT_TEXT).toMatch(/tracked file contents restored/i)
+    expect(ROLLBACK_CHECKPOINT_TEXT).not.toContain('files restored to that point')
     expect(ROLLBACK_CHECKPOINT_TEXT).toMatch(/don't mention/i)
   })
 
@@ -254,7 +255,11 @@ describe('the protected system-prompt node (0.1.5 node 0)', () => {
     const plan = planned(fixture, 2)
     expect(plan.range).toEqual({ start: 9, end: 11 })
     expect(plan.shadowed).toEqual([9, 10, 11])
-    expect(plan.sourceEventSeqs).toEqual([9, 10, 11])
+    // A run of three IS the compressible shape, so this citation is reordered on purpose
+    // while still citing every shadowed seq exactly once (see "the shadowed seqs a marker
+    // cites" for what the store would otherwise do to it).
+    expect([...plan.sourceEventSeqs].sort((a, b) => a - b)).toEqual([9, 10, 11])
+    expect(new Set(plan.sourceEventSeqs).size).toBe(3)
   })
 
   it('does not clamp a range that starts on a node which is not the system prompt', () => {
@@ -417,5 +422,162 @@ describe('isRollbackMarkerSource', () => {
     expect(isRollbackMarkerSource(null)).toBe(false)
     expect(isRollbackMarkerSource('plugin:rollback')).toBe(false)
     expect(isRollbackMarkerSource({})).toBe(false)
+  })
+})
+
+/**
+ * The desktop defect of 2026-10-03, in miniature.
+ *
+ * One session, four rollbacks of the same turn. The first shadowed turn 3 correctly
+ * (`{ startSeq: 53, endSeq: 54 }`). The three after it each found turn 3 gone from the
+ * SURFACE but still present in the LOG, so the range search started at the first surface
+ * node at or after the turn's boundary — the PREVIOUS MARKER — and wrote a range of one
+ * seq (`{60,60}`, `{75,75}`, `{93,93}` in the log). Because the framework REPLACES what
+ * a range covers, every one of those rollbacks destroyed the marker before it, and with
+ * it the window that was hiding turn 3: rolling back again un-hid what the last rollback
+ * had hidden, while reporting "已回退…已截断对话" and changing nothing the user could see.
+ */
+describe('a turn that was already rolled back', () => {
+  /** Turns 1-3, one user and one assistant message each; seqs are array indices. */
+  function threeTurnsWithClosings(): { entries: { type: string; data?: unknown }[]; nodes: number[] } {
+    const entries: { type: string; data?: unknown }[] = []
+    const nodes: number[] = []
+    for (let turn = 1; turn <= 3; turn++) {
+      entries.push({ type: 'turn/start', data: { turn } })
+      entries.push({ type: 'step/start', data: { turn, step: 1 } })
+      entries.push({ type: 'user/message', data: { turn } })
+      nodes.push(entries.length - 1)
+      entries.push({ type: 'assistant/message', data: { turn, step: 1 } })
+      nodes.push(entries.length - 1)
+      entries.push({ type: 'step/end', data: { turn, step: 1 } })
+      entries.push({ type: 'turn/end', data: { turn, reason: { kind: 'completed' } } })
+    }
+    return { entries, nodes }
+  }
+
+  /**
+   * Turn 3 rolled back once: its two messages (seqs 14 and 15) are gone from the surface
+   * and the checkpoint the rollback appended (seq 18) stands where they were.
+   */
+  function afterRollingBackTurn3(): SessionView {
+    const { entries, nodes } = threeTurnsWithClosings()
+    entries.push({ type: 'user/message', data: { source: { kind: 'plugin:rollback' } } })
+    return view(entries, [...nodes.slice(0, 4), 18])
+  }
+
+  /** The same log with turn 3 still standing — the state the FIRST rollback ran against. */
+  function beforeAnyRollback(): SessionView {
+    const { entries, nodes } = threeTurnsWithClosings()
+    return view(entries, nodes)
+  }
+
+  it('is recognized as already shadowed', () => {
+    expect(alreadyShadowed(afterRollingBackTurn3(), 3)).toBe(true)
+    // The turn before it is untouched, and a turn the log never had is not our call.
+    expect(alreadyShadowed(afterRollingBackTurn3(), 2)).toBe(false)
+    expect(alreadyShadowed(afterRollingBackTurn3(), 9)).toBe(false)
+  })
+
+  it('is NOT mistaken for already shadowed while its own output still stands', () => {
+    expect(alreadyShadowed(beforeAnyRollback(), 3)).toBe(false)
+    expect(alreadyShadowed(beforeAnyRollback(), 2)).toBe(false)
+    expect(alreadyShadowed(beforeAnyRollback(), 1)).toBe(false)
+  })
+
+  it('plans nothing, so no degenerate range can replace the previous marker', () => {
+    // The regression itself: the old planner returned `{ start: 18, end: 18 }` here.
+    expect(planTruncationMarker(afterRollingBackTurn3(), { fromTurn: 3, messageId: 'm' })).toBeNull()
+    expect(shadowedSurfaceFrom(afterRollingBackTurn3(), 3)).toEqual([])
+  })
+
+  it('refuses with an explanation, and stays quiet for a rollback that can proceed', () => {
+    expect(rolledBackAlready(afterRollingBackTurn3(), 3)).toContain('第 3 轮')
+    expect(rolledBackAlready(afterRollingBackTurn3(), 2)).toBeNull()
+    expect(rolledBackAlready(beforeAnyRollback(), 3)).toBeNull()
+  })
+
+  it('still plans the turn before it, and still plans the first rollback', () => {
+    expect(shadowedSurfaceFrom(afterRollingBackTurn3(), 2)).toEqual([8, 9, 18])
+    expect(shadowedSurfaceFrom(beforeAnyRollback(), 3)).toEqual([14, 15])
+    const plan = planTruncationMarker(beforeAnyRollback(), { fromTurn: 3, messageId: 'm' })
+    expect(plan?.range).toEqual({ start: 14, end: 15 })
+    expect(plan?.sourceEventSeqs).toEqual([14, 15])
+  })
+})
+
+/**
+ * The spelling of `sourceEventSeqs`, for a session that must stay OPENABLE.
+ *
+ * The JSONL store compresses a strictly increasing list with a run of three or more
+ * consecutive seqs into a `[start, end]` pair (`encodeSeqRanges`,
+ * `dsh-session/lib/index.js:982`), while the runtime consumer of the same field demands
+ * every entry be a safe integer (`:320`). Measured 2026-10-03, a marker whose list was
+ * compressed left the session unopenable: the transcript stood at "载入历史…", nothing
+ * was hidden, and every later rollback had no slice to work with. The fix is the list's
+ * ORDER — legal by every rule the runtime states (unique, earlier than the marker,
+ * `:321-325`), while failing the encoder's precondition. These tests pin the property
+ * that matters (the store must not find it compressible) and the one that must not be
+ * lost with it (every shadowed seq still cited, exactly once).
+ */
+describe('the shadowed seqs a marker cites', () => {
+  /** Turns 1-3, one user and one assistant message each. */
+  function threeTurns(): SessionView {
+    const entries: { type: string; data?: unknown }[] = []
+    const nodes: number[] = []
+    for (let turn = 1; turn <= 3; turn++) {
+      entries.push({ type: 'turn/start', data: { turn } })
+      entries.push({ type: 'step/start', data: { turn, step: 1 } })
+      entries.push({ type: 'user/message', data: { turn } })
+      nodes.push(entries.length - 1)
+      entries.push({ type: 'assistant/message', data: { turn, step: 1 } })
+      nodes.push(entries.length - 1)
+      entries.push({ type: 'step/end', data: { turn, step: 1 } })
+      entries.push({ type: 'turn/end', data: { turn, reason: { kind: 'completed' } } })
+    }
+    return view(entries, nodes)
+  }
+
+  /**
+   * A turn whose surface holds a RUN of consecutive seqs — the shape that made the store
+   * compress, and the shape a turn with several tool results produces on its own.
+   */
+  function turnWithConsecutiveNodes(): SessionView {
+    const entries: { type: string; data?: unknown }[] = []
+    const nodes: number[] = []
+    entries.push({ type: 'turn/start', data: { turn: 1 } })
+    entries.push({ type: 'step/start', data: { turn: 1, step: 1 } })
+    entries.push({ type: 'user/message', data: { turn: 1 } })
+    nodes.push(entries.length - 1)
+    for (let index = 0; index < 4; index += 1) {
+      entries.push({ type: 'tool/result', data: { turn: 1 } })
+      nodes.push(entries.length - 1)
+    }
+    entries.push({ type: 'step/end', data: { turn: 1, step: 1 } })
+    entries.push({ type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    return view(entries, nodes)
+  }
+
+  /** The store's compression precondition, restated so the test states it independently. */
+  const compressible = (seqs: readonly number[]): boolean =>
+    seqs.every((seq, index) => index === 0 || seq > seqs[index - 1]!)
+
+  it('cites every shadowed seq exactly once, and never in a compressible order', () => {
+    const fixture = turnWithConsecutiveNodes()
+    const shadowed = shadowedSurfaceFrom(fixture, 1)
+    expect(shadowed).toEqual([2, 3, 4, 5, 6])
+    const plan = planTruncationMarker(fixture, { fromTurn: 1, messageId: 'm' })
+    const cited = [...(plan?.sourceEventSeqs ?? [])]
+    // Same set, same size: the reordering may not lose or duplicate anything, because the
+    // runtime refuses a duplicate and refuses a missing shadowed node.
+    expect([...cited].sort((a, b) => a - b)).toEqual(shadowed)
+    expect(new Set(cited).size).toBe(cited.length)
+    expect(compressible(cited)).toBe(false)
+    // The range itself is untouched: only the citation's spelling changed.
+    expect(plan?.range).toEqual({ start: 2, end: 6 })
+  })
+
+  it('leaves a list too short to compress in its natural order', () => {
+    const plan = planTruncationMarker(threeTurns(), { fromTurn: 3, messageId: 'm' })
+    expect(plan?.sourceEventSeqs).toEqual([14, 15])
   })
 })

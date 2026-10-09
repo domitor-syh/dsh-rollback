@@ -23,7 +23,7 @@ export default defineConfig([
     platform: 'neutral',
     dts: false,
     sourcemap: false,
-    external: [/^@deepseek-ai\//, 'node:fs', 'node:fs/promises', 'node:os', 'node:path'],
+    deps: { neverBundle: [/^@deepseek-ai\//, /^node:/] },
   },
   {
     entry: { client: 'src/client/index.ts' },
@@ -32,7 +32,7 @@ export default defineConfig([
     platform: 'browser',
     dts: false,
     sourcemap: false,
-    external: [/^@deepseek-ai\//, 'react', 'react-dom'],
+    deps: { neverBundle: [/^@deepseek-ai\//, 'react', 'react-dom'] },
     outputOptions: {
       entryFileNames: '[name].js',
       banner:

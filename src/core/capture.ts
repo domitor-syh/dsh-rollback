@@ -39,11 +39,14 @@ export function recordChange(cp: TurnCheckpoint, mutation: FsMutation): TurnChec
       kind,
       before: mutation.before,
       after: mutation.after,
+      ...(mutation.afterKnown === false ? { afterKnown: false } : {}),
       basisKnown: mutation.before !== null || mutation.operation === 'create',
     }
     return { ...cp, changes: { ...cp.changes, [mutation.path]: change } }
   }
   // Keep the original `before`/`kind`/`basisKnown`; only the net `after` moves.
-  const merged: FileChange = { ...existing, after: mutation.after }
+  const { afterKnown: _previousAfterKnown, ...previous } = existing
+  const merged: FileChange = { ...previous, after: mutation.after,
+    ...(mutation.afterKnown === false ? { afterKnown: false } : {}) }
   return { ...cp, changes: { ...cp.changes, [mutation.path]: merged } }
 }

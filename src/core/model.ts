@@ -21,17 +21,17 @@ export interface FileChange {
   /** Filesystem-seam display path. */
   readonly path: string
   /**
-   * created = absent at turn start; updated = present and modified; removed =
-   * the file the plugin was watching was GONE when it looked. The third case
-   * cannot come from a file tool (none of them deletes), only from the boundary
-   * re-scan noticing a shell command's work — and it is what separates
-   * "put the old content back" from "bring the file back at all".
+   * First-touch operation retained for preimage provenance. The planner derives
+   * display kind/action from net endpoints, not from this intermediate kind.
+   * `removed` requires dispatch-owned evidence of a registered file's absence.
    */
   readonly kind: ChangeKind
-  /** Content before the turn. `null` only for a `created` file. */
+  /** Content before the first mutation; null is absence for create, otherwise unknown. */
   readonly before: string | null
   /** Content after the turn's last mutation of this path. */
-  readonly after: string
+  readonly after: string | null
+  /** False only when a historical record has no confirmed post-mutation state. */
+  readonly afterKnown?: boolean
   /**
    * Whether the pre-turn content is known well enough to restore. A backend
    * that declines a contextual basis for an `updated` file (`before === null`
@@ -73,6 +73,8 @@ export interface FsMutation {
   readonly operation: 'create' | 'update' | 'remove'
   /** Pre-mutation content, or null when the file did not exist / no basis. */
   readonly before: string | null
-  /** Post-mutation content. */
-  readonly after: string
+  /** Post-mutation content, or null when a confirmed boundary scan observed removal. */
+  readonly after: string | null
+  /** False when replaying a historical record without a known postimage. */
+  readonly afterKnown?: boolean
 }

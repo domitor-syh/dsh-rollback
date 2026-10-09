@@ -43,7 +43,9 @@ export function windowRefusal(fromTurn: number, availableTurns: readonly number[
   if (availableTurns.length === 0) return '当前会话没有可回退的轮次。'
   const oldest = Math.min(...availableTurns)
   const newest = Math.max(...availableTurns)
-  if (fromTurn >= oldest) return null
+  if (!Number.isSafeInteger(fromTurn) || fromTurn < 1) return '回退轮次必须为正整数。'
+  if (fromTurn >= oldest && fromTurn <= newest) return null
+  if (fromTurn > newest) return `目标轮次尚不可回退：最近可回退范围为第 ${oldest}–${newest} 轮。`
   return `超出可回退范围：只能回退到最近保留的检查点（第 ${oldest}–${newest} 轮，共 ${availableTurns.length} 轮），更早的已丢弃。`
 }
 

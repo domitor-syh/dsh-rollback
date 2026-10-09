@@ -1,188 +1,222 @@
 /**
- * Host side of the boundary re-scan: the watched-file registry and the filesystem
- * probe. See `src/core/boundary-scan.ts` for the decisions themselves.
- *
- * Watched files are the ones the file tools touched — the plugin's whole window onto
- * the workspace. A shell command can rewrite or delete any of them without the
- * plugin hearing about it, so every user-message boundary re-checks them and records
- * what changed, anchored at that boundary. The scan runs off the message path and
- * never throws: a failure here costs coverage, never the user's message.
- *
- * @module @domitor-syh/dsh-rollback/boundary-rescan
+ * Host-side watched-file registry and filesystem probes. Scans are serialized per
+ * session. Probe failures preserve the previous baseline; persistence failures reject
+ * scan/settled so rollback cannot silently proceed with incomplete checkpoints.
  */
-
-import { readFile, stat } from 'node:fs/promises'
-import { findingTurn, planBoundaryAction, unchangedByStat, type ObservedFile, type TrackedFile } from './core/boundary-scan.ts'
+import { readFile, lstat } from 'node:fs/promises'
+import { findingTurn, planBoundaryAction, type FileProbe, type ObservedFile, type TrackedFile } from './core/boundary-scan.ts'
 import type { FsMutation } from './core/model.ts'
 
-/** What the scanner needs from the plugin. */
+export interface BaselineOutcome {
+  path: string
+  /** Exact restored content; null means confirmed absent, never unknown. */
+  content: string | null
+}
+
 export interface BoundaryRescanDeps {
-  /**
-   * Resolve one watched path to its host path.
-   * @param sessionId - the session the path belongs to.
-   * @param path - the display path a tool reported.
-   * @returns the host path, or undefined when it cannot be resolved.
-   */
   hostPathOf(sessionId: string, path: string): Promise<string | undefined>
-  /** Paths the durable sidecar already holds for one session. */
   watchedPaths(sessionId: string): readonly string[]
-  /**
-   * The last content the durable sidecar knows for each watched path, with the turn it
-   * came from -- the turn that last confirmed the file existed.
-   */
-  knownContent(sessionId: string): Map<string, { content: string | null; turn: number | null }>
-  /**
-   * Record one finding against the turn its boundary opened.
-   * @param sessionId - the session.
-   * @param turn - the turn the boundary anchors to.
-   * @param mutation - the change to record.
-   */
+  knownContent(sessionId: string): Map<string, { content: string | null; turn: number | null; missing?: boolean }>
+  /** Persist baselines independently of dead-turn filtering; failures must throw. */
+  saveBaseline?(sessionId: string, outcomes: readonly BaselineOutcome[]): void
   record(sessionId: string, turn: number, mutation: FsMutation): void
-  /**
-   * Report something the user should know about coverage.
-   * @param message - the warning text.
-   */
   warn(message: string): void
 }
 
-/**
- * The largest file the scan will keep a restorable copy of. Beyond it the plugin
- * stops watching the path rather than pretending it could restore it.
- */
 const MAX_WATCHED_BYTES = 8 * 1024 * 1024
+const MAX_PATHS = 512
+const MAX_PATH_BYTES = 16 * 1024
+const MAX_AGGREGATE_BYTES = 64 * 1024 * 1024
+const MAX_PENDING_SCANS = 4
 
-/** Re-checks watched files at each user-message boundary. */
 export class BoundaryRescan {
-  /** Per session: display path to what the plugin last observed. */
   private readonly watched = new Map<string, Map<string, TrackedFile>>()
-  /** The scan currently running per session. */
   private readonly inFlight = new Map<string, Promise<void>>()
-  /** A newer anchor requested while a scan was already running. */
-  private readonly queued = new Map<string, number>()
-  /** Warnings that should appear once per path, not once per boundary. */
+  private readonly failures = new Map<string, LatchedFailure>()
+  private readonly pending = new Map<string, number>()
+  private readonly pendingCounts = new Map<string, number>()
   private readonly warned = new Set<string>()
-
+  private readonly dispatches = new WeakMap<Map<string, TrackedFile>, { sessionId: string; original: Map<string, TrackedFile>; registry: Map<string, TrackedFile> }>()
   constructor(private readonly deps: BoundaryRescanDeps) {}
 
-  /**
-   * Note what a file tool just left behind, so the next boundary compares against it
-   * instead of against the previous generation.
-   *
-   * `content` is null when the tool never reported it — the `str_replace_editor`
-   * tool returns only rendered text, so its capture is a pre-read and knows the
-   * BEFORE state alone. Passing its empty placeholder as real content would tell the
-   * registry the file is now empty, and the next boundary would record a phantom
-   * rewrite whose restore content is an empty string: a rollback would blank the
-   * file. An unknown content instead makes the next check read the file and adopt
-   * what it finds, recording nothing.
-   * @param sessionId - the session.
-   * @param path - the display path the tool reported.
-   * @param content - the content the tool left behind, or null when it never said.
-   */
+  /** null is unknown tool output, not an empty or confirmed absent file. */
   observe(sessionId: string, path: string, content: string | null, turn: number | null = null): void {
-    const tracked = this.registryFor(sessionId)
-    // The turn is recorded too: a tool write confirms the file existed in that turn,
-    // which is what a later finding has to be attributed from.
-    tracked.set(path, { lastKnown: content, size: null, mtimeMs: null, missing: false, lastSeenTurn: turn })
+    const registry = this.registryFor(sessionId)
+    if (Buffer.byteLength(path, 'utf8') > MAX_PATH_BYTES || (!registry.has(path) && registry.size >= MAX_PATHS)) {
+      this.failures.set(sessionId, { kind: 'scan', error: new Error('边界观察路径数量或路径长度超过上限，回退依据已锁定。') })
+      return
+    }
+    if (content !== null && Buffer.byteLength(content, 'utf8') > MAX_WATCHED_BYTES) {
+      this.failures.set(sessionId, { kind: 'scan', error: new Error(`边界观察文件超过恢复上限：${path}`) })
+      return
+    }
+    const aggregate = [...registry.values()].reduce((sum, item) => sum + (item.lastKnown === null ? 0 : Buffer.byteLength(item.lastKnown, 'utf8')), 0)
+    if (!registry.has(path) && content !== null && aggregate + Buffer.byteLength(content, 'utf8') > MAX_AGGREGATE_BYTES) {
+      this.failures.set(sessionId, { kind: 'scan', error: new Error('边界观察累计内容超过上限，回退依据已锁定。') })
+      return
+    }
+    registry.set(path, { lastKnown: content, size: null, mtimeMs: null, missing: false, lastSeenTurn: turn })
+  }
+
+  /** Clear a transient scan failure after all supplied rollback outcomes are durable. */
+  clearTransientFailure(sessionId: string): void {
+    const failure = this.failures.get(sessionId)
+    if (failure?.kind === 'scan') this.failures.delete(sessionId)
   }
 
   /**
-   * Re-check every watched file of one session, anchored at `turn`.
-   *
-   * Fire-and-forget by design: the caller invokes it from the event path and ignores
-   * the promise, and the scan swallows its own failures. A request arriving while a
-   * scan is already running is remembered and run afterwards, so a finding is never
-   * anchored to a turn the user has already left behind.
-   * @param sessionId - the session to scan.
-   * @param turn - the turn the boundary belongs to.
-   * @returns the running scan, for a caller that needs to wait for it.
+   * Install the exact state after successful rollback I/O. Persistence runs before the
+   * in-memory registry is changed; a persistence error remains latched and cannot be
+   * cleared by recovery.
+   * only successful paths belong here. Untouched/failed paths retain their baselines.
+   * saveBaseline must be wired to durable storage for restart coverage.
    */
-  scan(sessionId: string, turn: number): Promise<void> {
-    const running = this.inFlight.get(sessionId)
-    if (running !== undefined) {
-      this.queued.set(sessionId, turn)
-      return running
+  resetAfterRollback(sessionId: string, outcomes: readonly BaselineOutcome[]): void {
+    try {
+      this.deps.saveBaseline?.(sessionId, outcomes)
+    } catch (error) {
+      this.failures.set(sessionId, { kind: 'persistence', error })
+      throw error
     }
-    const task = (async () => {
-      try {
-        await this.runOnce(sessionId, turn)
-        while (this.queued.has(sessionId)) {
-          const next = this.queued.get(sessionId)!
-          this.queued.delete(sessionId)
-          await this.runOnce(sessionId, next)
-        }
-      } finally {
-        this.inFlight.delete(sessionId)
-        this.queued.delete(sessionId)
+    const registry = this.registryFor(sessionId)
+    for (const outcome of outcomes) {
+      registry.set(outcome.path, {
+        lastKnown: outcome.content, size: null, mtimeMs: null,
+        missing: outcome.content === null, lastSeenTurn: null,
+      })
+    }
+    // A successful durable baseline establishes a new safe generation. It may clear a
+    // transient probe/resolve latch, but never a persistence failure.
+    this.clearTransientFailure(sessionId)
+  }
+
+  /** Independent pre-dispatch observations: never mutate shared or durable state.
+   * Separate snapshots prevent overlapping tools from replacing each other's basis.
+   */
+  async captureDispatch(sessionId: string): Promise<Map<string, TrackedFile>> {
+    const registry = this.registryFor(sessionId)
+    const original = new Map(registry)
+    const snapshot = new Map(original)
+    try { await this.runOnce(sessionId, null, snapshot) } catch (error) {
+      if (this.failures.get(sessionId)?.kind !== 'persistence') this.failures.set(sessionId, { kind: 'scan', error })
+      throw error
+    }
+    this.dispatches.set(snapshot, { sessionId, original, registry })
+    return snapshot
+  }
+
+  async finishDispatch(sessionId: string, turn: number, snapshot: Map<string, TrackedFile>): Promise<void> {
+    try {
+      const dispatch = this.dispatches.get(snapshot)
+      if (dispatch?.sessionId !== sessionId) throw new Error('工具派发观察不属于此会话或已完成。')
+      this.dispatches.delete(snapshot)
+      // Do not let an old dispatch record over a newer canonical tool or rollback.
+      for (const path of snapshot.keys()) {
+        if (this.registryFor(sessionId) !== dispatch.registry || dispatch.registry.get(path) !== dispatch.original.get(path)) snapshot.delete(path)
       }
-    })()
+      await this.runOnce(sessionId, turn, snapshot, path => this.registryFor(sessionId) === dispatch.registry && dispatch.registry.get(path) === dispatch.original.get(path))
+    } catch (error) {
+      if (this.failures.get(sessionId)?.kind !== 'persistence') this.failures.set(sessionId, { kind: 'scan', error })
+      throw error
+    }
+  }
+
+  /** Queue scans serially; retain only the newest pending boundary anchor. */
+  scan(sessionId: string, turn: number): Promise<void> {
+    const previous = this.inFlight.get(sessionId)
+    if (previous !== undefined) {
+      const count = this.pendingCounts.get(sessionId) ?? 0
+      if (count >= MAX_PENDING_SCANS) {
+        const error = new Error('边界扫描队列超过上限，回退依据已锁定。')
+        this.failures.set(sessionId, { kind: 'scan', error })
+        return Promise.reject(error)
+      }
+      this.pendingCounts.set(sessionId, count + 1)
+      this.pending.set(sessionId, turn)
+      return previous
+    }
+    const task = this.runOnce(sessionId, turn).then(async () => {
+      const next = this.pending.get(sessionId)
+      this.pending.delete(sessionId)
+      this.pendingCounts.delete(sessionId)
+      if (next !== undefined) {
+        if (this.inFlight.get(sessionId) === task) this.inFlight.delete(sessionId)
+        await this.scan(sessionId, next)
+      }
+    })
     this.inFlight.set(sessionId, task)
+    void task.then(
+      () => { if (this.inFlight.get(sessionId) === task) this.inFlight.delete(sessionId) },
+      error => {
+        if (this.failures.get(sessionId)?.kind !== 'persistence') this.failures.set(sessionId, { kind: 'scan', error })
+        if (this.inFlight.get(sessionId) === task) this.inFlight.delete(sessionId)
+      },
+    )
     return task
   }
 
-  /**
-   * Wait for any running scan of this session to finish.
-   *
-   * A rollback can be asked for the very instant a turn ends, while the scan that
-   * turn triggered is still reading files; planning without waiting would miss
-   * exactly the change the user is rolling back.
-   * @param sessionId - the session.
-   */
+  /** Drain all work queued while waiting, then reject any latched recording failure. */
   async settled(sessionId: string): Promise<void> {
-    await this.inFlight.get(sessionId)
+    let task: Promise<void> | undefined
+    while ((task = this.inFlight.get(sessionId)) !== undefined) await task
+    const failure = this.failures.get(sessionId)
+    if (failure !== undefined) throw failure.error
   }
 
-  /** One pass over the session's watched files. */
-  private async runOnce(sessionId: string, turn: number): Promise<void> {
-    const tracked = this.registryFor(sessionId)
-    for (const [path, state] of [...tracked]) {
+  private async runOnce(sessionId: string, turn: number | null, registry = this.registryFor(sessionId), current: (path: string) => boolean = () => true): Promise<void> {
+    let failure: unknown
+    let failed = false
+    for (const [path, state] of [...registry]) {
       try {
-        await this.checkOne(sessionId, turn, path, state, tracked)
+        await this.checkOne(sessionId, turn, path, state, registry, current)
+        const aggregate = [...registry.values()].reduce((sum, item) => sum + (item.lastKnown === null ? 0 : Buffer.byteLength(item.lastKnown, 'utf8')), 0)
+        if (aggregate > MAX_AGGREGATE_BYTES) throw new Error('工具派发观察累计内容超过上限；回退依据已锁定。')
       } catch (error) {
-        this.deps.warn(`[dsh-rollback] boundary re-check failed for ${path}: ${error instanceof Error ? error.message : String(error)}`)
+        failure = error
+        this.warnOnce(`scan:${sessionId}:${path}`, `[dsh-rollback] boundary re-check failed for ${path}: ${errorMessage(error)}`)
+        break
       }
     }
+    if (failure !== undefined) throw failure
   }
 
-  /**
-   * Load the paths the durable sidecar already holds, so a restarted process keeps
-   * watching them. Called once per session; a later rollback deliberately does NOT
-   * re-prime, because the sidecar still describes the state the rollback undid and
-   * comparing against it would invent changes.
-   * @param sessionId - the session.
-   */
+  /** Load sidecar paths plus independent rollback baselines. */
   prime(sessionId: string): void {
-    const known = this.deps.knownContent(sessionId)
-    const primed = new Map<string, TrackedFile>()
-    for (const path of this.deps.watchedPaths(sessionId)) {
-      // A path the sidecar records without content (records written before that
-      // field existed) is still worth watching: the first check adopts its content.
-      const entry = known.get(path)
-      primed.set(path, { lastKnown: entry?.content ?? null, size: null, mtimeMs: null, missing: false, lastSeenTurn: entry?.turn ?? null })
+    try {
+      const known = this.deps.knownContent(sessionId)
+      const primed = new Map<string, TrackedFile>()
+      for (const path of new Set([...this.deps.watchedPaths(sessionId), ...known.keys()])) {
+        const entry = known.get(path)
+        primed.set(path, { lastKnown: entry?.content ?? null, size: null, mtimeMs: null, missing: entry?.missing === true, lastSeenTurn: entry?.turn ?? null })
+      }
+      if (primed.size > MAX_PATHS) throw new Error(`边界观察路径数量超过上限 ${MAX_PATHS}；回退依据已锁定。`)
+      let aggregate = 0
+      for (const [path, state] of primed) {
+        if (Buffer.byteLength(path, 'utf8') > MAX_PATH_BYTES) throw new Error(`边界观察路径过长：${path}`)
+        if (state.lastKnown !== null) {
+          const bytes = Buffer.byteLength(state.lastKnown, 'utf8')
+          if (bytes > MAX_WATCHED_BYTES || (aggregate += bytes) > MAX_AGGREGATE_BYTES) throw new Error('边界观察累计内容超过上限；回退依据已锁定。')
+        }
+      }
+      this.watched.set(sessionId, primed)
+    } catch (error) {
+      this.failures.set(sessionId, { kind: 'scan', error })
+      throw error
     }
-    this.watched.set(sessionId, primed)
   }
 
-  /**
-   * Forget what the plugin knows about a session's watched files, keeping the paths
-   * themselves watched.
-   *
-   * Used after a rollback, which rewrote the very files the registry describes: the
-   * next scan adopts whatever is on disk now and records nothing, where comparing
-   * against the pre-rollback picture would have invented a change for every file the
-   * rollback touched. Dropping the paths instead would quietly end their coverage.
-   * @param sessionId - the session.
-   */
+  /** @deprecated Use resetAfterRollback with exact successful outcomes instead. */
   forget(sessionId: string): void {
-    const tracked = this.watched.get(sessionId)
-    if (tracked === undefined) return
-    for (const path of [...tracked.keys()]) {
-      const previous = tracked.get(path)
-      tracked.set(path, { lastKnown: null, size: null, mtimeMs: null, missing: false, lastSeenTurn: previous?.lastSeenTurn ?? null })
+    const registry = this.watched.get(sessionId)
+    if (registry === undefined) return
+    for (const [path, previous] of registry) {
+      registry.set(path, {
+        lastKnown: null, size: null, mtimeMs: null,
+        missing: false, lastSeenTurn: previous.lastSeenTurn ?? null,
+      })
     }
   }
 
-  /** This session's registry, empty until primed or observed. */
   private registryFor(sessionId: string): Map<string, TrackedFile> {
     const existing = this.watched.get(sessionId)
     if (existing !== undefined) return existing
@@ -191,64 +225,92 @@ export class BoundaryRescan {
     return created
   }
 
-  /** Probe one path and act on what the decision says. */
   private async checkOne(
-    sessionId: string,
-    turn: number,
-    path: string,
-    state: TrackedFile,
-    registry: Map<string, TrackedFile>,
+    sessionId: string, turn: number | null, path: string, state: TrackedFile,
+    registry: Map<string, TrackedFile>, current: (path: string) => boolean,
   ): Promise<void> {
     const hostPath = await this.deps.hostPathOf(sessionId, path)
-    if (hostPath === undefined) return
+    // An observation that raced a newer tool observation or rollback must not overwrite it.
+    if (registry.get(path) !== state || !current(path)) return
+    if (hostPath === undefined) {
+      throw new Error(`Cannot resolve watched path ${path}; rollback coverage is unknown`)
+    }
     const fingerprint = await statFingerprint(hostPath)
-    if (fingerprint !== null && unchangedByStat(state, fingerprint.size, fingerprint.mtimeMs)) return
-    if (fingerprint !== null && fingerprint.size > MAX_WATCHED_BYTES) {
-      // Too large to keep a restorable copy of: stop watching rather than claim
-      // coverage the plugin cannot deliver.
-      this.warnOnce(`oversize:${sessionId}:${path}`, `[dsh-rollback] no longer watching ${path}: ${fingerprint.size} bytes exceeds the ${MAX_WATCHED_BYTES}-byte limit`)
-      registry.delete(path)
+    if (registry.get(path) !== state || !current(path)) return
+    if (fingerprint.kind === 'unknown') {
+      throw new Error(`Could not observe ${path}; preserving rollback baseline (${fingerprint.reason})`)
+    }
+    if (fingerprint.kind === 'observed' && fingerprint.value.size > MAX_WATCHED_BYTES) {
+      throw new Error(`Could not read ${path}: ${fingerprint.value.size} bytes exceeds the ${MAX_WATCHED_BYTES}-byte limit; preserving rollback baseline`)
+    }
+    const probe = fingerprint.kind === 'missing' ? fingerprint : await readObserved(hostPath)
+    if (registry.get(path) !== state || !current(path)) return
+    if (probe.kind === 'unknown') {
+      throw new Error(`Could not read ${path}; preserving rollback baseline (${probe.reason})`)
+    }
+    if (probe.kind === 'observed' && fingerprint.kind === 'observed'
+      && (probe.value.size !== fingerprint.value.size || probe.value.mtimeMs !== fingerprint.value.mtimeMs)) {
+      throw new Error(`File changed while reading ${path}; rollback coverage is unknown`)
+    }
+    const observed = probe.kind === 'missing' ? null : probe.value
+    if (turn === null) {
+      registry.set(path, observed === null
+        ? { ...state, lastKnown: null, size: null, mtimeMs: null, missing: true }
+        : { ...state, lastKnown: observed.content, size: observed.size, mtimeMs: observed.mtimeMs, missing: false })
       return
     }
-
-    const observed = fingerprint === null ? null : await readObserved(hostPath)
     const action = planBoundaryAction(state, observed)
     switch (action.kind) {
-      case 'none': {
-        // Identical content (a touched mtime) still refreshes the fingerprint so the
-        // next boundary can take the stat-only fast path.
-        if (fingerprint !== null) registry.set(path, { ...state, size: fingerprint.size, mtimeMs: fingerprint.mtimeMs, missing: false, lastSeenTurn: turn })
+      case 'none':
+        if (observed !== null) registry.set(path, {
+          ...state, size: observed.size, mtimeMs: observed.mtimeMs,
+          missing: false, lastSeenTurn: turn,
+        })
         return
-      }
-      case 'adopt': {
-        registry.set(path, { lastKnown: action.observed.content, size: action.observed.size, mtimeMs: action.observed.mtimeMs, missing: false, lastSeenTurn: turn })
+      case 'adopt':
+        registry.set(path, {
+          lastKnown: action.observed.content, size: action.observed.size,
+          mtimeMs: action.observed.mtimeMs, missing: false, lastSeenTurn: turn,
+        })
         return
-      }
-      case 'changed': {
-        // Attributed to the turn the change belongs to, not necessarily the one being
-        // scanned: see findingTurn.
-        const anchor = findingTurn(state.lastSeenTurn, turn)
-        this.deps.record(sessionId, anchor, { path, operation: 'update', before: action.before, after: action.after })
-        registry.set(path, { lastKnown: action.after, size: action.observed.size, mtimeMs: action.observed.mtimeMs, missing: false, lastSeenTurn: turn })
+      case 'created':
+        this.record(sessionId, findingTurn(state.lastSeenTurn, turn), {
+          path, operation: 'create', before: null, after: action.observed.content,
+        })
+        registry.set(path, {
+          lastKnown: action.observed.content, size: action.observed.size,
+          mtimeMs: action.observed.mtimeMs, missing: false, lastSeenTurn: turn,
+        })
         return
-      }
-      case 'missing': {
-        // Recorded as a removal, not an update: the rollback has to bring the file
-        // BACK, which the user should see as its own category rather than as a
-        // rewrite of a file that is still there.
-        const removeAnchor = findingTurn(state.lastSeenTurn, turn)
-        this.deps.record(sessionId, removeAnchor, { path, operation: 'remove', before: action.before, after: '' })
+      case 'changed':
+        this.record(sessionId, findingTurn(state.lastSeenTurn, turn), {
+          path, operation: 'update', before: action.before, after: action.after,
+        })
+        registry.set(path, {
+          lastKnown: action.after, size: action.observed.size,
+          mtimeMs: action.observed.mtimeMs, missing: false, lastSeenTurn: turn,
+        })
+        return
+      case 'missing':
+        this.record(sessionId, findingTurn(state.lastSeenTurn, turn), {
+          path, operation: 'remove', before: action.before, after: null,
+        })
         registry.set(path, { ...state, lastKnown: action.before, size: null, mtimeMs: null, missing: true })
         return
-      }
-      case 'unrestorable': {
-        this.warnOnce(`unread:${sessionId}:${path}`, `[dsh-rollback] ${path} disappeared before the plugin ever read it; a rollback cannot restore it`)
-        registry.set(path, { ...state, size: null, mtimeMs: null, missing: true })
-      }
+      case 'unrestorable':
+        throw new Error(`${path} disappeared before the plugin read it; rollback cannot restore it`)
+      case 'unknown':
+        throw new Error(action.reason)
     }
   }
 
-  /** Report one condition once per key. */
+  private record(sessionId: string, turn: number, mutation: FsMutation): void {
+    try { this.deps.record(sessionId, turn, mutation) } catch (error) {
+      this.failures.set(sessionId, { kind: 'persistence', error })
+      throw error
+    }
+  }
+
   private warnOnce(key: string, message: string): void {
     if (this.warned.has(key)) return
     this.warned.add(key)
@@ -256,26 +318,55 @@ export class BoundaryRescan {
   }
 }
 
-/** Current size and mtime of a regular file, or null when it is absent or not one. */
-async function statFingerprint(hostPath: string): Promise<{ size: number; mtimeMs: number } | null> {
+type Probe<T> = FileProbe<T>
+type FailureKind = 'scan' | 'persistence'
+interface LatchedFailure {
+  kind: FailureKind
+  error: unknown
+}
+
+/** Only ENOENT confirms absence; directories and every other errno remain unknown. */
+async function statFingerprint(hostPath: string): Promise<Probe<{ size: number; mtimeMs: number }>> {
   try {
-    const info = await stat(hostPath)
-    if (!info.isFile()) return null
-    return { size: info.size, mtimeMs: info.mtimeMs }
-  } catch {
-    return null
+    const info = await lstat(hostPath)
+    if (!info.isFile()) return { kind: 'unknown', reason: 'path is not a regular file' }
+    return { kind: 'observed', value: { size: info.size, mtimeMs: info.mtimeMs } }
+  } catch (error) {
+    return failedProbe(error)
   }
 }
 
-/** Read a file for the re-scan. A read failure leaves it unobserved, which the
- * decision treats as absent — and an absent file with no known content is reported
- * rather than recorded, so a transient read error cannot sabotage a rollback. */
-async function readObserved(hostPath: string): Promise<ObservedFile | null> {
+async function readObserved(hostPath: string): Promise<Probe<ObservedFile>> {
   try {
-    const info = await stat(hostPath)
-    const content = await readFile(hostPath, 'utf8')
-    return { content, size: info.size, mtimeMs: info.mtimeMs }
-  } catch {
-    return null
+    const before = await lstat(hostPath)
+    if (!before.isFile()) return { kind: 'unknown', reason: 'path is not a regular file' }
+    if (before.size > MAX_WATCHED_BYTES) return { kind: 'unknown', reason: 'file grew beyond the watched size limit' }
+    const bytes = await readFile(hostPath)
+    if (bytes.length > MAX_WATCHED_BYTES) return { kind: 'unknown', reason: 'file grew beyond the watched size limit' }
+    // Node's utf8 decoder replaces malformed bytes. A rollback must never save
+    // that lossy string as a complete preimage; BOM bytes must also be preserved.
+    const content = bytes.toString('utf8')
+    if (bytes.includes(0) || !Buffer.from(content, 'utf8').equals(bytes)) {
+      return { kind: 'unknown', reason: 'file is binary or not lossless UTF-8 text' }
+    }
+    const after = await lstat(hostPath)
+    if (!after.isFile()) return { kind: 'unknown', reason: 'path ceased to be a regular file while reading' }
+    if (before.size !== after.size || before.mtimeMs !== after.mtimeMs
+      || before.ctimeMs !== after.ctimeMs || before.dev !== after.dev || before.ino !== after.ino
+      || bytes.length !== after.size) {
+      return { kind: 'unknown', reason: 'file changed while reading' }
+    }
+    return { kind: 'observed', value: { content, size: after.size, mtimeMs: after.mtimeMs } }
+  } catch (error) {
+    return failedProbe(error)
   }
+}
+
+function failedProbe(error: unknown): { kind: 'missing' } | { kind: 'unknown'; reason: string } {
+  if (error !== null && typeof error === 'object' && (error as { code?: unknown }).code === 'ENOENT') return { kind: 'missing' }
+  return { kind: 'unknown', reason: errorMessage(error) }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }

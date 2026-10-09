@@ -46,7 +46,7 @@ describe('restart replay of a real desktop session', () => {
     const created = 'C:/Users/tester/Desktop/rbk-test.txt'
     appendCheckpoint({ sessionId, turn: 1, path: removed, operation: 'update', before: '', after: 'line one\n' })
     appendCheckpoint({ sessionId, turn: 2, path: removed, operation: 'update', before: 'line one\n', after: 'line one\nline two\n' })
-    appendCheckpoint({ sessionId, turn: 3, path: removed, operation: 'remove', before: 'line one\nline two\n', after: '' })
+    appendCheckpoint({ sessionId, turn: 3, path: removed, operation: 'remove', before: 'line one\nline two\n', after: null })
     appendCheckpoint({ sessionId, turn: 3, path: created, operation: 'create', before: null, after: 'fresh content\n' })
     return { removed, created }
   }
@@ -66,7 +66,8 @@ describe('restart replay of a real desktop session', () => {
       for (const [path, stored] of durable.get(turn) ?? []) {
         fold.fold({
           kind: 'fs-mutation',
-          mutation: { path, operation: stored.operation, before: stored.before, after: '' },
+          mutation: { path, operation: stored.operation, before: stored.before, after: stored.after ?? null,
+            ...(stored.after === undefined ? { afterKnown: false } : {}) },
         })
       }
       fold.fold({ kind: 'turn-end', turn, seq: turn * 10 + 1 })
@@ -131,7 +132,7 @@ describe('restart replay of a real desktop session', () => {
     // a.txt` alongside `turn=5 update c.txt`, i.e. the boundary that found them.
     const shellCreated = 'C:/Users/tester/Desktop/shell-made.txt'
     appendCheckpoint({ sessionId, turn: 1, path: shellCreated, operation: 'create', before: null, after: '' })
-    appendCheckpoint({ sessionId, turn: 3, path: shellCreated, operation: 'remove', before: '', after: '' })
+    appendCheckpoint({ sessionId, turn: 3, path: shellCreated, operation: 'remove', before: '', after: null })
 
     const durable = loadCheckpoints(sessionId)
     const fold = new SessionFold(10)
@@ -140,7 +141,8 @@ describe('restart replay of a real desktop session', () => {
       for (const [path, stored] of durable.get(turn) ?? []) {
         fold.fold({
           kind: 'fs-mutation',
-          mutation: { path, operation: stored.operation, before: stored.before, after: '' },
+          mutation: { path, operation: stored.operation, before: stored.before, after: stored.after ?? null,
+            ...(stored.after === undefined ? { afterKnown: false } : {}) },
         })
       }
       fold.fold({ kind: 'turn-end', turn, seq: turn * 10 + 1 })
@@ -152,10 +154,9 @@ describe('restart replay of a real desktop session', () => {
       { path: shellCreated, action: 'recover', content: '', kind: 'removed' },
     ])
 
-    // Rolling back to before the turn that CREATED it deletes it instead — the two
-    // targets must stay distinguishable, which is what "attribution" buys.
+    // Rolling back the full create/delete span has identical absent endpoints.
     const rollingBackTheCreatingTurn = planRollback(fold.snapshots(), 1, 31)
-    expect(rollingBackTheCreatingTurn.restored.map(f => f.action)).toEqual(['delete'])
+    expect(rollingBackTheCreatingTurn.restored).toEqual([])
   })
 
   it('prunes records older than the retention window and compacts the file', async () => {

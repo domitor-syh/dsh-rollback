@@ -33,6 +33,91 @@ function makeScanner(options: { watched?: readonly string[]; known?: Map<string,
 }
 
 describe('BoundaryRescan', () => {
+  it.each([
+    ['invalid-utf8', Buffer.from([0x61, 0xff, 0x62])],
+    ['binary-nul', Buffer.from([0x61, 0, 0x62])],
+  ])('rejects %s rather than persisting a lossy preimage', async (_label, bytes) => {
+    const file = join(root, 'unsafe.txt')
+    await writeFile(file, bytes)
+    const { scanner, records } = makeScanner()
+    scanner.observe('s1', file, 'old-text', 1)
+    await expect(scanner.captureDispatch('s1')).rejects.toThrow('lossless UTF-8')
+    await expect(scanner.settled('s1')).rejects.toThrow('lossless UTF-8')
+    expect(records).toEqual([])
+  })
+
+  it('preserves UTF-8 BOM and Unicode in a deletion preimage', async () => {
+    const file = join(root, 'bom.txt')
+    const original = '\uFEFF中文\r\nlast line'
+    await writeFile(file, original, 'utf8')
+    const { scanner, records } = makeScanner()
+    scanner.observe('s1', file, 'old-text', 1)
+    const snapshot = await scanner.captureDispatch('s1')
+    await unlink(file)
+    await scanner.finishDispatch('s1', 2, snapshot)
+    expect(records).toEqual([{ turn: 2, mutation: { path: file, operation: 'remove', before: original, after: null } }])
+  })
+
+  it('takes external live content as a dispatch basis without recording or replacing history', async () => {
+    const file = join(root, 'external.txt')
+    await writeFile(file, 'user-edited')
+    const { scanner, records } = makeScanner()
+    scanner.observe('s1', file, 'old-model-after', 1)
+    const snapshot = await scanner.captureDispatch('s1')
+    expect(records).toEqual([])
+    expect(snapshot.get(file)?.lastKnown).toBe('user-edited')
+    await scanner.finishDispatch('s1', 2, snapshot)
+    expect(records).toEqual([])
+    const next = await scanner.captureDispatch('s1')
+    await writeFile(file, 'new-model-after')
+    await scanner.finishDispatch('s1', 3, next)
+    expect(records).toEqual([{ turn: 3, mutation: { path: file, operation: 'update', before: 'user-edited', after: 'new-model-after' } }])
+  })
+
+  it('keeps overlapping dispatch observations independent', async () => {
+    const file = join(root, 'overlap.txt')
+    await writeFile(file, 'user-edited')
+    const { scanner, records } = makeScanner()
+    scanner.observe('s1', file, 'old-model-after', 1)
+    const first = await scanner.captureDispatch('s1')
+    await writeFile(file, 'first-tool-after')
+    const second = await scanner.captureDispatch('s1')
+    await scanner.finishDispatch('s1', 2, first)
+    expect(records[0]?.mutation.before).toBe('user-edited')
+    await scanner.finishDispatch('s1', 2, second)
+    expect(records).toHaveLength(1)
+    expect(second.get(file)?.lastKnown).toBe('first-tool-after')
+  })
+
+  it('does not replace a newer authoritative observation with an old dispatch snapshot', async () => {
+    const file = join(root, 'newer.txt')
+    await writeFile(file, 'before')
+    const { scanner } = makeScanner()
+    scanner.observe('s1', file, 'before', 1)
+    const old = await scanner.captureDispatch('s1')
+    await writeFile(file, 'after')
+    scanner.observe('s1', file, 'after', 3)
+    await scanner.finishDispatch('s1', 2, old)
+    const fresh = await scanner.captureDispatch('s1')
+    expect(fresh.get(file)?.lastSeenTurn).toBe(3)
+  })
+
+  it('binds a dispatch snapshot to one session and one finish', async () => {
+    const file = join(root, 'single-use.txt')
+    await writeFile(file, 'before')
+    const { scanner, records } = makeScanner()
+    scanner.observe('s1', file, 'before', 1)
+    const snapshot = await scanner.captureDispatch('s1')
+    await writeFile(file, 'after')
+    await scanner.finishDispatch('s1', 2, snapshot)
+    await expect(scanner.finishDispatch('s1', 3, snapshot)).rejects.toThrow('已完成')
+    expect(records).toHaveLength(1)
+    await expect(scanner.settled('s1')).rejects.toThrow('已完成')
+    const fresh = await scanner.captureDispatch('s1')
+    await scanner.finishDispatch('s1', 4, fresh)
+    await expect(scanner.settled('s1')).rejects.toThrow('已完成')
+  })
+
   it('records a file a shell command removed, against the boundary turn', async () => {
     const file = join(root, 'watched.txt')
     await writeFile(file, 'content', 'utf8')
@@ -41,7 +126,7 @@ describe('BoundaryRescan', () => {
     await unlink(file)
 
     await scanner.scan('s1', 5)
-    expect(records).toEqual([{ turn: 5, mutation: { path: file, operation: 'remove', before: 'content', after: '' } }])
+    expect(records).toEqual([{ turn: 5, mutation: { path: file, operation: 'remove', before: 'content', after: null } }])
   })
 
   it('records a disappearance once, not at every following boundary', async () => {
@@ -103,7 +188,7 @@ describe('BoundaryRescan', () => {
     // pre-deletion content is what goes back), while the old rule cost a MISSING entry
     // on the very turn that did the deleting — one is cosmetic, the other loses the
     // user's file from the preview.
-    expect(records).toEqual([{ turn: 9, mutation: { path: file, operation: 'remove', before: 'durable content', after: '' } }])
+    expect(records).toEqual([{ turn: 9, mutation: { path: file, operation: 'remove', before: 'durable content', after: null } }])
   })
 
   it('learns the content of a path it has never read, then notices a later change', async () => {
@@ -151,12 +236,13 @@ describe('BoundaryRescan', () => {
     scanner.prime('s1')
     await unlink(file)
 
-    await scanner.scan('s1', 3)
+    await expect(scanner.scan('s1', 3)).rejects.toThrow('disappeared before')
     expect(records).toEqual([])
     expect(warnings.some(w => w.includes(file))).toBe(true)
 
     // And it does not repeat the warning at every boundary.
-    await scanner.scan('s1', 4)
+    await expect(scanner.scan('s1', 4)).rejects.toThrow('disappeared before')
+    await expect(scanner.settled('s1')).rejects.toThrow('disappeared before')
     expect(warnings).toHaveLength(1)
   })
 
@@ -202,7 +288,15 @@ describe('BoundaryRescan', () => {
     })
   })
 
-  it('never throws when a watched path cannot be resolved', async () => {
+  it('records a confirmed missing path as a create when it reappears', async () => {
+    const file = join(root, 'recreated.txt')
+    const { scanner, records } = makeScanner({ known: new Map([[file, { content: null, turn: 1, missing: true }]]) })
+    scanner.prime('s1')
+    await writeFile(file, 'new', 'utf8')
+    await scanner.scan('s1', 2)
+    expect(records).toEqual([{ turn: 2, mutation: { path: file, operation: 'create', before: null, after: 'new' } }])
+  })
+  it('rejects when a watched path cannot be resolved', async () => {
     const scanner = new BoundaryRescan({
       hostPathOf: async () => undefined,
       watchedPaths: () => ['unresolvable'],
@@ -211,7 +305,8 @@ describe('BoundaryRescan', () => {
       warn: () => {},
     })
     scanner.prime('s1')
-    await expect(scanner.scan('s1', 1)).resolves.toBeUndefined()
+    await expect(scanner.scan('s1', 1)).rejects.toThrow('Cannot resolve')
+    await expect(scanner.settled('s1')).rejects.toThrow('Cannot resolve')
   })
 
   it('settles only after a running scan has recorded what it found', async () => {

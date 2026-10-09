@@ -28,8 +28,11 @@ import type {} from '@deepseek-ai/dsh-commands'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 // ctx.systemPrompt.context — the turn-scoped note this plugin contributes.
 import type {} from '@deepseek-ai/dsh-system-prompt'
-// The tools/pre-execute and tools/result events this plugin observes.
+// The tools/pre-execute, tools/execute and tools/result events this plugin observes.
 import type {} from '@deepseek-ai/dsh-tools'
+// Optional context-pressure pricing; type-only, no runtime dependency or injection.
+import type {} from '@deepseek-ai/dsh-compaction'
+import type {} from '@deepseek-ai/dsh-token-meter'
 // ctx.invariants.register — the seat self-check.
 import type {} from '@deepseek-ai/dsh-invariants'
 // Session and its branded ids/seqs, plus the event payload shapes.

@@ -69,23 +69,16 @@ export interface SessionView {
  * Framed like the harness's own compaction checkpoint (`frameSummary`): it says
  * what it is and tells the model to continue from the messages that follow
  * without acknowledging it, so the model neither has to guess why an
- * unexplained user turn appeared nor act on it. The file sentence is the one
- * fact a rollback adds beyond compaction — the workspace was reverted too, so
- * the model must not keep reasoning about content its own edits had produced.
+ * unexplained user turn appeared nor act on it. Only tracked restorable file
+ * contents are reverted; unobserved workspace changes and file metadata are not.
+ * The model must not keep reasoning about edits removed from that tracked set.
  *
- * Everything here is load-bearing, and nothing else is: the four facts are (1)
- * this is machine-generated, not something the user said, (2) the messages after
- * this point are gone, so stop reasoning about them, (3) the workspace files were
- * reverted with them, so their later edits are not on disk, and (4) continue from
- * what remains and do not mention the checkpoint. The marker stays in the model's
- * context for the REST OF THE SESSION — a later rollback replaces it, nothing else
- * removes it — so every word is paid on every subsequent request. That is why the
- * wording is this terse: it is roughly a third of the prose it replaced, with the
- * same four facts and no new ambiguity. `tests/truncation-plan.test.ts` pins a
- * character budget so it cannot quietly grow back.
+ * Keep the notice short: it remains model-visible until another replacement
+ * shadows it, and every word is paid on subsequent requests. The test pins both
+ * the character budget and the tracked-content qualification.
  */
 export const ROLLBACK_CHECKPOINT_TEXT =
-  'Automated checkpoint: earlier messages removed, files restored to that point. Continue from what remains; don\'t mention this checkpoint.'
+  'Automated checkpoint: later messages removed; tracked file contents restored. Continue from what remains; don\'t mention this checkpoint.'
 
 /**
  * Provenance stamped on the marker, so the framework and the client both
@@ -288,6 +281,87 @@ function eventTypeAtSeq(view: SessionView, seq: number): string | null {
 }
 
 /**
+ * Whether one seq sits inside `turn`'s own span: at or after its `turn/start`, and
+ * before the next turn's.
+ *
+ * This is the test that separates "a node of the turn being rolled back" from "a node
+ * that merely comes later in the surface", and the difference is not cosmetic — it is
+ * the whole of the 2026-10-03 defect. See {@link alreadyShadowed}.
+ */
+function seqInsideTurn(view: SessionView, turn: number, seq: number): boolean {
+  const start = turnStartSeqFor(view, turn)
+  if (start === null) return false
+  if (seq < start) return false
+  // The turn's OWN closing event bounds it, and this bound is what makes the test
+  // correct rather than merely plausible: the checkpoint a previous rollback appended
+  // lands AFTER the rolled-back turn's `turn/end`, so a span that ran to the next
+  // turn's start would call that marker a node of the turn — which is exactly the
+  // reading that produced `{ startSeq: 60, endSeq: 60 }` on the desktop. The last
+  // `turn/end` wins, for the same reason the last `turn/start` does.
+  let closing: number | null = null
+  for (const event of view.events) {
+    if (event.type !== 'turn/end') continue
+    if ((event.data as { turn?: unknown } | undefined)?.turn !== turn) continue
+    closing = event.seq
+  }
+  if (closing !== null) return seq <= closing
+  // A turn that never closed (interrupted before it could) is bounded by the next one.
+  for (const event of view.events) {
+    if (event.type !== 'turn/start') continue
+    if (event.seq > start && event.seq <= seq) return false
+  }
+  return true
+}
+
+/**
+ * Whether the target turn's model-visible output is ALREADY shadowed — that is, the
+ * turn was rolled back before.
+ *
+ * Measured on the desktop (2026-10-03), this is what four rollbacks of one turn did:
+ * the first shadowed the turn correctly; the three after it each found the turn gone
+ * from the SURFACE but still present in the LOG, so the range search below started at
+ * the first surface node at or after the turn's boundary — which was the PREVIOUS
+ * MARKER. The framework replaces what a range covers, so each of those rollbacks
+ * destroyed the marker before it, and with it the window that was hiding the turn:
+ * rolling back again REVEALED what the last rollback had hidden, wrote a marker whose
+ * range was a single seq (`[60,60]`, `[75,75]`, `[93,93]` in the log), and reported
+ * "已回退…已截断对话" while changing nothing the user could see.
+ *
+ * The turn's own boundary is read from the log, which still holds it, so presence in
+ * the log is not evidence of presence in the surface: what decides is whether the
+ * surface node the range would START at belongs to this turn. When it does not, there
+ * is nothing of this turn left to shadow.
+ * @param view - the session view.
+ * @param fromTurn - the turn the rollback targeted.
+ * @returns whether the turn's output is already gone from the model-visible surface.
+ */
+export function alreadyShadowed(view: SessionView, fromTurn: number): boolean {
+  const boundary = turnStartSeqFor(view, fromTurn)
+  if (boundary === null) return false
+  const head = view.surface.nodes.find(seq => seq >= boundary)
+  if (head === undefined) return false
+  return !seqInsideTurn(view, fromTurn, head)
+}
+
+/**
+ * The user-facing refusal for a rollback whose target turn is already shadowed, or null
+ * when the rollback may proceed.
+ *
+ * Colocated with {@link alreadyShadowed} rather than with the other refusals because it
+ * is the only one that has to read the session view; the wording stays in the style of
+ * `rollback-guard.ts`: what is wrong, and what the user can do instead. Nothing is
+ * offered as a remedy here on purpose — "roll back an earlier turn" is what the picker
+ * already offers, and an already-shadowed turn is simply not a target.
+ * @param view - the session view.
+ * @param fromTurn - the turn the rollback targeted.
+ * @returns the refusal text, or null when the rollback may proceed.
+ */
+export function rolledBackAlready(view: SessionView, fromTurn: number): string | null {
+  if (!alreadyShadowed(view, fromTurn)) return null
+  return `第 ${fromTurn} 轮已经在回退点之前（该轮已被回退过），再回退一次不会改变任何东西，因此没有执行。`
+}
+
+/**
  * The surface seq of the system-prompt node a rollback must never shadow, or null
  * when node 0 holds something else.
  *
@@ -323,6 +397,15 @@ function boundarySurfaceFrom(view: SessionView, fromTurn: number): number[] {
   const nodes = view.surface.nodes
   const startIdx = nodes.findIndex(seq => seq >= boundary)
   if (startIdx === -1) return []
+  // The node this range would start at must belong to the TARGET TURN. When the turn
+  // has already been rolled back, its own nodes are gone from the surface and the first
+  // node at or after its boundary is the PREVIOUS MARKER — and a range starting there
+  // replaces that marker, which destroys the window hiding the rolled-back turn. That is
+  // the degenerate `[60,60]` / `[75,75]` / `[93,93]` measured on the desktop
+  // (2026-10-03): three rollbacks of one already-rolled-back turn, each of which
+  // un-hid what the one before it had hidden. Nothing is the honest answer here, and
+  // `service.execute` refuses the rollback outright rather than writing that marker.
+  if (!seqInsideTurn(view, fromTurn, nodes[startIdx]!)) return []
   return [...nodes.slice(startIdx)]
 }
 
@@ -358,6 +441,35 @@ function withoutSystemPromptHead(view: SessionView, shadowed: readonly number[])
  */
 export function shadowedSurfaceFrom(view: SessionView, fromTurn: number): number[] {
   return withoutSystemPromptHead(view, boundarySurfaceFrom(view, fromTurn))
+}
+
+/**
+ * The shadowed seqs, ordered so the session store keeps them VERBATIM.
+ *
+ * The JSONL store has a lossless range encoding for this one field: a STRICTLY
+ * INCREASING list containing a run of three or more consecutive seqs is written as a
+ * single `[start, end]` pair (`encodeSeqRanges`, `dsh-session/lib/index.js:982`). On
+ * 2026-10-03 a marker written that way left a session that could never be opened again:
+ * the runtime consumer of the field demands every entry be a non-negative safe integer
+ * (`:320`), so the pair — a valid STORAGE form — was not a valid RUNTIME value. The
+ * transcript stood at "载入历史…" from then on, and every later rollback in that session
+ * had nothing left to hide. Replaying the session's real 108-event log through the
+ * framework's own append path, this marker was the ONLY event it refused.
+ *
+ * The runtime has no ordering requirement of its own: entries must be unique and must
+ * name earlier events (`:321-325`), nothing more. So leading with the LAST seq keeps the
+ * list exactly as legal, keeps every element, and leaves `isStrictlyIncreasing` false —
+ * which is the encoder's entire precondition (`:983`). Nothing about the range changes;
+ * only its spelling, and only so the spelling survives the store intact.
+ *
+ * Fewer than three seqs cannot contain a run of three, so short lists are left in their
+ * natural order.
+ * @param shadowed - the surface seqs the marker replaces, ascending.
+ * @returns the same seqs, spelled so the store will not compress them.
+ */
+function seqsForStorage(shadowed: readonly number[]): number[] {
+  if (shadowed.length < 3) return [...shadowed]
+  return [shadowed[shadowed.length - 1]!, ...shadowed.slice(0, -1)]
 }
 
 /** Everything the marker needs beyond the session itself. */
@@ -399,6 +511,6 @@ export function planTruncationMarker(
     shadowed,
     data,
     range: { start: shadowed[0]!, end: shadowed[shadowed.length - 1]! },
-    sourceEventSeqs: [...shadowed],
+    sourceEventSeqs: seqsForStorage(shadowed),
   }
 }

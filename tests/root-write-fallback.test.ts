@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, readdir, readFile, rm, stat as nodeStat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { installRootWriteFallback } from '../src/root-write-fallback.ts'
 
 /** The context shape the installer accepts, derived from its own signature. */
@@ -223,6 +223,40 @@ describe('installRootWriteFallback', () => {
     expect(await readFile(target.hostPath, 'utf8')).toBe('present')
     expect((await readdir(directory)).filter(name => name.includes('rbk-tmp'))).toEqual([])
   })
+  it('refuses guarded creation before reading or staging bytes', async () => {
+    const fs = fakeFs(() => rootMkdirEperm())
+    const read = vi.spyOn(fs, 'readText')
+    installRootWriteFallback(fakeContext(fs))
+    await expect(writeVia(fs, targetFor('absent.txt'), 'new', { kind: 'createIfAbsent' }, { mode: 'danger-full-access' }))
+      .rejects.toThrow('conditional publication')
+    expect(read).not.toHaveBeenCalled()
+    expect(await readdir(directory)).toEqual([])
+  })
+
+  it('refuses a current replacement guard without a conditional publisher', async () => {
+    const target = targetFor('current.txt')
+    await writeFile(target.hostPath, 'external', 'utf8')
+    const fs = fakeFs(() => rootMkdirEperm())
+    const current = await fs.stat(target)
+    const read = vi.spyOn(fs, 'readText')
+    installRootWriteFallback(fakeContext(fs))
+    await expect(writeVia(fs, target, 'overwrite', { kind: 'replaceIfVersion', version: current!.version }, { mode: 'danger-full-access' }))
+      .rejects.toThrow('conditional publication')
+    expect(read).not.toHaveBeenCalled()
+    expect(await readFile(target.hostPath, 'utf8')).toBe('external')
+    expect((await readdir(directory)).filter(name => name.includes('rbk-tmp'))).toEqual([])
+  })
+
+  it('forwards guards unchanged when the original provider succeeds', async () => {
+    const fs = fakeFs(() => undefined)
+    const write = vi.spyOn(fs, 'writeText')
+    const target = targetFor('provider.txt')
+    const expected = { kind: 'createIfAbsent' }
+    const policy = { mode: 'danger-full-access' }
+    installRootWriteFallback(fakeContext(fs))
+    await expect(writeVia(fs, target, 'new', expected, policy)).resolves.toMatchObject({ after: 'new' })
+    expect(write).toHaveBeenCalledWith(target, 'new', expected, undefined, policy)
+  })
 })
 
 /** Call the wrapped edit the way the edit tool does: the policy stamped last. */
@@ -243,6 +277,18 @@ function editVia(
 
 describe('the edit fallback', () => {
   const policy = { mode: 'danger-full-access' }
+
+  it('refuses a current edit version guard before publishing any bytes', async () => {
+    const target = targetFor('current-edit.txt')
+    await writeFile(target.hostPath, 'external', 'utf8')
+    const fs = fakeFs(() => rootMkdirEperm())
+    const current = await fs.stat(target)
+    installRootWriteFallback(fakeContext(fs))
+    await expect(editVia(fs, target, { oldString: 'external', newString: 'overwrite' }, { version: current!.version }, policy))
+      .rejects.toThrow('conditional publication')
+    expect(await readFile(target.hostPath, 'utf8')).toBe('external')
+    expect((await readdir(directory)).filter(name => name.includes('rbk-tmp'))).toEqual([])
+  })
 
   it('edits a file at the drive root and keeps its line-ending style on disk', async () => {
     const target = targetFor('crlf.txt')

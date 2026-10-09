@@ -273,7 +273,7 @@ describe('planRollback', () => {
     // Same bytes written, different story: 恢复 puts old content into a file that is
     // still there, 找回 brings a file back. Only the recorded kind can tell them
     // apart, so the plan has to carry it through.
-    const gone = cp(3, 5, { '/gone': { path: '/gone', operation: 'remove', before: 'was here', after: '' } })
+    const gone = cp(3, 5, { '/gone': { path: '/gone', operation: 'remove', before: 'was here', after: null } })
     const edited = cp(3, 5, { '/edited': { path: '/edited', operation: 'update', before: 'old', after: 'new' } })
     const plan = planRollback([gone, edited], 3, 6)
     expect(plan.restored).toEqual([
@@ -283,7 +283,7 @@ describe('planRollback', () => {
   })
 
   it('skips a removal whose content was never known', () => {
-    const gone = cp(3, 5, { '/gone': { path: '/gone', operation: 'remove', before: null, after: '' } })
+    const gone = cp(3, 5, { '/gone': { path: '/gone', operation: 'remove', before: null, after: null } })
     const plan = planRollback([gone], 3, 6)
     expect(plan.restored).toEqual([])
     expect(plan.skipped).toEqual([{ path: '/gone', reason: 'basis-unknown' }])

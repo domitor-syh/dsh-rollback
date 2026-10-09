@@ -162,6 +162,36 @@ describe('replaying a log that has rollback markers', () => {
 })
 
 describe('deadTurnsOf', () => {
+  it('kills a turn whose first surface is replaced but turn/start lies before the range', () => {
+    const events: ReplayEvent[] = [
+      { type: 'turn/start', seq: 10, data: { turn: 1 } },
+      { type: 'system/message', seq: 11, surfaceOp: 'append' },
+      { type: 'assistant/message', seq: 12, surfaceOp: 'append' },
+      { type: 'turn/end', seq: 13, data: { turn: 1 } },
+      marker(20, 12, 12),
+    ]
+    expect([...deadTurnsOf(events)]).toEqual([1])
+    expect([...deadTurnsOf([...events.slice(0, -1), marker(20, 11, 11)])]).toEqual([])
+  })
+
+  it('keeps system-only turns and future turns with multiple legacy and modern markers', () => {
+    const events: ReplayEvent[] = [
+      { type: 'turn/start', seq: 1, data: { turn: 1 } },
+      { type: 'system/message', seq: 2, surfaceOp: 'append' },
+      { type: 'turn/end', seq: 3, data: { turn: 1 } },
+      { type: 'turn/start', seq: 10, data: { turn: 2 } },
+      { type: 'user/message', seq: 12, surfaceOp: 'append' },
+      { type: 'turn/end', seq: 13, data: { turn: 2 } },
+      { type: 'turn/start', seq: 30, data: { turn: 3 } },
+      { type: 'tool/result', seq: 32, surfaceOp: 'append' },
+      { type: 'turn/end', seq: 33, data: { turn: 3 } },
+      legacyMarker(40, 1, 12), marker(50, 12, 32), marker(60, 12, 12),
+      { type: 'turn/start', seq: 70, data: { turn: 4 } },
+      { type: 'assistant/message', seq: 72, surfaceOp: 'append' },
+    ]
+    expect([...deadTurnsOf([...events].reverse())]).toEqual([2, 3])
+  })
+
   it('names the turns a rollback removed, and only those', () => {
     const events: ReplayEvent[] = [
       { type: 'turn/start', seq: 10, data: { turn: 1 } },
