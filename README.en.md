@@ -28,6 +28,8 @@ dsh plugin --profile web add @domitor-syh/dsh-rollback
 
 Restart `dsh web` and refresh the page after installation. When running DSH from source, prefix the command with `pnpm`.
 
+On the desktop build the same package installs through its own official channel: enter **`@domitor-syh/dsh-rollback`** where the desktop app installs plugins (equivalently, `dsh plugin --profile desktop add @domitor-syh/dsh-rollback`), then restart the desktop app.
+
 The current target is **DSH 0.2.0-rc.2**. The declared compatibility range is `>=0.1.5-rc.2 <0.2.0-0 || >=0.2.0-rc.2 <0.3.0-0`; check compatibility for other builds.
 
 ## Usage
