@@ -113,8 +113,12 @@ describe('pinned real host v4 idle rollback contracts', () => {
     expect(pressure.wire.view(pricedState).projectedTokens).toBe(1000 + markerTokens - shadowed)
     const breakdown = definitions.get('contextBreakdown')
     const before = seed().reduce((state, e) => breakdown.apply(state, e), breakdown.init())
+    // 0.2.1's bounded composition projection now uses the same adjacent
+    // shadow-price protocol as pressure; an unpriced marker leaves stale tokens.
     expect(breakdown.wire.view(breakdown.apply(before, userMarker())))
-      .toEqual(breakdown.wire.view(breakdown.apply(breakdown.apply(before, prune(shadowed)), userMarker(6))))
+      .toEqual({ systemTokens: 0, toolsTokens: 0, messageTokens: shadowed })
+    expect(breakdown.wire.view(breakdown.apply(breakdown.apply(before, prune(shadowed)), userMarker(6))))
+      .toEqual({ systemTokens: 0, toolsTokens: 0, messageTokens: markerTokens })
   })
 
   it('uses exact first/last surface identities even when endpoints are numerically inverted', () => {

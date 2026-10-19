@@ -15,9 +15,10 @@
  * absence is gone:
  *
  *   - the DSH packages this plugin touches are installed as devDependencies,
- *     pinned to `0.2.0-rc.2` — the build this plugin is adapted to. Note these
- *     publish under two dist-tags and `latest` is a stale, broken `0.0.1-rc.1`
- *     line; the real line is `next`. An unpinned install gets the broken one.
+ *     pinned to `0.2.1-rc.2` — the current adaptation target — with Cordis at
+ *     `4.0.5`. Exact versions make the API checked here reproducible; the retired
+ *     invariant service is not a dependency. The working-directory service is
+ *     loaded for typing optional access, preserving the older-host fallback.
  *   - `src/dsh-types.ts` loads those packages' `Context` augmentations. Installing
  *     them is not enough on its own: an augmentation only applies when its module is
  *     loaded by the program, which is why the service names resolved to nothing.

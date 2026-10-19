@@ -33,7 +33,7 @@ import type {} from '@deepseek-ai/dsh-tools'
 // Optional context-pressure pricing; type-only, no runtime dependency or injection.
 import type {} from '@deepseek-ai/dsh-compaction'
 import type {} from '@deepseek-ai/dsh-token-meter'
-// ctx.invariants.register — the seat self-check.
-import type {} from '@deepseek-ai/dsh-invariants'
+// Optional effective session directory; older hosts use the existing header fallback.
+import type {} from '@deepseek-ai/dsh-working-directory'
 // Session and its branded ids/seqs, plus the event payload shapes.
 import type {} from '@deepseek-ai/dsh-session/types'

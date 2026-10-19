@@ -64,8 +64,7 @@ function planText(plan: RollbackPlan, header: string): string {
 
 /** List the turns the sliding window can still roll back to. */
 function listText(service: RollbackService, session: { id: string }): string {
-  const fold = service.foldFor(session as never)
-  const turns = fold.snapshots().map(cp => cp.turn)
+  const turns = service.availableTurns(session as never)
   if (turns.length === 0) return `当前会话没有可回退的轮次。${WINDOW_HINT}`
   return `可回退到的轮次：${turns.join(', ')} ${WINDOW_HINT}`
 }

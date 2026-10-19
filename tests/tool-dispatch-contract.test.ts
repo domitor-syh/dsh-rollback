@@ -4,12 +4,14 @@ import { Session } from '@deepseek-ai/dsh-session'
 import { SystemPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { ToolRuntime, type ToolExecutionInput, type ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { BoundaryRescan } from '../src/boundary-rescan.ts'
 import { RollbackService } from '../src/service.ts'
 import { appendCheckpoint, loadCheckpoints } from '../src/store.ts'
+import { appendRecoveryGap, loadRecoveryGaps } from '../src/recovery-gap-store.ts'
+import { loadTransaction } from '../src/transaction-store.ts'
 
 const contexts: Context[] = []
 const temporaryRoots: string[] = []
@@ -121,7 +123,7 @@ describe('pinned real Cordis tools dispatch contract', () => {
   })
 })
 
-function rollbackFixture() {
+function rollbackFixture(withWorkingDirectory = false) {
   const ctx = runtime()
   const root = mkdtempSync(join(tmpdir(), 'rollback-tool-contract-'))
   temporaryRoots.push(root)
@@ -136,6 +138,7 @@ function rollbackFixture() {
   const setFile = (path: string, content: string) => {
     const version = `contract-v${++revision}`
     files.set(path, { content, version })
+    mkdirSync(dirname(path), { recursive: true })
     writeFileSync(path, content)
     return version
   }
@@ -151,21 +154,30 @@ function rollbackFixture() {
   // These services do not dispatch tools; Context and ToolRuntime remain real.
   ctx.provide('sessions', { get: (id: string) => id === session.id ? session : undefined, list: () => [session], flush: async () => true })
   ctx.provide('sandboxPolicy', { resolve: () => ({ mode: 'danger-full-access', workspaceRoot: root }) })
+  let cwd = root
+  const aliases = new Map<string, string>()
+  const canonicalPath = (path: string) => aliases.get(path) ?? path
+  const workingDirectory = { ensure: vi.fn(async (_agent?: ToolExecutionInput['agent'], _signal?: AbortSignal) => cwd) }
+  if (withWorkingDirectory) ctx.provide('workingDirectory', workingDirectory)
   const fs = {
-    resolve: async (path: string) => ({ displayPath: path }),
-    processPath: (target: { displayPath: string }) => target.displayPath,
+    resolve: async (path: string, options?: { cwd?: string }) => {
+      const displayPath = resolve(options?.cwd ?? root, path)
+      return { displayPath, targetKey: canonicalPath(displayPath) }
+    },
+    processPath: (target: { displayPath: string; targetKey?: string }) => target.targetKey ?? target.displayPath,
     processPathFromHostPath: (path: string) => path,
-    stat: async (target: { displayPath: string }) => {
-      const current = files.get(target.displayPath)
+    stat: async (target: { displayPath: string; targetKey?: string }) => {
+      const current = files.get(target.targetKey ?? target.displayPath)
       return current === undefined ? undefined : { type: 'file', size: current.content.length, version: current.version }
     },
-    readText: async (target: { displayPath: string }) => files.get(target.displayPath)!.content,
-    lstat: async (path: string) => files.has(path) ? { type: 'file' } : undefined,
-    writeText: async (target: { displayPath: string }, content: string, expected?: { kind: string; version?: string }) => {
-      const current = files.get(target.displayPath)
+    readText: async (target: { displayPath: string; targetKey?: string }) => files.get(target.targetKey ?? target.displayPath)!.content,
+    lstat: async (path: string) => files.has(canonicalPath(path)) ? { type: 'file' } : undefined,
+    writeText: async (target: { displayPath: string; targetKey?: string }, content: string, expected?: { kind: string; version?: string }) => {
+      const path = target.targetKey ?? target.displayPath
+      const current = files.get(path)
       if (expected?.kind === 'createIfAbsent' && current !== undefined) throw new Error('File already exists')
       if (expected?.kind === 'replaceIfVersion' && current?.version !== expected.version) throw new Error('Version conflict')
-      return { version: setFile(target.displayPath, content) }
+      return { version: setFile(path, content) }
     },
   }
   ctx.provide('fs', fs)
@@ -183,8 +195,375 @@ function rollbackFixture() {
     ctx.emit('session/event', session, event)
   }
   const agent = { id: session.id } as NonNullable<ToolExecutionInput['agent']>
-  return { ctx, session, paths, setFile, rollback, publish, agent, restart }
+  return { ctx, session, paths, setFile, rollback, publish, agent, restart, root, workingDirectory, canonicalPath,
+    alias: (display: string, target: string) => { aliases.set(display, target) },
+    cd: (path: string) => { cwd = resolve(root, path) } }
 }
+
+function startFileTurn(h: ReturnType<typeof rollbackFixture>, turn = 2) {
+  h.publish('turn/start', { turn })
+  const message = h.session.append('user/message', {
+    id: `cwd-turn-user-${turn}`, role: 'user', source: { kind: 'ui' }, content: [{ type: 'text', text: 'change file' }],
+  } as never, { surfaceOp: 'append' })
+  h.ctx.emit('session/event', h.session, message)
+}
+
+function registerDirectoryTool(h: ReturnType<typeof rollbackFixture>, name: 'write' | 'edit', reportedPath?: string, after = 'model-change') {
+  return h.ctx.tools.register({
+    name, description: 'Current-directory file mutation regression',
+    parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] },
+    output: {
+      schema: { type: 'object', properties: { path: { type: 'string' }, before: { type: 'string' }, after: { type: 'string' }, version: { type: 'string' } }, required: ['path', 'before', 'after', 'version'] },
+      render: () => [{ type: 'text', text: 'Written' }],
+    },
+    execute: async (args: { file_path: string }, exec) => {
+      const target = h.canonicalPath(resolve(await h.workingDirectory.ensure(exec.agent, exec.signal), args.file_path))
+      const before = existsSync(target) ? readFileSync(target, 'utf8') : ''
+      const version = h.setFile(target, after)
+      return { path: reportedPath ?? target, before, after, version }
+    },
+  })
+}
+
+describe('session working-directory compatibility', () => {
+  it('keeps a gap despite same-turn successful, unchanged and net-zero receipts', async () => {
+    const h = rollbackFixture(true)
+    const target = h.paths[0]!
+    startFileTurn(h)
+    const mismatched = registerDirectoryTool(h, 'write', h.paths[1]!)
+    await h.ctx.tools.execute(input('write', { file_path: target }, h.agent))
+    mismatched()
+    const restore = registerDirectoryTool(h, 'write', undefined, 'previous-after')
+    await h.ctx.tools.execute({ ...input('write', { file_path: target }, h.agent), callId: 'same-turn-restore' as ToolExecutionInput['callId'] })
+    restore()
+    registerDirectoryTool(h, 'write', undefined, 'previous-after')
+    await h.ctx.tools.execute({ ...input('write', { file_path: target }, h.agent), callId: 'same-turn-noop' as ToolExecutionInput['callId'] })
+    // Even an independent legacy roundtrip cannot establish this failed call's basis.
+    appendCheckpoint({ sessionId: String(h.session.id), turn: 2, path: h.paths[1]!, operation: 'update', before: 'previous-after', after: 'middle' })
+    appendCheckpoint({ sessionId: String(h.session.id), turn: 2, path: h.paths[1]!, operation: 'update', before: 'middle', after: 'previous-after' })
+    h.publish('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    expect(loadCheckpoints(String(h.session.id)).get(2)?.has(target)).toBe(true)
+    await expect(h.rollback.preview(h.session, 2)).rejects.toThrow('恢复缺口')
+    const restarted = await h.restart()
+    await expect(restarted.execute(h.session, 2)).rejects.toThrow('恢复缺口')
+    expect(loadRecoveryGaps(String(h.session.id))).toHaveLength(1)
+    expect(readFileSync(target, 'utf8')).toBe('previous-after')
+  })
+
+  it('anchors a final-result mismatch to its dispatch turn after a post-hook starts another turn', async () => {
+    const h = rollbackFixture(true)
+    const target = h.paths[0]!
+    startFileTurn(h)
+    registerDirectoryTool(h, 'write')
+    h.ctx.on('tools/post-execute', async (_exec, result) => {
+      h.publish('turn/end', { turn: 2, reason: { kind: 'completed' } })
+      startFileTurn(h, 3)
+      return { kind: 'accept', value: { ...(result.value as Record<string, string>), path: h.paths[1]! } }
+    })
+    expect((await h.ctx.tools.execute(input('write', { file_path: target }, h.agent))).isError).toBe(false)
+    h.publish('turn/end', { turn: 3, reason: { kind: 'completed' } })
+    expect(loadRecoveryGaps(String(h.session.id))).toEqual([expect.objectContaining({ turn: 2, stage: 'result' })])
+    expect((await h.rollback.preview(h.session, 3)).restored).toEqual([])
+    await expect(h.rollback.execute(h.session, 2)).rejects.toThrow('恢复缺口')
+    const restarted = await h.restart()
+    expect((await restarted.preview(h.session, 3)).restored).toEqual([])
+    await expect(restarted.preview(h.session, 2)).rejects.toThrow('恢复缺口')
+  })
+
+  it('rechecks a gap added after a successful preview even without a session version change', async () => {
+    const h = rollbackFixture()
+    const plan = await h.rollback.preview(h.session, 1)
+    appendRecoveryGap({ format: 1, sessionId: String(h.session.id), turn: 1, callId: 'late-gap', tool: 'write',
+      expectedPath: h.paths[0]!, reportedPath: h.paths[1]!, stage: 'result' })
+    const append = vi.spyOn(h.session, 'append')
+    await expect(h.rollback.execute(h.session, 1, undefined, plan.version)).rejects.toThrow('恢复缺口')
+    expect(append).not.toHaveBeenCalled()
+    expect(loadTransaction(String(h.session.id))).toBeNull()
+    expect(readFileSync(h.paths[0]!, 'utf8')).toBe('previous-after')
+  })
+
+  it('keeps a persisted gap when its turn ages out of checkpoint storage', async () => {
+    const h = rollbackFixture()
+    appendRecoveryGap({ format: 1, sessionId: String(h.session.id), turn: 1, callId: 'old-gap', tool: 'write',
+      expectedPath: h.paths[0]!, reportedPath: h.paths[1]!, stage: 'dispatch' })
+    appendCheckpoint({ sessionId: String(h.session.id), turn: 40, path: h.paths[0]!, operation: 'update', before: 'previous-after', after: 'future' })
+    expect(loadCheckpoints(String(h.session.id)).has(1)).toBe(false)
+    expect(loadRecoveryGaps(String(h.session.id))).toHaveLength(1)
+    await expect(h.rollback.preview(h.session, 1)).rejects.toThrow('恢复缺口')
+  })
+
+  it('stops marker commit when a gap arrives during file restore and lets abort compensate', async () => {
+    const h = rollbackFixture(true)
+    const target = h.paths[0]!
+    startFileTurn(h)
+    registerDirectoryTool(h, 'write')
+    await h.ctx.tools.execute(input('write', { file_path: target }, h.agent))
+    h.publish('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    const surface = [...h.session.surface.nodes]
+    const write = h.ctx.fs.writeText.bind(h.ctx.fs)
+    const writeSpy = vi.spyOn(h.ctx.fs, 'writeText').mockImplementation(async (...args) => {
+      const outcome = await write(...args)
+      appendRecoveryGap({ format: 1, sessionId: String(h.session.id), turn: 2, callId: 'late-result-during-restore', tool: 'write',
+        expectedPath: target, reportedPath: h.paths[1]!, stage: 'result' })
+      return outcome
+    })
+    await expect(h.rollback.execute(h.session, 2)).rejects.toThrow('/rollback abort')
+    expect(h.session.surface.nodes).toEqual(surface)
+    expect(readFileSync(target, 'utf8')).toBe('previous-after')
+    expect(loadTransaction(String(h.session.id))?.phase).toBe('restoring')
+    writeSpy.mockRestore()
+    await expect(h.rollback.recover(h.session, false)).rejects.toThrow('恢复缺口')
+    await h.rollback.recover(h.session, true)
+    expect(loadTransaction(String(h.session.id))).toBeNull()
+    expect(readFileSync(target, 'utf8')).toBe('model-change')
+    expect(h.session.surface.nodes).toEqual(surface)
+    await expect(h.rollback.preview(h.session, 2)).rejects.toThrow('恢复缺口')
+  })
+
+  it('keeps partial-error recovery when the host rejects a post-hook attempt to replace its value', async () => {
+    const h = rollbackFixture(true)
+    const target = h.paths[0]!
+    startFileTurn(h)
+    h.ctx.tools.register({
+      name: 'write', description: 'Partial write before error',
+      parameters: { type: 'object', properties: {} },
+      output: { schema: { type: 'null' }, render: () => [] },
+      execute: async () => { h.setFile(target, 'partial'); throw new Error('partial-error') },
+    })
+    h.ctx.on('tools/post-execute', async () => ({
+      kind: 'accept', value: { path: h.paths[1]!, before: 'wrong-basis', after: 'partial' },
+    }))
+    const result = await h.ctx.tools.execute(input('write', { file_path: target }, h.agent))
+    expect(result).toMatchObject({ isError: true, error: { message: expect.stringContaining('cannot replace the value of a failed result') } })
+    h.publish('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    expect(loadCheckpoints(String(h.session.id)).get(2)?.get(target)).toMatchObject({ before: 'previous-after', after: 'partial' })
+    expect(loadRecoveryGaps(String(h.session.id))).toEqual([])
+    await h.rollback.execute(h.session, 2)
+    expect(readFileSync(target, 'utf8')).toBe('previous-after')
+  })
+
+  it('retains strict session failure when the operation gap cannot be persisted', async () => {
+    const h = rollbackFixture(true)
+    const gapFile = join(h.root, 'storages', 'dsh-rollback', 'recovery-gaps-v1',
+      `s-${Buffer.from(String(h.session.id), 'utf16le').toString('hex')}.json`)
+    mkdirSync(gapFile, { recursive: true })
+    startFileTurn(h)
+    registerDirectoryTool(h, 'write', h.paths[1]!)
+    expect((await h.ctx.tools.execute(input('write', { file_path: h.paths[0]! }, h.agent))).isError).toBe(false)
+    h.publish('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    startFileTurn(h, 3)
+    h.publish('turn/end', { turn: 3, reason: { kind: 'completed' } })
+    await expect(h.rollback.preview(h.session, 3)).rejects.toThrow('持久化')
+    expect(await h.rollback.diagnose(h.session)).toMatchObject({ checkpointState: 'failed', recoveryGaps: null })
+    expect(loadTransaction(String(h.session.id))).toBeNull()
+  })
+
+  it('refuses unreadable gap evidence both live and after restart', async () => {
+    const h = rollbackFixture()
+    appendRecoveryGap({ format: 1, sessionId: String(h.session.id), turn: 1, callId: 'corrupt-gap', tool: 'write',
+      expectedPath: h.paths[0]!, reportedPath: h.paths[1]!, stage: 'dispatch' })
+    const gapFile = join(h.root, 'storages', 'dsh-rollback', 'recovery-gaps-v1',
+      `s-${Buffer.from(String(h.session.id), 'utf16le').toString('hex')}.json`)
+    writeFileSync(gapFile, '{broken')
+    await expect(h.rollback.preview(h.session, 1)).rejects.toThrow('recovery gap')
+    const restarted = await h.restart()
+    await expect(restarted.execute(h.session, 1)).rejects.toThrow('持久化')
+    expect(readFileSync(h.paths[0]!, 'utf8')).toBe('previous-after')
+    expect(loadTransaction(String(h.session.id))).toBeNull()
+  })
+
+  it('does not capture file ownership for working-directory changes', async () => {
+    const h = rollbackFixture(true)
+    startFileTurn(h)
+    const capture = vi.spyOn(BoundaryRescan.prototype, 'captureDispatch')
+    const finish = vi.spyOn(BoundaryRescan.prototype, 'finishDispatch')
+    h.ctx.tools.register({
+      name: 'working_directory', description: 'Directory-only operation',
+      parameters: { type: 'object', properties: {} },
+      output: { schema: { type: 'null' }, render: () => [] },
+      execute: async () => { h.cd('sub'); h.setFile(h.paths[0]!, 'external-edit'); return null },
+    })
+    expect((await h.ctx.tools.execute(input('working_directory', {}, h.agent))).isError).toBe(false)
+    h.publish('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    expect(capture).not.toHaveBeenCalled()
+    expect(finish).not.toHaveBeenCalled()
+    expect(loadCheckpoints(String(h.session.id)).has(2)).toBe(false)
+    expect((await h.rollback.preview(h.session, 2)).restored).toEqual([])
+    expect(readFileSync(h.paths[0]!, 'utf8')).toBe('external-edit')
+  })
+
+  it.each(['write', 'edit'] as const)('restores relative %s in the effective directory without touching its original-root twin', async name => {
+    const h = rollbackFixture(true)
+    const original = join(h.root, 'same.txt')
+    const target = join(h.root, 'sub', 'same.txt')
+    h.setFile(original, 'root-twin')
+    h.setFile(target, 'sub-before')
+    h.cd('sub')
+    startFileTurn(h)
+    registerDirectoryTool(h, name)
+    expect((await h.ctx.tools.execute(input(name, { file_path: 'same.txt' }, h.agent))).isError).toBe(false)
+    expect(h.workingDirectory.ensure).toHaveBeenCalledWith(h.agent, expect.any(AbortSignal))
+    h.publish('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    expect(loadCheckpoints(String(h.session.id)).get(2)?.get(target)).toMatchObject({ before: 'sub-before', after: 'model-change' })
+    expect(loadCheckpoints(String(h.session.id)).get(2)?.has(original)).not.toBe(true)
+    // Restoring absolute recorded paths must not depend on the later cwd or
+    // require the new service when loading checkpoints in a legacy fixture.
+    h.cd('elsewhere')
+    const resumed = await h.restart()
+    expect((await resumed.preview(h.session, 2)).restored).toEqual([
+      expect.objectContaining({ path: target, content: 'sub-before', action: 'restore' }),
+    ])
+    await resumed.execute(h.session, 2)
+    expect(readFileSync(target, 'utf8')).toBe('sub-before')
+    expect(readFileSync(original, 'utf8')).toBe('root-twin')
+  })
+
+  it('deletes only the file created in the effective directory', async () => {
+    const h = rollbackFixture(true)
+    const original = join(h.root, 'new.txt')
+    const target = join(h.root, 'sub', 'new.txt')
+    h.setFile(original, 'root-twin')
+    h.cd('sub')
+    startFileTurn(h)
+    registerDirectoryTool(h, 'write')
+    expect((await h.ctx.tools.execute(input('write', { file_path: 'new.txt' }, h.agent))).isError).toBe(false)
+    h.publish('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    expect((await h.rollback.preview(h.session, 2)).restored).toEqual([
+      expect.objectContaining({ path: target, action: 'delete' }),
+    ])
+    await h.rollback.execute(h.session, 2)
+    expect(existsSync(target)).toBe(false)
+    expect(readFileSync(original, 'utf8')).toBe('root-twin')
+  })
+
+  it('resolves relative targets at the original root when the host has no directory service', async () => {
+    const h = rollbackFixture()
+    const target = h.paths[0]!
+    startFileTurn(h)
+    registerDirectoryTool(h, 'write')
+    expect((await h.ctx.tools.execute(input('write', { file_path: basename(target) }, h.agent))).isError).toBe(false)
+    h.publish('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    expect((await h.rollback.preview(h.session, 2)).restored).toEqual([
+      expect.objectContaining({ path: target, content: 'previous-after' }),
+    ])
+    await h.rollback.execute(h.session, 2)
+    expect(readFileSync(target, 'utf8')).toBe('previous-after')
+  })
+
+  it('keeps absolute tool paths fixed after changing the effective directory', async () => {
+    const h = rollbackFixture(true)
+    const target = h.paths[0]!
+    h.cd('sub')
+    startFileTurn(h)
+    registerDirectoryTool(h, 'edit')
+    expect((await h.ctx.tools.execute(input('edit', { file_path: target }, h.agent))).isError).toBe(false)
+    h.publish('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    await h.rollback.execute(h.session, 2)
+    expect(readFileSync(target, 'utf8')).toBe('previous-after')
+  })
+
+  it.each(['write', 'edit'] as const)('uses canonical process paths for %s through a provider alias', async name => {
+    const h = rollbackFixture(true)
+    const target = h.paths[0]!
+    const alias = join(h.root, 'alias', 'same.txt')
+    h.alias(alias, target)
+    h.cd('alias')
+    startFileTurn(h)
+    registerDirectoryTool(h, name)
+    expect((await h.ctx.tools.execute(input(name, { file_path: 'same.txt' }, h.agent))).isError).toBe(false)
+    h.publish('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    expect(loadCheckpoints(String(h.session.id)).get(2)?.has(alias)).not.toBe(true)
+    expect((await h.rollback.preview(h.session, 2)).restored).toEqual([
+      expect.objectContaining({ path: target, content: 'previous-after' }),
+    ])
+    await h.rollback.execute(h.session, 2)
+    expect(readFileSync(target, 'utf8')).toBe('previous-after')
+  })
+
+  it('refreshes the capture if cwd changes between pre-execute and dispatch', async () => {
+    const h = rollbackFixture(true)
+    const oldTarget = join(h.root, 'first', 'same.txt')
+    const target = join(h.root, 'second', 'same.txt')
+    h.setFile(oldTarget, 'first-before')
+    h.setFile(target, 'second-before')
+    h.cd('first')
+    startFileTurn(h)
+    h.ctx.on('tools/pre-execute', async (_exec, next) => {
+      const decision = await next()
+      h.cd('second')
+      return decision
+    }, { prepend: true })
+    registerDirectoryTool(h, 'write')
+    expect((await h.ctx.tools.execute(input('write', { file_path: 'same.txt' }, h.agent))).isError).toBe(false)
+    h.publish('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    await h.rollback.execute(h.session, 2)
+    expect(readFileSync(target, 'utf8')).toBe('second-before')
+    expect(readFileSync(oldTarget, 'utf8')).toBe('first-before')
+  })
+
+  it.each(['body', 'post-error', 'post-result', 'post-block', 'post-corrected'] as const)('isolates a %s mismatch and permits later-turn rollback before and after restart', async phase => {
+    const h = rollbackFixture(true)
+    const target = h.paths[0]!
+    const unrelated = h.paths[1]!
+    startFileTurn(h)
+    const unregister = registerDirectoryTool(h, 'write', phase === 'post-result' ? undefined : unrelated)
+    const call = input('write', { file_path: target }, h.agent)
+    h.session.append('tool/call', { turn: 2, callId: call.callId, name: 'write', arguments: JSON.stringify(call.arguments) } as never)
+    const post = phase === 'body' ? undefined : h.ctx.on('tools/post-execute', async (_exec, result) => {
+      if (phase === 'post-error') throw new Error('late-hook-failure')
+      if (phase === 'post-block') return { kind: 'block', feedback: [{ type: 'text', text: 'late-hook-block' }] }
+      return { kind: 'accept', value: { ...(result.value as Record<string, string>), path: phase === 'post-corrected' ? target : unrelated } }
+    })
+    const result = await h.ctx.tools.execute(call)
+    expect(result.isError).toBe(phase === 'post-error' || phase === 'post-block')
+    if (phase === 'post-error') expect(result).toMatchObject({ error: { message: 'late-hook-failure' } })
+    h.session.append('tool/result', { turn: 2, message: { source: { callId: call.callId }, isError: result.isError },
+      ...(result.isError ? { error: result.error } : {}),
+    } as never, { surfaceOp: 'append' })
+    post?.()
+    unregister()
+    h.publish('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    expect(loadCheckpoints(String(h.session.id)).has(2)).toBe(false)
+    expect(loadRecoveryGaps(String(h.session.id))).toEqual([
+      { format: 1, sessionId: String(h.session.id), turn: 2, callId: call.callId, tool: 'write',
+        expectedPath: target, reportedPath: unrelated, stage: phase === 'post-result' ? 'result' : 'dispatch' },
+    ])
+    expect(await h.rollback.diagnose(h.session)).toMatchObject({ checkpointState: 'partial', recoveryGaps: [expect.objectContaining({ turn: 2 })] })
+    const originalSurface = [...h.session.surface.nodes]
+    const append = vi.spyOn(h.session, 'append')
+    await expect(h.rollback.preview(h.session, 2)).rejects.toThrow('第 2 轮 write')
+    await expect(h.rollback.execute(h.session, 1)).rejects.toThrow('恢复缺口')
+    expect(h.session.surface.nodes).toEqual(originalSurface)
+    expect(append).not.toHaveBeenCalled()
+    expect(loadTransaction(String(h.session.id))).toBeNull()
+    expect(readFileSync(target, 'utf8')).toBe('model-change')
+    expect(readFileSync(unrelated, 'utf8')).toBe('previous-after')
+    append.mockRestore()
+
+    // A later normal mutation, including the same file, has its own trusted basis.
+    startFileTurn(h, 3)
+    registerDirectoryTool(h, 'write', undefined, 'later-change')
+    const later = { ...input('write', { file_path: target }, h.agent), callId: 'later-write' as ToolExecutionInput['callId'] }
+    h.session.append('tool/call', { turn: 3, callId: later.callId, name: 'write', arguments: JSON.stringify(later.arguments) } as never)
+    expect((await h.ctx.tools.execute(later)).isError).toBe(false)
+    h.session.append('tool/result', { turn: 3, message: { source: { callId: later.callId } } } as never, { surfaceOp: 'append' })
+    h.publish('turn/end', { turn: 3, reason: { kind: 'completed' } })
+    const expected = [expect.objectContaining({ path: target, content: 'model-change', action: 'restore' })]
+    expect((await h.rollback.preview(h.session, 3)).restored).toEqual(expected)
+    expect(h.rollback.availableTurns(h.session)).toEqual([3])
+    await expect(h.rollback.preview(h.session, 2)).rejects.toThrow('第 3 轮')
+    const restarted = await h.restart()
+    expect(restarted.availableTurns(h.session)).toEqual([3])
+    expect((await restarted.preview(h.session, 3)).restored).toEqual(expected)
+    await expect(restarted.execute(h.session, 2)).rejects.toThrow('恢复缺口')
+    expect(readFileSync(target, 'utf8')).toBe('later-change')
+    await restarted.execute(h.session, 3)
+    expect(readFileSync(target, 'utf8')).toBe('model-change')
+    expect(readFileSync(unrelated, 'utf8')).toBe('previous-after')
+    expect(loadRecoveryGaps(String(h.session.id))).toHaveLength(1)
+    await expect(restarted.preview(h.session, 2)).rejects.toThrow('恢复缺口')
+  })
+})
 
 describe('production rollback on the real tools dispatch pipeline', () => {
   it('leaves canonical direct success to tools/result without a pre-result broad scan or unrelated ownership', async () => {
@@ -394,7 +773,7 @@ describe('production rollback on the real tools dispatch pipeline', () => {
     expect(append).not.toHaveBeenCalled()
   })
 
-  it('records a partially mutating direct throw before tools/result without a broad scan', async () => {
+  it('records a partially mutating direct throw at final result without a broad scan', async () => {
     const h = rollbackFixture()
     const target = h.paths[0]!
     h.setFile(target, 'user-edited-basis')

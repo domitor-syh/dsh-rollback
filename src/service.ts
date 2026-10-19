@@ -11,6 +11,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
+import type { ToolExecutionInput } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-session/types'
 import type { FsMutation } from './core/model.ts'
 import { priceRollbackPrune } from './core/prune-pricing.ts'
@@ -33,6 +34,7 @@ import {
 } from './core/truncation-plan.ts'
 import { appendCheckpoint, loadCallCoverage, loadCheckpoints, loadWatched, saveRollbackBaseline } from './store.ts'
 import { discardRescue, loadRescues, saveRescue, validateRescuePoint } from './rescue-store.ts'
+import { appendRecoveryGap, loadRecoveryGaps, type RecoveryGap } from './recovery-gap-store.ts'
 
 /** Retained checkpoint window: "仅支持回退至最近 10 轮会话内" (sliding window). */
 export const ROLLBACK_WINDOW = 10
@@ -55,7 +57,7 @@ function sessionOf(ctx: Context, exec: { agent?: { id?: unknown } }): Session | 
 }
 
 function isReadOnlyFileDispatch(name: string | undefined, input: unknown): boolean {
-  if (['read', 'read_image', 'glob', 'grep', 'web_search', 'web_fetch', 'load_workspace_dependencies',
+  if (['read', 'read_image', 'glob', 'grep', 'working_directory', 'web_search', 'web_fetch', 'load_workspace_dependencies',
     'cordis_inspect_list', 'cordis_inspect_query', 'job_list', 'job_output', 'get_goal',
     'list_agents', 'ask_user_question', 'present', 'skill', 'todo_write'].includes(name ?? '')) return true
   if (name !== 'str_replace_editor' && name !== 'plugin_manager') return false
@@ -287,7 +289,9 @@ const GLOBAL_ACTIVE = shared[lockKey] ??= new Set<string>()
 export class RollbackService {
   private readonly folds = new WeakMap<object, SessionFold>()
   /** Copy-before-Write carrier for `str_replace_editor`, keyed by call id. */
-  private readonly pendingBefore = new Map<string, { path: string; kind: 'created' | 'updated'; before: string | null }>()
+  private readonly pendingBefore = new Map<string, { path: string; kind: 'created' | 'updated'; before: string | null; session: Session; turn: number | null }>()
+  /** Original dispatch identity survives post-hooks, including a final error. */
+  private readonly directCalls = new Map<string, { session: Session; turn: number | null; gapped: boolean }>()
   /** Target-only evidence captured before post-execute can reject committed I/O. */
   private readonly directEffects = new Map<string, { session: Session; turn: number; mutation: FsMutation }>()
   /** Watchdog for registered files, compared only within mutating dispatch windows. */
@@ -348,6 +352,44 @@ export class RollbackService {
     }
   }
 
+  /** Keep a mismatch out of file receipts; only a failed durable write poisons the session. */
+  private recordTargetGap(source: { session: Session; turn: number | null }, callId: string, tool: string,
+    expectedPath: string, reportedPath: string, stage: RecoveryGap['stage']): void {
+    const sessionId = String(source.session.id)
+    try {
+      if (source.turn === null) throw new Error('目标不一致的文件调用缺少原始轮次，无法记录恢复缺口。')
+      appendRecoveryGap({ format: 1, sessionId, turn: source.turn, callId, tool, expectedPath, reportedPath, stage })
+      diagnose(this.ctx, 'warn', `[dsh-rollback] target mismatch recorded for turn ${source.turn}, call ${callId}; only rollbacks crossing this gap are blocked`)
+    } catch (error) {
+      this.durabilityFailures.set(sessionId, String(error))
+      diagnose(this.ctx, 'warn', '[dsh-rollback] recovery gap persistence failed; rollback disabled:', error)
+    }
+  }
+
+  private recoveryGaps(session: Session): readonly RecoveryGap[] {
+    return loadRecoveryGaps(String(session.id), deadTurnsOf(eventsOf(session) as never))
+  }
+
+  /** Retained targets whose rollback suffix contains no live recovery gap. */
+  availableTurns(session: Session): readonly number[] {
+    const lastGap = this.recoveryGaps(session).reduce((last, gap) => Math.max(last, gap.turn), 0)
+    return this.foldFor(session).snapshots().map(cp => cp.turn).filter(turn => turn > lastGap)
+  }
+
+  /** Every rollback restores a suffix; a known gap blocks only suffixes containing its turn. */
+  private assertGapFree(session: Session, fromTurn: number, recovering = false): void {
+    const gaps = this.recoveryGaps(session).filter(gap => gap.turn >= fromTurn)
+    if (gaps.length === 0) return
+    const lastGap = gaps.reduce((last, gap) => Math.max(last, gap.turn), 0)
+    const available = this.foldFor(session).snapshots().map(cp => cp.turn).filter(turn => turn > lastGap)
+    const details = gaps.slice(0, 5).map(gap => `第 ${gap.turn} 轮 ${gap.tool}（调用 ${gap.callId}）：${gap.expectedPath} → ${gap.reportedPath}`).join('；')
+    const alternative = available.length === 0 ? '当前保留范围内还没有位于缺口之后的可回退轮次。'
+      : `可以改选缺口之后的第 ${available.join('、')} 轮作为回退起点。`
+    const status = recovering ? '恢复事务跨过文件恢复缺口，已停止继续恢复；请 /rollback abort 补偿已执行的文件操作'
+      : '本次回退跨过文件恢复缺口，未改动文件或对话'
+    throw new Error(`${status}：${details}${gaps.length > 5 ? `；另有 ${gaps.length - 5} 项` : ''}。${alternative}`)
+  }
+
   private assertReady(session: Session, version?: number): void {
     this.lifetime.signal.throwIfAborted()
     if (this.ctx.sessions.get(session.id) !== session) throw new Error('目标会话已关闭或替换，已停止回退并保留恢复日志。')
@@ -385,6 +427,8 @@ export class RollbackService {
       checkpoints = fold.snapshots().map(cp => cp.turn)
       openTurn = fold.inProgressTurn()
     } catch { /* Unreadable state is not an empty list. */ }
+    let recoveryGaps: readonly RecoveryGap[] | null = null
+    try { recoveryGaps = this.recoveryGaps(session) } catch { /* Unreadable gap evidence is never an empty list. */ }
     let rescuePoints: number | 'unknown' = 'unknown'
     try { rescuePoints = loadRescues(id).length } catch { /* Keep unreadable durable rescue state unknown. */ }
     let policyMode = 'unknown'
@@ -401,8 +445,10 @@ export class RollbackService {
     return {
       sessionId: id, liveSession, observationState,
       disposed: this.lifetime.signal.aborted, active: this.active.has(id), journal,
-      checkpointState: this.durabilityFailures.has(id) || observationState === 'failed' ? 'failed' : checkpoints === null ? 'unknown' : 'observed',
+      checkpointState: this.durabilityFailures.has(id) || observationState === 'failed' || recoveryGaps === null ? 'failed'
+        : checkpoints === null ? 'unknown' : recoveryGaps.length > 0 ? 'partial' : 'observed',
       checkpoints, openTurn, policyMode, fsMethods: capabilities,
+      recoveryGaps,
       rescuePoints,
       conditionalDelete: 'unsupported', pressurePricing,
       capabilityEvidence: 'method-presence-only; backend guards and local mapping are not probed',
@@ -560,16 +606,30 @@ export class RollbackService {
       const directFile = isDirectFileDispatch(exec.name)
       const callId = exec.callId ?? ''
       this.directEffects.delete(callId)
+      if (directFile && observesChanges && dispatchSession !== undefined) {
+        this.directCalls.set(callId, { session: dispatchSession, turn: dispatchTurn, gapped: false })
+      }
       let failed = true
+      let targetMismatch = false
       try {
         const result = await next()
         failed = result.isError === true
+        const before = this.pendingBefore.get(callId)
+        const reported = fsMutationFrom(exec.name ?? '', result.value)
+        if (before !== undefined && reported !== null && reported.path !== before.path) {
+          // Never pair one target's preimage with another target's postimage,
+          // including when a later post-hook converts this success into an error.
+          targetMismatch = true
+          const call = this.directCalls.get(callId)
+          if (call !== undefined) call.gapped = true
+          this.recordTargetGap(call ?? before, callId, exec.name ?? '', before.path, reported.path, 'dispatch')
+        }
         return result
       } finally {
         // Observe only the declared direct target, including new/unregistered paths.
         // Keep success evidence until tools/result: post-execute may still turn a
         // committed write into a final error. Never scan unrelated direct-tool paths.
-        if (directFile && observesChanges && dispatchSession !== undefined && dispatchTurn !== null) {
+        if (directFile && !targetMismatch && observesChanges && dispatchSession !== undefined && dispatchTurn !== null) {
           try {
             const before = this.pendingBefore.get(callId)
             if (before === undefined) throw new Error('文件工具派发缺少可信目标前镜像。')
@@ -601,6 +661,16 @@ export class RollbackService {
         this.pendingBefore.delete(callId)
         const effect = this.directEffects.get(callId)
         this.directEffects.delete(callId)
+        const call = this.directCalls.get(callId)
+        this.directCalls.delete(callId)
+        // A post-hook cannot repair missing preimage evidence by changing the
+        // result back, or hide an earlier mismatch by returning an error.
+        if (call?.gapped) return
+        const reported = fsMutationFrom(exec.name ?? '', result.value)
+        if (pending !== undefined && reported !== null && reported.path !== pending.path) {
+          this.recordTargetGap(call ?? pending, callId, exec.name ?? '', pending.path, reported.path, 'result')
+          return
+        }
         if (result.isError as boolean) {
           if (effect !== undefined && effect.mutation.after !== effect.mutation.before) this.recordDirectEffect(effect.session, effect.turn, effect.mutation, callId)
           return
@@ -619,7 +689,6 @@ export class RollbackService {
         // pre-read fallback (`str_replace_editor`, whose result value is rendered
         // text) knows only the BEFORE state, so its `after` is a placeholder, not an
         // observation.
-        const reported = fsMutationFrom(exec.name ?? '', (result as { value?: unknown }).value)
         if (reported === null && effect !== undefined) {
           const { mutation, turn, session } = effect
           if (mutation.before === mutation.after) {
@@ -641,7 +710,7 @@ export class RollbackService {
             ? 'create'
             : reported?.operation ?? 'update'
         const mutation = reported !== null
-          ? { ...reported, path: pending?.path ?? reported.path, before: pending?.before ?? (pending?.kind === 'created' ? null : reported.before), operation }
+          ? { ...reported, before: pending?.before ?? (pending?.kind === 'created' ? null : reported.before), operation }
           : pending === undefined
             ? null
             : {
@@ -769,6 +838,9 @@ export class RollbackService {
     // finding on the CURRENT turn — resurrecting it on the next rollback.
     const sessionKey = typeof session.id === 'string' ? session.id : ''
     if (sessionKey !== '') this.deadTurns.set(sessionKey, deadTurnsOf(eventsOf(session) as never))
+    // Gaps are durable restrictions, not file mutations or successful call coverage.
+    // Validate them on restart without merging them into checkpoints or aging them out.
+    this.recoveryGaps(session)
     // Keep watching whatever the sidecar still knows — minus those removed turns — so
     // a restarted process notices a shell command that removes one of those files.
     if (sessionKey !== '') this.rescan.prime(sessionKey)
@@ -888,12 +960,7 @@ export class RollbackService {
    * `insert` command mutates it, so the checkpoint can restore the pre-turn
    * content even though the tool's own result value is only a rendered string.
    */
-  private async captureBefore(exec: {
-    name?: string
-    callId?: string
-    arguments?: unknown
-    agent?: { id?: unknown }
-  }): Promise<void> {
+  private async captureBefore(exec: Pick<ToolExecutionInput, 'name' | 'callId' | 'arguments' | 'agent' | 'signal'>): Promise<void> {
     const args = (typeof exec.arguments === 'string' ? JSON.parse(exec.arguments) : exec.arguments ?? {}) as { command?: unknown; path?: unknown; file_path?: unknown }
     const name = exec.name ?? ''
     if (name === 'str_replace_editor') {
@@ -903,18 +970,28 @@ export class RollbackService {
     if (typeof path !== 'string' || path === '') return
     const session = sessionOf(this.ctx, exec)
     if (session === undefined) return
-    const policy = this.ctx.sandboxPolicy.resolve({ session: session as Session })
-    const target = await this.ctx.fs.resolve(path, { cwd: policy.workspaceRoot })
+    // 0.2.1 file tools follow the Session's effective directory, while the
+    // sandbox workspaceRoot intentionally stays at its original permission boundary.
+    // Older hosts have no workingDirectory service and retain the original rule.
+    const workingDirectory = this.ctx.get?.('workingDirectory')
+    const cwd = workingDirectory !== undefined && exec.agent !== undefined
+      ? await workingDirectory.ensure(exec.agent, exec.signal)
+      : this.ctx.sandboxPolicy.resolve({ session }).workspaceRoot
+    const target = await this.ctx.fs.resolve(path, { cwd, signal: exec.signal })
+    // The file tools report processPath, which may differ from displayPath for
+    // symlinks and provider aliases. Keep the same identity in every receipt.
+    const targetPath = this.ctx.fs.processPath(target)
+    const turn = this.foldFor(session).inProgressTurn()
     const info = await this.ctx.fs.stat(target)
     if (info === undefined) {
-      this.pendingBefore.set(exec.callId ?? '', { path: target.displayPath, kind: 'created', before: null })
+      this.pendingBefore.set(exec.callId ?? '', { path: targetPath, kind: 'created', before: null, session, turn })
       return
     }
     if (info.type !== 'file') throw new Error('目标不是普通文件；未捕获恢复依据。')
     const before = await this.ctx.fs.readText(target)
     const confirmed = await this.ctx.fs.stat(target)
     if (confirmed === undefined || confirmed.version !== info.version) throw new Error('捕获期间目标已变化；未捕获恢复依据。')
-    this.pendingBefore.set(exec.callId ?? '', { path: target.displayPath, kind: 'updated', before })
+    this.pendingBefore.set(exec.callId ?? '', { path: targetPath, kind: 'updated', before, session, turn })
   }
 
   /**
@@ -934,6 +1011,7 @@ export class RollbackService {
     const sessionId = typeof session.id === 'string' ? session.id : ''
     if (sessionId !== '') { await this.observed(sessionId); await this.rescan.settled(sessionId) }
     this.assertReady(session, version)
+    this.assertGapFree(session, fromTurn)
     // The same range check `execute` makes: a preview that quietly reported the oldest
     // retained records as if they were this target's state would be worse than no
     // preview at all.
@@ -972,6 +1050,7 @@ export class RollbackService {
       }
     }
     this.assertReady(session, version)
+    this.assertGapFree(session, fromTurn)
     // The fold's in-memory surface tail can lag behind the durable session
     // surface (e.g. restored/image turns). The authoritative truncation — and
     // exactly what `execute` shadows — is the session surface itself, so report
@@ -1020,6 +1099,7 @@ export class RollbackService {
       }
       signal?.throwIfAborted()
       this.assertReady(session, version)
+      this.assertGapFree(session, fromTurn)
       const transactionId = markerMessageId()
       const transaction: RollbackTransaction = {
         format: 1, id: transactionId, sessionId: id, fromTurn, version,
@@ -1129,6 +1209,7 @@ export class RollbackService {
     const marker = transaction.marker
     const already = () => marker !== null && eventsOf(session).some(event => event.type === 'user/message' && event.data?.id === marker.data.id)
     if (abort && (already() || transaction.phase === 'committed')) throw new Error('对话标记已经写入，不能取消；请 /rollback retry 完成持久化。')
+    if (!abort && transaction.phase !== 'committed' && !already()) this.assertGapFree(session, transaction.fromTurn, true)
     if (transaction.phase !== 'committed' && !already() && !abort && !transactionFresh(session, transaction.version, transaction.phase === 'marker' && marker !== null ? marker : undefined)) throw new Error('会话已发生变化，拒绝陈旧截断；请 /rollback abort 补偿文件后重新预览。')
     if (abort) { transaction.phase = 'aborting'; saveTransaction(transaction) }
     const rescue = {
@@ -1157,6 +1238,7 @@ export class RollbackService {
       const current = await this.readState(session, file.path)
       signal?.throwIfAborted()
       if (this.ctx.sessions.get(session.id) !== session) throw new Error('目标会话已关闭或替换，恢复日志已保留。')
+      if (!abort && !already()) this.assertGapFree(session, transaction.fromTurn, true)
       // Explicit rollback/retry/abort selects the desired state even after content changes.
       if (current !== desired) await this.applyState(session, file.path, desired, signal, current)
       this.rescan.resetAfterRollback(id, [{ path: file.path, content: desired }])
@@ -1171,6 +1253,7 @@ export class RollbackService {
     signal?.throwIfAborted()
     if (transaction.phase !== 'committed' && !already()) {
       this.assertReady(session)
+      this.assertGapFree(session, transaction.fromTurn, true)
       if (!transactionFresh(session, transaction.version, transaction.phase === 'marker' && marker !== null ? marker : undefined)) throw new Error('会话已发生变化，拒绝陈旧截断；恢复日志已保留。')
       transaction.phase = 'marker'
       saveTransaction(transaction)

@@ -36,7 +36,9 @@ dsh plugin --profile desktop add @domitor-syh/dsh-rollback
 
 安装后：Web 端重启 `dsh web` 并刷新页面；桌面端重启桌面应用。从 DSH 源码运行时，在上述命令前加 `pnpm`。
 
-当前适配目标为 **DSH 0.2.0-rc.2**。声明的兼容范围为 `>=0.1.5-rc.2 <0.2.0-0 || >=0.2.0-rc.2 <0.3.0-0`，其他构建需确认兼容性。
+当前适配目标为 **DSH 0.2.1-rc.2**。声明的兼容范围仍为 `>=0.1.5-rc.2 <0.2.0-0 || >=0.2.0-rc.2 <0.3.0-0`，旧版本在本次适配中未重新验证。
+
+0.5.1 修复了切换会话工作目录后，相对路径文件可能捕获到原目录同名文件的问题；回退继续使用修改时记录的目标路径。
 
 ## 使用
 
@@ -63,17 +65,21 @@ dsh plugin --profile desktop add @domitor-syh/dsh-rollback
 
 运行中不能回退。回退只处理具备恢复依据的已跟踪文件，不是整个工作区备份；外部修改警告提示相关内容可能被覆盖。恢复失败后先按提示使用 `retry` 或 `abort`，报错不代表文件操作已自动撤销；对话撤回提交后不能再 `abort`。回退不会删除原始会话日志。
 
+工具回报的文件路径与捕获目标不一致时，该操作留下持久的恢复缺口。例如第 5 轮出现缺口，第 6 轮起正常保留的检查点仍可回退；从第 5 轮或更早开始的回退会在预览和执行时被拒绝，并提示缺口及之后可用的起始轮次。重启后限制仍保留；不会跳过缺口做部分回退或只撤回对话。恢复记录写入或读取失败仍可能阻止更大范围的回退。
+
 ## 开发
 
 构建工具链要求 Node `^22.18.0 || >=24.11.0`。
 
 ```sh
-pnpm install
-pnpm typecheck
-pnpm test
-pnpm check:readmes
-pnpm build
+pnpm --config.verify-deps-before-run=false install --ignore-scripts
+pnpm --config.verify-deps-before-run=false typecheck
+pnpm --config.verify-deps-before-run=false test
+pnpm --config.verify-deps-before-run=false check:readmes
+pnpm --config.verify-deps-before-run=false build
 ```
+
+DSH 0.2.1 已退役 invariant 服务，插件不再依赖 `@deepseek-ai/dsh-invariants`。公开的 `./invariant` 入口保留为已弃用的空操作，旧配置可继续加载，也可移除该条目。宿主版本范围由顶层 `engines.dsh` 声明；旧宿主缺少 `workingDirectory` 时保留原有目录回退路径。
 
 修改后需将构建产物安装到目标 profile，再重启 DSH 并刷新页面。版本变更见 [更新日志](./CHANGELOG.md)。
 

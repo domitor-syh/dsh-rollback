@@ -36,7 +36,9 @@ dsh plugin --profile desktop add @domitor-syh/dsh-rollback
 
 After installing: restart `dsh web` and refresh the page on the web side, restart the desktop app on the desktop side. When running DSH from source, prefix the commands with `pnpm`.
 
-The current target is **DSH 0.2.0-rc.2**. The declared compatibility range is `>=0.1.5-rc.2 <0.2.0-0 || >=0.2.0-rc.2 <0.3.0-0`; check compatibility for other builds.
+The current target is **DSH 0.2.1-rc.2**. The declared compatibility range remains `>=0.1.5-rc.2 <0.2.0-0 || >=0.2.0-rc.2 <0.3.0-0`; older versions have not been revalidated for this adaptation.
+
+0.5.1 fixes relative file paths capturing a same-named file in the original directory after the session working directory changes. Rollback continues to use the target path recorded when the file was changed.
 
 ## Usage
 
@@ -63,17 +65,21 @@ There are three ways to use the plugin:
 
 Rollback is unavailable while a turn is running. It covers tracked files with restore evidence, not a full workspace backup; external-change warnings mean that related content may be overwritten. After recovery fails, follow the instructions for `retry` or `abort`: an error does not mean file operations were automatically undone. Abort is unavailable once conversation withdrawal is committed. Rollback does not erase original session logs.
 
+When a tool reports a file path different from the captured target, that operation leaves a persistent recovery gap. For example, a gap in turn 5 still allows rollback from normally retained checkpoints at turn 6 or later; rollback starting at turn 5 or earlier is rejected in both preview and execution, with the gap and later available start turns shown. The restriction survives restart; rollback cannot skip the gap, restore only part of the range, or withdraw only the conversation. Failure to write or read recovery records can still block a wider range of rollbacks.
+
 ## Development
 
 The build toolchain requires Node `^22.18.0 || >=24.11.0`.
 
 ```sh
-pnpm install
-pnpm typecheck
-pnpm test
-pnpm check:readmes
-pnpm build
+pnpm --config.verify-deps-before-run=false install --ignore-scripts
+pnpm --config.verify-deps-before-run=false typecheck
+pnpm --config.verify-deps-before-run=false test
+pnpm --config.verify-deps-before-run=false check:readmes
+pnpm --config.verify-deps-before-run=false build
 ```
+
+DSH 0.2.1 retired the invariant service, so the plugin no longer depends on `@deepseek-ai/dsh-invariants`. The public `./invariant` entry remains as a deprecated no-op; existing configurations can still load it or remove the entry. The host version range is declared through top-level `engines.dsh`; older hosts without `workingDirectory` retain the original directory fallback.
 
 Install the build artifacts into the target profile, then restart DSH and refresh the page. See the [changelog](./CHANGELOG.md) for version history.
 
