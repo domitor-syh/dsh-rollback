@@ -25,7 +25,7 @@ describe('package compatibility admission and legacy companion', () => {
   })
 
   // This checks version admission only, not execution on these historical hosts.
-  it.each(['0.1.5-rc.2', '0.1.5-rc.3', '0.2.0-rc.2', '0.2.1-rc.2'])(
+  it.each(['0.1.5-rc.2', '0.1.5-rc.3', '0.2.0-rc.2', '0.2.1-rc.2', '0.2.1-rc.3'])(
     'retains declared admission for %s', version => {
       expect(evaluatePluginCompatibility(manifest, {}, version)).toBeUndefined()
       // Older boot code uses the retained DSH peers when engines.dsh is absent.

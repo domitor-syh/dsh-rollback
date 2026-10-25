@@ -36,7 +36,7 @@ dsh plugin --profile desktop add @domitor-syh/dsh-rollback
 
 After installing: restart `dsh web` and refresh the page on the web side, restart the desktop app on the desktop side. When running DSH from source, prefix the commands with `pnpm`.
 
-The current target is **DSH 0.2.1-rc.2**. The declared compatibility range remains `>=0.1.5-rc.2 <0.2.0-0 || >=0.2.0-rc.2 <0.3.0-0`; older versions have not been revalidated for this adaptation.
+The current target is **DSH 0.2.1-rc.3**. That version changes no host API this plugin uses; the client-side changes only add navigation customization and analytics plus adaptive Tooltip placement, so no plugin code change is needed. The declared compatibility range remains `>=0.1.5-rc.2 <0.2.0-0 || >=0.2.0-rc.2 <0.3.0-0` (already covering `0.2.1-rc.3`); older versions have not been revalidated for this adaptation.
 
 0.5.1 fixes relative file paths capturing a same-named file in the original directory after the session working directory changes. Rollback continues to use the target path recorded when the file was changed.
 

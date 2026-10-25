@@ -15,7 +15,7 @@
  * absence is gone:
  *
  *   - the DSH packages this plugin touches are installed as devDependencies,
- *     pinned to `0.2.1-rc.2` — the current adaptation target — with Cordis at
+ *     pinned to `0.2.1-rc.3` — the current adaptation target — with Cordis at
  *     `4.0.5`. Exact versions make the API checked here reproducible; the retired
  *     invariant service is not a dependency. The working-directory service is
  *     loaded for typing optional access, preserving the older-host fallback.
