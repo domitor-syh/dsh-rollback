@@ -24,7 +24,8 @@ jobs:
           #     11.28.3 so both versions accept it now).
           # Pinned exactly, so a future pnpm release cannot fail a commit that passes
           # locally. Bump this in the same commit as any lockfile change.
-          version: 11.28.3
+          # Now 11.28.5: that is what wrote the DSH 0.2.1-rc.5 lockfile.
+          version: 11.28.5
       - uses: actions/setup-node@v4
         with:
           # pnpm 11 requires Node >= 22.13 (its own engines field); Node 20 made the
@@ -32,5 +33,12 @@ jobs:
           # which is why the runs kept failing after the pnpm pin. Keep this >= 22.13
           # for as long as the pnpm pin above stays on the 11 line.
           node-version: 22
-      - run: pnpm install --frozen-lockfile --ignore-scripts
+      # --trust-lockfile: the committed lockfile is the reviewed, already-verified
+      # base, so the frozen install does not re-apply the release-age policy to its
+      # entries. Without it, pnpm 11's default 24-hour minimumReleaseAge rejects every
+      # DSH prerelease the plugin tracks for the first day after publication, even
+      # though the packages are exact-pinned here and verified locally. Resolution of
+      # a changed lockfile still enforces the policy; remove this flag if CI should
+      # also gate frozen entries on release age.
+      - run: pnpm install --frozen-lockfile --ignore-scripts --trust-lockfile
       - run: pnpm test
